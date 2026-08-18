@@ -31,7 +31,9 @@ type ProcessGroupStats
 
     /// Number of live processes currently in the group. Under the POSIX process-group mechanism
     /// this counts live process *groups* (one per contained child) rather than individual
-    /// processes; with a Job Object (or cgroup) it is the exact process count.
+    /// processes — plus each individually tracked process adopted by pid (`ProcessGroup.AdoptByPid`),
+    /// which is one process rather than a group; with a Job Object (or cgroup) it is the exact
+    /// process count.
     member _.ActiveProcessCount = activeProcessCount
 
     /// Maximum number of kernel tasks (processes and their threads) charged to the group at once over

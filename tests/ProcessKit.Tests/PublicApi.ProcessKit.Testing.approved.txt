@@ -9,7 +9,8 @@ class ProcessKit.Testing.CassetteEntry
   member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
   member ToString() : System.String
   new()
-  new(System.String, System.String[], System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double, System.Boolean, System.Nullable<System.Int32>, System.Nullable<System.Int32>, ProcessKit.Testing.CassetteFailure, System.String, System.String)
+  new(System.String, System.String[], System.String, System.String, System.String, System.Boolean, System.String[], System.String, System.String, System.String, System.String, System.Nullable<System.Int32>, System.Boolean, System.Boolean, System.Nullable<System.Int32>, System.Boolean, System.Double, System.Boolean, System.Nullable<System.Int32>, System.Nullable<System.Int32>, ProcessKit.Testing.CassetteFailure, System.String, System.String)
+  property Arg0 : System.String { get; set }
   property Args : System.String[] { get; set }
   property Code : System.Nullable<System.Int32> { get; set }
   property CommandFingerprint : System.String { get; set }
@@ -137,6 +138,7 @@ class ProcessKit.Testing.RecordReplayRunner
 
 class ProcessKit.Testing.RecordedInvocation
   member Matches(System.Collections.Generic.IEnumerable<System.String>) : System.Boolean
+  property Arg0 : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
   property Args : System.Collections.Generic.IReadOnlyList<System.String> { get }
   property Cwd : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
   property EnvNames : System.Collections.Generic.IReadOnlyList<System.String> { get }

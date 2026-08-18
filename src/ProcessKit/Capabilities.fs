@@ -164,6 +164,7 @@ type ContainmentCapabilities
         resourceLimits: ResourceLimitCapabilities,
         signals: SignalCapabilities,
         adoption: Capability,
+        adoptionByPid: Capability,
         pty: Capability,
         ptyResize: Capability,
         killOnParentDeath: Capability,
@@ -199,6 +200,16 @@ type ContainmentCapabilities
     /// mechanism these options select: a Windows Job Object always can, a Linux cgroup v2 group can (which
     /// is what requesting whole-tree limits selects), and the POSIX process group cannot at all.
     member _.Adoption = adoption
+
+    /// `ProcessGroup.AdoptByPid` — the same, from a **bare pid** rather than a `System.Diagnostics.Process`.
+    /// A separate axis because it is answered by a different question and can differ from `Adoption` on the
+    /// very same host: what it needs is an identity ANCHOR for the number, not a primitive that relocates a
+    /// process. The Job Object and cgroup v2 mechanisms hold one inherently (a process object; kernel cgroup
+    /// membership). The POSIX process group — which cannot `Adopt` at all — can still track a foreign pid
+    /// against a re-verified start-time token, so it is `Qualified` wherever this host has a reader for one
+    /// (Linux `/proc`, macOS `proc_pidinfo`) and `Unsupported` where it does not (the BSDs), rather than
+    /// tracking a bare number teardown would later SIGKILL whoever holds.
+    member _.AdoptionByPid = adoptionByPid
 
     /// `Command.Pty` — starting a child on a pseudo-terminal. Reported from the very host gate the spawn
     /// applies (the ConPTY entry point on Windows; the `setsid --ctty` helper plus `/dev/ptmx` on POSIX),
@@ -381,6 +392,11 @@ module internal CapabilityProbe =
             /// and the `KillOnParentDeath` pre-arm guard all `exec` it by absolute path).
             SystemShellAvailable: bool
 
+            /// POSIX only: this host has a start-time identity reader at all (Linux `/proc/<pid>/stat`,
+            /// macOS `proc_pidinfo`) — the anchor bare-pid adoption takes for a foreign number on the
+            /// process-group mechanism. Read from the very probe that path consults.
+            ProcessIdentityReaderAvailable: bool
+
             /// POSIX only: the trusted directories the security helpers are searched in, as an error message
             /// spells them — so a reported precondition names the list that was really searched.
             TrustedHelperDirectories: string
@@ -553,6 +569,24 @@ module internal CapabilityProbe =
                     "a Windows Job Object or a Linux cgroup v2 group; no POSIX primitive can move a foreign process into a process group (setpgid only relocates our own children, and only before they exec)"
             )
 
+    /// `ProcessGroup.AdoptByPid`, per selected mechanism. It parts company with `adoption` on exactly one
+    /// row — the POSIX process group, which cannot RELOCATE a foreign process but can TRACK one against an
+    /// identity anchor, so the question there is whether this host can read such an anchor at all.
+    let private adoptionByPid (facts: PlatformFacts) (mechanism: Mechanism) : Capability =
+        match mechanism with
+        | Mechanism.JobObject
+        | Mechanism.CgroupV2 -> Capability.Available
+        | Mechanism.ProcessGroup ->
+            if facts.ProcessIdentityReaderAvailable then
+                // A real qualification, not a footnote: the containment this mechanism gives an adopted
+                // pid is narrower than the other two mechanisms give, and both halves of that are things
+                // a caller has to plan around.
+                Capability.Qualified
+                    "the process is tracked INDIVIDUALLY against a start-time anchor re-verified before every signal and kill: it is listed, signalled and killed with the group, but processes it forks afterwards are NOT contained (no POSIX primitive moves a foreign, already-exec'ed process into our process group), a number whose anchor stops matching is dropped from the group rather than signalled, and a pid this process may not signal (another user's, a protected one) is refused at adoption rather than accepted as a member the group could not kill"
+            else
+                Capability.Unsupported
+                    "a start-time identity reader for the pid (Linux /proc/<pid>/stat, macOS proc_pidinfo); this platform ships none ProcessKit can verify, so there is no anchor to bind the group to and a bare number would let teardown SIGKILL whatever holds it later — refused rather than downgraded"
+
     /// `Command.KillOnParentDeath`, from the same per-platform gate the POSIX spawn path applies.
     let private killOnParentDeath (facts: PlatformFacts) : Capability =
         if facts.IsWindows then
@@ -641,7 +675,7 @@ module internal CapabilityProbe =
         // fabricated availability this snapshot exists to avoid. They carry the creation precondition
         // instead. The host-level axes (limits, PTY, kill-on-parent-death, helpers) are unaffected — they
         // are facts about the host, not about a group that was never created.
-        let mechanism, creation, signalCapabilities, adoptionCapability =
+        let mechanism, creation, signalCapabilities, adoptionCapability, adoptionByPidCapability =
             match choice with
             | MechanismChoice.Selected mechanism ->
                 let creation =
@@ -653,11 +687,11 @@ module internal CapabilityProbe =
                     | Mechanism.JobObject
                     | Mechanism.ProcessGroup -> Capability.Available
 
-                Some mechanism, creation, signals mechanism, adoption facts mechanism
+                Some mechanism, creation, signals mechanism, adoption facts mechanism, adoptionByPid facts mechanism
             | MechanismChoice.Refused error ->
                 let refusal = Capability.Unsupported(refusalRequirement error)
 
-                None, refusal, SignalCapabilities(refusal, refusal, refusal), refusal
+                None, refusal, SignalCapabilities(refusal, refusal, refusal), refusal, refusal
 
         let ptyCapability = pty facts
 
@@ -674,6 +708,7 @@ module internal CapabilityProbe =
             resourceLimits facts,
             signalCapabilities,
             adoptionCapability,
+            adoptionByPidCapability,
             ptyCapability,
             ptyResize,
             killOnParentDeath facts,
@@ -702,6 +737,7 @@ module internal CapabilityProbe =
               PrivilegeDropHelperAvailable = not isWindows && Native.Posix.privilegeDropHelperAvailable ()
               ControllingTerminalHelperAvailable = not isWindows && Native.Posix.controllingTerminalHelperAvailable ()
               SystemShellAvailable = not isWindows && Native.Posix.systemShellAvailable ()
+              ProcessIdentityReaderAvailable = not isWindows && Native.Posix.processIdentityReaderAvailable ()
               TrustedHelperDirectories =
                 (if isWindows then
                      ""

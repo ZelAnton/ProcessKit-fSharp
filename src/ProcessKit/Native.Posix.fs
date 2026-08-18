@@ -94,6 +94,15 @@ module internal Posix =
     [<Literal>]
     let private ESRCH = 3
 
+    // errno EPERM — "operation not permitted": the target EXISTS, but this process has no right to signal
+    // it (another user's process, a protected/system one). Same value on Linux and macOS. It is the errno
+    // that separates "nothing is at this number" from "something is, and we have no power over it" — the
+    // whole question the bare-pid adoption gate (`ensureAdoptedSignalable`) asks before this library
+    // promises to signal and SIGKILL a foreign process. Not private: the adoption tests drive that gate
+    // through its seam and classify by this value rather than by a magic 1.
+    [<Literal>]
+    let EPERM = 1
+
     // errno EINVAL — "invalid argument", the kernel's verdict on an out-of-range signal *number*. Used
     // for the synthetic classification of a non-deliverable number (signal 0 / a negative) that
     // `signalProcessGroup` refuses *before* the syscall, so a probe never masquerades as a delivered
@@ -359,17 +368,48 @@ module internal Posix =
     /// real process whose start time it cannot control. Production leaves it `None`.
     let mutable readProcessIdentityForTests: (int -> uint64 option) option = None
 
+    /// Test seam (internal, not public API): overrides whether this host has a start-time identity reader
+    /// AT ALL, so the readerless-platform branch of bare-pid adoption (the BSDs, which refuse with
+    /// `ProcessError.Unsupported` rather than tracking a bare number) can be exercised from a Linux or
+    /// macOS build host — the same shape as `ptyCttyHelperAvailableForTests`, which forces the "no ctty
+    /// helper" host on a machine that does carry it. Deliberately separate from
+    /// `readProcessIdentityForTests`: "this platform ships no reader" and "this pid's identity could not
+    /// be read" are different facts with different typed refusals. Production leaves it `None`.
+    let mutable processIdentityReaderAvailableForTests: (unit -> bool) option = None
+
     /// Test seam (internal, not public API): replaces the native member-resource read so backend identity
     /// gates can be tested without racing a real process exit or pid recycle. Production leaves it `None`.
     let mutable readMemberStatsForTests: (int -> MemberStats option) option = None
 
     /// Test seam (internal, not public API): invoked with the target pgid/pid by every process-group
     /// delivery primitive (`killProcessGroup` / `signalProcessGroup` / `suspendProcessGroup` /
-    /// `resumeProcessGroup`) and the per-child raw kill (`killProcess`, the cgroup
-    /// backend's `KillChild`) just before its syscall, so a test can record which pgids/pids a path
-    /// actually delivered to — proving a recycled number is pruned and NEVER signalled/killed, and a
-    /// matching one still is. Production leaves it `None`.
+    /// `resumeProcessGroup`), the per-child raw kill (`killProcess`, the cgroup backend's `KillChild`) and
+    /// each anchor-gated delivery to an adopted foreign pid (`signalAdopted` / `killAdopted`) just before
+    /// its syscall, so a test can record which pgids/pids a path actually delivered to — proving a
+    /// recycled number is pruned and NEVER signalled/killed, and a matching one still is. It records that
+    /// a target was reached, not what the kernel answered; the gate's `kill(pid, 0)` probe, which delivers
+    /// nothing, deliberately does not fire it. Production leaves it `None`.
     let mutable groupDeliveryObserverForTests: (int -> unit) option = None
+
+    /// Test seam (internal, not public API): replaces the EXACT-pid `kill` the bare-pid adoption path runs
+    /// — its signalability gate (`kill(pid, 0)`, see `ensureAdoptedSignalable`), every signal/suspend/
+    /// resume delivery to an adopted foreign pid (`signalAdopted`) and every teardown SIGKILL of one
+    /// (`killAdopted`, used by `KillTree`, the graceful escalation and `HardRelease`) — with a
+    /// deterministic classification per pid. Those three are the whole set for a pid adopted into a POSIX
+    /// PROCESS GROUP; the cgroup mechanism adopts by writing `cgroup.procs` instead and sweeps its members
+    /// through `killCgroup`/`killProcess`, neither of which this seam replaces.
+    ///
+    /// It is what makes an adopted FOREIGN process simulable at all. The other seams here fake identity
+    /// and liveness, but a synthetic number's real `kill` still answers `ESRCH`, which both refuses the
+    /// adoption outright (the gate) and, for one that got in, prunes the ledger entry on its first
+    /// delivery — so without this seam a test can exercise nothing past that first call, and the real
+    /// permission verdict (`EPERM` for another user's process) cannot be produced on a build host at all
+    /// without pointing the test at a process it must never actually signal. The hook receives the pid and
+    /// the signal number (0 for the gate's probe). Because that set is closed, an installed hook also means
+    /// no signal a test drives at a pid adopted into a process group reaches the kernel — the teardown
+    /// SIGKILL included, the one delivery whose wrong target could not be undone. Production leaves it
+    /// `None`.
+    let mutable adoptedPidKillForTests: (int -> int -> SignalDelivery) option = None
 
     /// Test seam (internal, not public API): fires with the target pid whenever a control operation is
     /// delivered by the EXACT-LEADER fallback (`kill(pid, …)`) instead of to the process group
@@ -796,6 +836,25 @@ module internal Posix =
                 readMacStartTime pid
             else
                 None
+
+    /// Whether this host has a start-time identity reader AT ALL — the platform question, asked before
+    /// any particular pid is looked at, and answered from exactly the same platform switch
+    /// `readProcessIdentity` dispatches on (so the two can never disagree).
+    ///
+    /// It is what separates the two honest refusals a **bare-pid** adoption has to tell apart. On a host
+    /// with no reader (the BSDs) there is no anchor to capture for any pid, so adopting by number could
+    /// only ever mean tracking — and later signalling — a bare number: a whole-platform
+    /// `ProcessError.Unsupported`, never a silent downgrade. On a host WITH a reader, a `None` from
+    /// `readProcessIdentity` is about that one pid (already gone, a `hidepid` `/proc` mount, another
+    /// user's process on macOS) and is a per-process `ProcessError.Adopt`. A read-time failure and a
+    /// missing mechanism are neighbouring facts, and a caller can act on them differently.
+    let processIdentityReaderAvailable () : bool =
+        match processIdentityReaderAvailableForTests with
+        | Some hook -> hook ()
+        | None ->
+            match readProcessIdentityForTests with
+            | Some _ -> true
+            | None -> RuntimeInformation.IsOSPlatform OSPlatform.Linux || isMacOs
 
     // ----------------------------------------------------------------------------------
     // Enriched member snapshot (ProcessGroup.MembersInfo): parent pid + image name, per pid
@@ -1341,6 +1400,132 @@ module internal Posix =
             killProcess id
             killProcessGroup id
         | TrackedTarget.Gone -> ()
+
+    // ----------------------------------------------------------------------------------
+    // The BARE-PID adoption gate (`ProcessGroup.AdoptByPid`): a foreign process this library did not
+    // start, tracked on the POSIX process-group mechanism by its pid PLUS the start-time anchor captured
+    // when it was adopted.
+    //
+    // Deliberately a SEPARATE choke from `trackedTarget`, not a reuse of it, because the two answer
+    // different questions about different targets:
+    //
+    //  * `trackedTarget` is about OUR OWN spawned leader, whose pgid we own. It may therefore route a
+    //    delivery to the whole process GROUP (`killpg`), and it may fall back to the by-number liveness
+    //    verdict when no token is known, because an unreaped child's number cannot be recycled.
+    //  * an adopted foreign pid is neither. We do not own its process group — a `killpg` there would
+    //    sweep processes nobody adopted (a wrong-target kill of a stranger's whole tree) — and it is not
+    //    our child, so nothing holds its number against recycling once it exits. The bare NUMBER is
+    //    therefore never evidence of anything here: delivery is to the EXACT pid, and only while the
+    //    anchor still matches.
+    //
+    // Fail-closed by construction: the anchor is a `uint64` (not an option), because `AdoptByPid` refuses
+    // an adoption whose identity could not be read in the first place, and an identity that cannot be
+    // read NOW is not a match — so a live process behind a suddenly-unreadable `/proc` stops being
+    // signalled rather than being signalled on the strength of its number. That is the same trade
+    // `leaderPidStillTracked` documents: losing containment of a live process is the lesser harm next to
+    // a wrong-target kill.
+
+    /// Is `pid` still the exact process whose start-time `anchor` was captured when it was adopted by
+    /// number? Re-read on EVERY probe, signal, suspend/resume and teardown kill — never once at adoption
+    /// and then trusted. `false` for a recycled number, a vanished process, and an unreadable identity
+    /// alike (see the section comment: no read, no delivery).
+    let adoptedStillOurs (pid: int) (anchor: uint64) : bool =
+        match readProcessIdentity pid with
+        | Some current -> current = anchor
+        | None -> false
+
+    // Every EXACT-pid `kill` sent to a pid adopted into a process group funnels through this one call —
+    // the signalability gate's probe below, each delivery in `signalAdopted`, and teardown's SIGKILL in
+    // `killAdopted` — so the seam that makes a foreign process simulable covers all three and they can
+    // never disagree about what the kernel would say for a given pid. Teardown is the one that matters most: it is where a SIGKILL is
+    // sent, so leaving it on the raw syscall would put a real kill of a real number in reach of any test
+    // that adopts a plausible pid. It does NOT fire the delivery observer: a `kill(pid, 0)` probe delivers
+    // nothing, and recording it as a delivery is exactly the confusion `isDeliverableSignal` refuses
+    // elsewhere — the two callers that do deliver fire the observer themselves.
+    let private killAdoptedPid (pid: int) (signalNum: int) : SignalDelivery =
+        match adoptedPidKillForTests with
+        | Some hook -> hook pid signalNum
+        | None -> classifySignalDelivery (kill (pid, signalNum))
+
+    /// May this process actually SIGNAL `pid`? Asked once, at adoption, with `kill(pid, 0)` — the probe
+    /// that delivers nothing and answers with an errno — and the answer decides whether a bare pid is
+    /// adopted at all.
+    ///
+    /// Reading a start-time anchor proves only that we can IDENTIFY the process, never that we can control
+    /// it, and on Linux the two come apart routinely: `/proc/<pid>/stat` is world-readable, so another
+    /// user's (or a system) process yields a perfectly good anchor while every `kill` to it fails `EPERM`.
+    /// Tracking such a pid would enlist it as a member this group claims to signal and SIGKILL, and the
+    /// teardown kill is fire-and-forget — so the caller would be told the process is contained and would
+    /// never learn otherwise. That is the silent downgrade of the kill-on-dispose guarantee this gate
+    /// exists to prevent, and it is the same refusal the other two mechanisms already make by construction
+    /// (a denied `OpenProcess`, a denied `cgroup.procs` write).
+    ///
+    /// The verdict is about the moment it is taken, not a permanent property — a process can change
+    /// credentials afterwards, exactly as it can exit afterwards — and it is deliberately fail-CLOSED: an
+    /// errno that is neither success nor `ESRCH` nor `EPERM` is still not proof that a kill would land, so
+    /// it refuses and names the errno rather than adopting on a probe it could not interpret. `Error`
+    /// carries the caller-facing reason, which the backend wraps in `ProcessError.Adopt` (the shape
+    /// `Native.Cgroup.adoptIntoCgroup` already uses).
+    let ensureAdoptedSignalable (pid: int) : Result<unit, string> =
+        // `Delivered` here reads as "the call itself succeeded", not "a signal arrived": signal 0 delivers
+        // nothing, and the DU is classifying `kill`'s return, which is the same three-way answer either
+        // way — 0, `ESRCH`, or another errno.
+        match killAdoptedPid pid 0 with
+        | SignalDelivery.Delivered -> Ok()
+        | SignalDelivery.TargetGone ->
+            Error
+                "nothing is at this pid any more: the signalability probe (kill(pid, 0)) reported that no such process exists, so the number changed hands or the process exited during the adoption"
+        | SignalDelivery.DeliveryFailed(errno, message) when errno = EPERM ->
+            Error
+                $"this process may not signal pid {pid} ({message}): it belongs to another user or is otherwise protected, so the kill-on-dispose guarantee could not be kept for it — a pid is never adopted into a group that would be unable to signal or kill it"
+        | SignalDelivery.DeliveryFailed(errno, message) ->
+            Error
+                $"the signalability probe (kill(pid, 0)) for pid {pid} failed with errno {errno} ({message}), which is not proof that this group could signal or kill it; a bare pid is only adopted once its controllability is confirmed"
+
+    /// Deliver `signalNum` to an adopted foreign pid, gated on its anchor. The EXACT pid only: its
+    /// process group belongs to whoever started it, so `killpg` is not ours to use here. A non-matching
+    /// anchor reports `TargetGone` and delivers nothing, exactly as a `TrackedTarget.Gone` verdict does.
+    let signalAdopted (pid: int) (anchor: uint64) (signalNum: int) : SignalDelivery =
+        if not (isDeliverableSignal signalNum) then
+            SignalDelivery.DeliveryFailed(
+                EINVAL,
+                $"signal {signalNum} is a liveness probe / non-signal, not a deliverable signal — refused before kill"
+            )
+        elif adoptedStillOurs pid anchor then
+            observeGroupDelivery pid
+            killAdoptedPid pid signalNum
+        else
+            SignalDelivery.TargetGone
+
+    /// Freeze one adopted foreign pid (SIGSTOP), gated exactly like `signalAdopted`.
+    let suspendAdopted (pid: int) (anchor: uint64) : SignalDelivery = signalAdopted pid anchor sigStop
+
+    /// Thaw one adopted foreign pid (SIGCONT), gated exactly like `signalAdopted`.
+    let resumeAdopted (pid: int) (anchor: uint64) : SignalDelivery = signalAdopted pid anchor sigCont
+
+    /// Teardown's SIGKILL for ONE adopted foreign pid — `KillTree`, the graceful stop's escalation and
+    /// `HardRelease` — gated on its anchor and routed through the same `killAdoptedPid` choke as every
+    /// other exact-pid kill this path makes. The EXACT pid only, for the reason `signalAdopted` gives: a
+    /// `killpg` here would sweep a process group we did not create.
+    ///
+    /// Deliberately NOT `killProcess` (which the cgroup backend and the exact-leader route still use): a
+    /// teardown that reached the raw syscall directly would be the one delivery on this path the seam
+    /// could not intercept — and it is the delivery that sends SIGKILL, so it is the one where reaching
+    /// the wrong process is unrecoverable.
+    ///
+    /// Fire-and-forget, like the teardown kills around it: the delivery verdict is not reported, because
+    /// nothing can act on it (the process is going away either way, and it is not ours to reap). The
+    /// return value is the ANCHOR verdict, not the kill's — `true` when the pid was still the process
+    /// that was adopted and the SIGKILL therefore went out, `false` when the number has changed hands or
+    /// its identity can no longer be read and nothing was sent. The gate lives here rather than at the
+    /// three call sites so a fourth one cannot deliver an ungated SIGKILL to a bare number.
+    let killAdopted (pid: int) (anchor: uint64) : bool =
+        if adoptedStillOurs pid anchor then
+            observeGroupDelivery pid
+            killAdoptedPid pid SIGKILL |> ignore
+            true
+        else
+            false
 
     // A connected AF_UNIX SOCK_STREAM socket pair for one piped stdio channel, used instead of a bare
     // pipe: its parent-kept end can be wrapped in a .NET `Socket`/`NetworkStream`, whose async reads and
@@ -3578,7 +3763,11 @@ module internal Posix =
                 try
                     fileActions <- Marshal.AllocHGlobal 1024
                     attributes <- Marshal.AllocHGlobal 1024
-                    let argv = command.Program :: List.ofSeq command.Config.Args
+                    // `argv[0]` is `Command.Arg0` when set, else `Program` (the ordinary, unchanged
+                    // behaviour) — `command.Program` below still names the FILE `posix_spawnp` resolves
+                    // and executes; only the first element of the argv array it hands the child differs.
+                    let argv0 = config.Arg0 |> Option.defaultValue command.Program
+                    let argv = argv0 :: List.ofSeq command.Config.Args
 
                     let envp =
                         effectiveEnvironment command
@@ -4207,35 +4396,51 @@ module internal Posix =
     /// `PreferLocal`, PATH lookup, and the typed `NotFound` contract; arguments remain positional (`"$@"`),
     /// so no user value is reparsed as shell text. The soft limit is rounded up to seconds and the hard
     /// limit gets one extra second, allowing the child to observe SIGXCPU before unconditional termination.
+    /// `Command.Arg0` is refused up front (T-376/R-01): the `/bin/sh` shim's own `exec "$@"` has no seam
+    /// for a distinct `argv[0]`, so honouring an override here would misapply it to the SHIM's `argv[0]`
+    /// while the real program (reached only through `exec`) observes its unmodified `resolvedProgram` name
+    /// instead — exactly the silent-misapplication failure `arg0HelperConflict` refuses for `setpriv`/
+    /// `setsid --ctty`, and the same refusal `spawnPosixIntoCgroup` gives its own `/bin/sh` launcher.
     let withCpuTimeLimit (duration: TimeSpan) (command: Command) : Result<Command, ProcessError> =
         let command = applyPreferLocal command
 
-        match resolveCommandProgram command with
-        | Error error -> Error error
-        | Ok resolvedProgram ->
-            let seconds = max 1L (int64 (Math.Ceiling duration.TotalSeconds))
-            let config = command.Config
-
-            let args =
-                seq {
-                    yield "-c"
-
-                    yield
-                        "ulimit -S -t \"$1\" || exit 125; ulimit -H -t \"$(($1 + 1))\" || exit 125; shift; exec \"$@\""
-
-                    yield "processkit-rlimit"
-                    yield string seconds
-                    yield resolvedProgram
-                    yield! config.Args
-                }
-
-            Ok(
-                Command(
-                    { config with
-                        Program = "/bin/sh"
-                        Args = ImmutableList.CreateRange args }
-                )
+        if command.Config.Arg0.IsSome then
+            Error(
+                ProcessError.Unsupported
+                    "Command.Arg0 combined with CpuTimeMax: the /bin/sh RLIMIT_CPU shim re-execs the target by name and has no seam for a distinct argv[0]"
             )
+        else
+            match resolveCommandProgram command with
+            | Error error -> Error error
+            | Ok resolvedProgram ->
+                let seconds = max 1L (int64 (Math.Ceiling duration.TotalSeconds))
+                let config = command.Config
+
+                let args =
+                    seq {
+                        yield "-c"
+
+                        yield
+                            "ulimit -S -t \"$1\" || exit 125; ulimit -H -t \"$(($1 + 1))\" || exit 125; shift; exec \"$@\""
+
+                        yield "processkit-rlimit"
+                        yield string seconds
+                        yield resolvedProgram
+                        yield! config.Args
+                    }
+
+                Ok(
+                    Command(
+                        { config with
+                            Program = "/bin/sh"
+                            Args = ImmutableList.CreateRange args
+                            // Defense in depth: the check above already refuses `Arg0` for a `CpuTimeMax` run,
+                            // so this config should never carry one here — cleared so a caller reaching this
+                            // some other way can never see it silently misapplied to the `/bin/sh` SHIM's own
+                            // `argv[0]` (mirrors `spawnPosixIntoCgroup`'s `launcherConfig.Arg0 = None`).
+                            Arg0 = None }
+                    )
+                )
 
     /// Rewrite a `setpriv`-helper `NotFound` into the same typed `ProcessError.Spawn` against the ORIGINAL
     /// program that an up-front trusted-resolution miss produces (`setprivHelperMissing`), so a caller who
@@ -4278,6 +4483,33 @@ module internal Posix =
         else
             None
 
+    /// The honest typed refusal for `Command.Arg0` combined with a knob whose POSIX spawn path re-`exec`s
+    /// the target BY NAME through a helper — `setpriv` (a `Uid`/`Gid`/`Groups` drop or `KillOnParentDeath`)
+    /// or the `setsid --ctty` pty shim (`Pty`). Neither helper's CLI has a seam for a distinct `argv[0]`
+    /// separate from the program it execs, so honouring the override there would mean either applying it
+    /// to the WRONG process (the helper's own `argv[0]`) or inventing a new native shim — refused loudly
+    /// instead, before any child exists. A lone `Setsid` does not route through either helper, so it is
+    /// deliberately not checked here (see `Command.Arg0`). The cgroup-backend migration launcher and the
+    /// `CpuTimeMax` `RLIMIT_CPU` shim have the same re-`exec`-by-name shape but are refused at their own
+    /// entry points instead — `spawnPosixIntoCgroup`'s unconditional `Arg0` gate and `withCpuTimeLimit`'s
+    /// up-front check — because both rewrite `config.Program` to `/bin/sh` before this function ever sees
+    /// the dispatch, so a check here would be looking at the wrong program by the time it ran.
+    let private arg0HelperConflict (config: CommandConfig) : ProcessError option =
+        if config.Arg0.IsNone then
+            None
+        elif needsSetpriv config then
+            Some(
+                ProcessError.Unsupported
+                    "Command.Arg0 combined with a Uid/Gid/Groups drop or KillOnParentDeath: the setpriv helper re-execs the target by name and has no seam for a distinct argv[0]"
+            )
+        elif config.Pty.IsSome then
+            Some(
+                ProcessError.Unsupported
+                    "Command.Arg0 combined with Pty: the setsid --ctty helper re-execs the target by name and has no seam for a distinct argv[0]"
+            )
+        else
+            None
+
     /// Spawn `command` as a contained POSIX child. A command requesting a privilege drop (`Uid`/`Gid`) or
     /// `Command.KillOnParentDeath` (Linux) is rewritten to run through the `setpriv` helper and spawned on
     /// the ordinary `posix_spawn` path — the drop / `--pdeathsig` arming runs in `setpriv` before it
@@ -4293,48 +4525,54 @@ module internal Posix =
         let config = command.Config
 
         // The Windows-only token knobs are refused first, before any other dispatch: a POSIX host has no
-        // restricted token and no integrity label to honour them with.
+        // restricted token and no integrity label to honour them with. `Arg0` combined with a
+        // helper-routing knob is refused right behind it, for the same "refuse before any child exists"
+        // reason.
         match windowsOnlyOptionsUnsupported config with
         | Some error -> Error error
         | None ->
-            if
-                config.KillOnParentDeath
-                && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux)
-            then
-                // macOS/BSD have no `PR_SET_PDEATHSIG` analog to reap a child on sudden parent death. Refuse
-                // the request honestly rather than silently ignoring it (matching
-                // `KillOnParentDeathScope.Nothing`).
-                Error(
-                    ProcessError.Unsupported
-                        "KillOnParentDeath needs Linux's PR_SET_PDEATHSIG (armed via setpriv); macOS/BSD have no parent-death-signal analog"
-                )
-            elif config.Pty.IsSome then
-                // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper (see
-                // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9). A
-                // `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`, via `setpriv`).
-                spawnPosixPty command
-            else
 
-                match groupsRequireDropError command with
-                | Some error -> Error error
-                | None ->
-                    if needsSetpriv config then
-                        // A uid/gid drop needs the non-root precheck; a lone `KillOnParentDeath` (no credential
-                        // change) does not, so the precheck runs only when a drop is actually requested.
-                        let precheck =
-                            if config.Uid.IsSome || config.Gid.IsSome then
-                                privilegeDropPrecheck command
-                            else
-                                None
+            match arg0HelperConflict config with
+            | Some error -> Error error
+            | None ->
+                if
+                    config.KillOnParentDeath
+                    && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux)
+                then
+                    // macOS/BSD have no `PR_SET_PDEATHSIG` analog to reap a child on sudden parent death. Refuse
+                    // the request honestly rather than silently ignoring it (matching
+                    // `KillOnParentDeathScope.Nothing`).
+                    Error(
+                        ProcessError.Unsupported
+                            "KillOnParentDeath needs Linux's PR_SET_PDEATHSIG (armed via setpriv); macOS/BSD have no parent-death-signal analog"
+                    )
+                elif config.Pty.IsSome then
+                    // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper (see
+                    // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9). A
+                    // `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`, via `setpriv`).
+                    spawnPosixPty command
+                else
 
-                        match precheck with
-                        | Some error -> Error error
-                        | None ->
-                            match setprivCommand command with
-                            | Error error -> Error error
-                            | Ok dropping -> spawnPosixViaSpawn dropping |> remapSetprivNotFound command
-                    else
-                        spawnPosixViaSpawn command
+                    match groupsRequireDropError command with
+                    | Some error -> Error error
+                    | None ->
+                        if needsSetpriv config then
+                            // A uid/gid drop needs the non-root precheck; a lone `KillOnParentDeath` (no credential
+                            // change) does not, so the precheck runs only when a drop is actually requested.
+                            let precheck =
+                                if config.Uid.IsSome || config.Gid.IsSome then
+                                    privilegeDropPrecheck command
+                                else
+                                    None
+
+                            match precheck with
+                            | Some error -> Error error
+                            | None ->
+                                match setprivCommand command with
+                                | Error error -> Error error
+                                | Ok dropping -> spawnPosixViaSpawn dropping |> remapSetprivNotFound command
+                        else
+                            spawnPosixViaSpawn command
 
     // ----------------------------------------------------------------------------------
     // Linux cgroup v2: place the child INSIDE its cgroup atomically with its own execution
@@ -4404,7 +4642,12 @@ module internal Posix =
                     Groups = None
                     // `--pdeathsig=SIGKILL` (when requested) is nested in `innerArgv` via `setpriv` above;
                     // cleared here so `spawnPosixViaSpawn` does not wrap the `/bin/sh` launcher in another one.
-                    KillOnParentDeath = false }
+                    KillOnParentDeath = false
+                    // Defense in depth: the dispatch below already refuses `Arg0` for a cgroup-backend run
+                    // (the launcher's `exec "$@"` has no seam for a distinct `argv[0]` either), so this
+                    // config should never carry one here — cleared so a caller reaching this some other
+                    // way can never see it silently misapplied to the `/bin/sh` LAUNCHER's own `argv[0]`.
+                    Arg0 = None }
 
             match spawnPosixViaSpawn (Command launcherConfig) with
             | Error(ProcessError.NotFound _) ->
@@ -4449,12 +4692,24 @@ module internal Posix =
 
         // The Windows-only token knobs have no POSIX equivalent and are refused first (the same gate
         // `spawnPosix` applies); a PTY then gates the same unsupported-host check as `spawnPosixPty` before
-        // the cgroup launch. The rest of the dispatch (Groups-need-a-drop, non-root drop precheck) is
-        // shared with the non-pty path.
+        // the cgroup launch. `Arg0` is refused unconditionally here — UNLIKE `spawnPosix`/
+        // `spawnDetachedPosix`, this path ALWAYS routes the target through the `/bin/sh` migration
+        // launcher's `exec "$@"`, which (like `setpriv`/`setsid --ctty`) has no seam for a distinct
+        // `argv[0]`, whether or not a privilege drop or PTY is also requested. The rest of the dispatch
+        // (Groups-need-a-drop, non-root drop precheck) is shared with the non-pty path.
         let unsupportedGate =
             match windowsOnlyOptionsUnsupported config with
             | Some error -> Some error
-            | None -> if config.Pty.IsSome then ptyHostUnsupported () else None
+            | None ->
+                if config.Arg0.IsSome then
+                    Some(
+                        ProcessError.Unsupported
+                            "Command.Arg0 combined with a cgroup-backend run: the /bin/sh migration launcher re-execs the target by name and has no seam for a distinct argv[0]"
+                    )
+                elif config.Pty.IsSome then
+                    ptyHostUnsupported ()
+                else
+                    None
 
         match unsupportedGate with
         | Some error -> Error error
@@ -4609,7 +4864,10 @@ module internal Posix =
                 try
                     fileActions <- Marshal.AllocHGlobal 1024
                     attributes <- Marshal.AllocHGlobal 1024
-                    let argv = command.Program :: List.ofSeq config.Args
+                    // See `spawnPosixViaSpawn`'s matching comment: `argv[0]` is `Command.Arg0` when set,
+                    // else `Program`; `command.Program` still names the file `posix_spawnp` resolves.
+                    let argv0 = config.Arg0 |> Option.defaultValue command.Program
+                    let argv = argv0 :: List.ofSeq config.Args
 
                     let envp =
                         effectiveEnvironment command
@@ -4847,21 +5105,27 @@ module internal Posix =
 
         // The Windows-only token knobs are refused here too, before any launch work: a detached child gets
         // no weaker honesty guarantee than a contained one just because nothing tracks it afterwards.
+        // `Pty` never reaches here (the verb layer already refuses it for a detached launch), so
+        // `arg0HelperConflict` only ever fires here for the `Uid`/`Gid`/`Groups` drop it also guards.
         match windowsOnlyOptionsUnsupported config with
         | Some error -> Error error
         | None ->
-            match groupsRequireDropError command with
+
+            match arg0HelperConflict config with
             | Some error -> Error error
             | None ->
-                if config.Uid.IsSome || config.Gid.IsSome then
-                    match privilegeDropPrecheck command with
-                    | Some error -> Error error
-                    | None ->
-                        match setprivCommand command with
-                        | Error error -> Error error
-                        | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
-                else
-                    spawnDetachedPosixCore command
+                match groupsRequireDropError command with
+                | Some error -> Error error
+                | None ->
+                    if config.Uid.IsSome || config.Gid.IsSome then
+                        match privilegeDropPrecheck command with
+                        | Some error -> Error error
+                        | None ->
+                            match setprivCommand command with
+                            | Error error -> Error error
+                            | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
+                    else
+                        spawnDetachedPosixCore command
 
     // ----------------------------------------------------------------------------------
     // Capability probes — read-only, no spawn, no side effects

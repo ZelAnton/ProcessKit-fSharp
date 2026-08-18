@@ -51,6 +51,21 @@ type DryRunRunnerTests() =
         Assert.That(DryRunRunner.Render command, Is.EqualTo "echo \"hello world\"")
 
     [<Test>]
+    member _.``Render includes the Arg0 override, before the working directory annotation``() =
+        let command =
+            Command.create "busybox"
+            |> Command.arg0 "ls"
+            |> Command.args [ "-la" ]
+            |> Command.currentDir "/srv/app"
+
+        Assert.That(DryRunRunner.Render command, Is.EqualTo "busybox -la (argv0: ls) (cwd: /srv/app)")
+
+    [<Test>]
+    member _.``Render omits the Arg0 annotation when it is unset``() =
+        let command = Command.create "busybox" |> Command.args [ "-la" ]
+        Assert.That(DryRunRunner.Render command, Is.EqualTo "busybox -la")
+
+    [<Test>]
     member _.``Windows raw fragments remain verbatim after quoted ordinary arguments``() =
         let command =
             Command.create "tool"

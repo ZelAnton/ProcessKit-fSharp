@@ -1,11 +1,13 @@
 namespace ProcessKit
 
 open System
+open System.Collections.Generic
 open System.Diagnostics
 open System.Net.Http
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
+open System.Threading.Channels
 
 /// When the supervisor restarts an exited child. In every case `Supervisor.StopWhen` and
 /// `Supervisor.MaxRestarts` can end supervision first.
@@ -141,6 +143,12 @@ module internal Supervision =
     [<Literal>]
     let DefaultSupervisionTail = 1000
 
+    /// Default capacity of the opt-in live event buffer (`Supervisor.Events()`), in events not yet read
+    /// by the consumer. Deep enough that an ordinary consumer never lags (a whole crash-restart cycle
+    /// costs three events), shallow enough that an *unread* stream can never grow the supervisor's heap.
+    [<Literal>]
+    let DefaultEventCapacity = 128
+
     /// The capture policy to apply to each incarnation: respect an explicit bounded/fail-loud
     /// command policy, but bound an unbounded line count to a tail. Only the line cap is filled in
     /// — the overflow *mode* and any byte cap are preserved, so an unbounded `Error` (fail-loud)
@@ -230,6 +238,10 @@ type internal SupervisorConfig =
       OnRestart: (SupervisorRestartEvent -> unit) option
       OnStormPause: (SupervisorStormPauseEvent -> unit) option
       Capture: OutputBufferPolicy
+      // The opt-in live event stream (`Supervisor.Events`): the bounded buffer's capacity, or `None`
+      // (the default) for a session that publishes no events at all — the loop then allocates neither a
+      // channel nor a single event object, so `RunAsync` and every existing consumer are untouched.
+      EventCapacity: int option
       // Liveness supervision (off unless `Liveness` is set): periodically probe the live incarnation and,
       // after `LivenessFailures` consecutive failed attempts, gracefully stop it (with `LivenessGrace`)
       // so the ordinary restart path takes over. `LivenessInterval` is the gap between attempts;
@@ -279,6 +291,7 @@ module internal SupervisorConfig =
           OnRestart = None
           OnStormPause = None
           Capture = Supervision.defaultCapture command
+          EventCapacity = None
           Liveness = None
           LivenessInterval = TimeSpan.FromSeconds 10.0
           LivenessFailures = 3
@@ -322,6 +335,436 @@ type SupervisionStatus
     /// unavailable, or `None` when no incarnation is active right now.
     member _.StartTime = startTime
 
+/// Which supervision transition a `SupervisionEvent` reports — the discriminator to branch on when
+/// consuming `SupervisionSession.EventsAsync`.
+///
+/// A plain .NET enum on purpose: this taxonomy is meant to *grow*, and a new kind must not break a
+/// consumer that was written against an earlier version. Existing kinds are never renumbered, renamed,
+/// or repurposed; new ones are appended with the next free value. Both languages already force the
+/// habit that makes that safe — F# requires a wildcard branch when matching an enum, and a C# `switch`
+/// expression needs a discard arm — so treat an unrecognized kind as "something newer happened" (the
+/// event's `Name` still identifies it) rather than as an error.
+type SupervisionEventKind =
+
+    /// An incarnation was launched: `Attempt` is its 1-based number, `Pid` the live child's process id
+    /// (`None` for a capture-only runner, which exposes no live handle).
+    | IncarnationStarted = 1
+
+    /// An incarnation produced a `ProcessResult`: `Attempt`, `Outcome`, `Duration`, and `IsSuccess`
+    /// (the command's `OkCodes` verdict, not merely "exit 0").
+    | IncarnationFinished = 2
+
+    /// An incarnation ended without producing a `ProcessResult` at all — it never started, or its
+    /// capture failed. `Attempt` and the coarse `FailureKind` say which incarnation and what class of
+    /// failure; the failure's message and any captured output are deliberately not carried.
+    | IncarnationFailed = 3
+
+    /// A restart was scheduled: `Restart` is its 1-based lifetime number, `Delay` the (jittered)
+    /// backoff about to be slept out, and `Cause` distinguishes an ordinary exit restart from one a
+    /// liveness probe forced. Reported before the delay, exactly like the `OnRestart` callback.
+    | RestartScheduled = 4
+
+    /// The failure-storm guard paused restarts: `StormPause` is its 1-based number and `Delay` the
+    /// (jittered) pause about to be slept out. Reported before the pause, like `OnStormPause`.
+    | StormPaused = 5
+
+    /// A liveness/health probe ended the current incarnation: `Attempt` is that incarnation, and
+    /// `IsTerminal` is `false` when the unhealthy streak tripped (the ordinary restart path decides
+    /// what happens next) or `true` when the probe itself failed fatally and supervision will end.
+    /// Reported once per decision, not once per failed attempt.
+    | HealthCheckFailed = 6
+
+    /// The `GiveUpWhen` classifier declared `Attempt`'s failure permanent, so supervision stops
+    /// instead of restarting it.
+    | GaveUp = 7
+
+    /// Supervision ended with a `SupervisionOutcome`; `Reason` is that outcome's `StopReason`. The
+    /// last event of a successful supervision.
+    | Stopped = 8
+
+    /// Supervision ended with a terminal error instead of an outcome; `FailureKind` is that error's
+    /// coarse class. The last event of a failed supervision.
+    | SupervisionFailed = 9
+
+    /// The consumer fell behind the bounded buffer and `DroppedEvents` older events were discarded to
+    /// make room. Synthesized on the reading side immediately before the oldest event that survived,
+    /// so a gap is always explicit — never a silent loss. See `SupervisionSession.DroppedEventCount`
+    /// for the lifetime total.
+    | EventsDropped = 10
+
+/// The per-kind payload behind a `SupervisionEvent`. Internal, and a record rather than a positional
+/// argument list, so a future field is one `with`-updated line in the one factory that carries it
+/// instead of another argument on every construction site.
+type internal SupervisionEventPayload =
+    { Kind: SupervisionEventKind
+      Name: string
+      Program: string
+      Attempt: int option
+      Pid: int option
+      Outcome: Outcome option
+      Duration: TimeSpan option
+      IsSuccess: bool option
+      FailureKind: string option
+      Restart: int option
+      Delay: TimeSpan option
+      Cause: RestartCause option
+      StormPause: int option
+      IsTerminal: bool option
+      Reason: StopReason option
+      DroppedEvents: int64 option }
+
+module internal SupervisionEventPayload =
+
+    /// A payload carrying only what every event carries; each factory fills in its own fields.
+    let create (kind: SupervisionEventKind) (name: string) (program: string) =
+        { Kind = kind
+          Name = name
+          Program = program
+          Attempt = None
+          Pid = None
+          Outcome = None
+          Duration = None
+          IsSuccess = None
+          FailureKind = None
+          Restart = None
+          Delay = None
+          Cause = None
+          StormPause = None
+          IsTerminal = None
+          Reason = None
+          DroppedEvents = None }
+
+    /// The stable, coarse class of a failure — the union case's own identifier and nothing else.
+    /// Deliberately not `ProcessError.Message` and never the error value itself: several cases carry
+    /// the child's captured stdout/stderr (`Exit`/`Signalled`/`Timeout`) or a detail string built from
+    /// an OS message, none of which belongs in a fan-out event stream a consumer may log wholesale.
+    let failureKind (error: ProcessError) : string =
+        match error with
+        | ProcessError.Spawn _ -> "spawn"
+        | ProcessError.NotFound _ -> "not_found"
+        | ProcessError.Exit _ -> "exit"
+        | ProcessError.Signalled _ -> "signalled"
+        | ProcessError.Timeout _ -> "timeout"
+        | ProcessError.Unobserved _ -> "unobserved"
+        | ProcessError.Cancelled _ -> "cancelled"
+        | ProcessError.NotReady _ -> "not_ready"
+        | ProcessError.Parse _ -> "parse"
+        | ProcessError.RetryPredicate _ -> "retry_predicate"
+        | ProcessError.JsonRpc _ -> "json_rpc"
+        | ProcessError.OutputTooLarge _ -> "output_too_large"
+        | ProcessError.OutputIncomplete _ -> "output_incomplete"
+        | ProcessError.Stdin _ -> "stdin"
+        | ProcessError.ResourceLimit _ -> "resource_limit"
+        | ProcessError.Adopt _ -> "adopt"
+        | ProcessError.CassetteMiss _ -> "cassette_miss"
+        | ProcessError.Io _ -> "io"
+        | ProcessError.Unsupported _ -> "unsupported"
+
+/// One typed transition of a live supervision, delivered by `SupervisionSession.EventsAsync` — the
+/// stream counterpart of the `OnRestart`/`OnStormPause` callbacks and the `Status` snapshot, which it
+/// adds to rather than replaces.
+///
+/// Read `Kind` first: it says which transition this is, and therefore which of the payload properties
+/// below carry a value (each is `None` for every other kind). `Name` is the same fact as a stable
+/// lowercase machine identifier — `incarnation_started`, `restart_scheduled`, … — suitable as a log
+/// field or metric label, in the same `snake_case` style as the `"kind"` identifiers `ReportJson`
+/// writes.
+///
+/// **Non-secret by construction.** An event carries lifecycle facts only: counters, a pid, an
+/// `Outcome`, durations, the program name, and coarse failure/stop classifications. It never carries
+/// argv, environment values, captured stdout/stderr, or a `ProcessError`'s message — the same taxonomy
+/// `MemberInfo` and the library's logging already follow, so a consumer can forward the whole stream to
+/// a log or metrics sink without auditing it for secrets.
+///
+/// Sealed with an internal constructor so it can gain fields without breaking the frozen API.
+[<Sealed>]
+type SupervisionEvent internal (payload: SupervisionEventPayload) =
+
+    /// Which transition this event reports — the discriminator every consumer branches on.
+    member _.Kind = payload.Kind
+
+    /// This event's stable machine identifier (`incarnation_started`, `restart_scheduled`, …): the
+    /// same information as `Kind`, in the lowercase form a structured log or metric label wants.
+    /// Existing identifiers are never renamed; a new kind gets a new one.
+    member _.Name = payload.Name
+
+    /// The supervised command's program name — on every event, so a stream merged across supervisors
+    /// stays attributable.
+    member _.Program = payload.Program
+
+    /// The 1-based incarnation number this event is about (`IncarnationStarted`,
+    /// `IncarnationFinished`, `IncarnationFailed`, `HealthCheckFailed`, `GaveUp`); `None` otherwise.
+    /// The first incarnation is `1`, so it is one ahead of `SupervisionOutcome.Restarts`.
+    member _.Attempt = payload.Attempt
+
+    /// The live child's OS process id on `IncarnationStarted`; `None` on every other kind, and also on
+    /// an `IncarnationStarted` from a runner that exposes no live handle (a capture-only test double).
+    member _.Pid = payload.Pid
+
+    /// How the incarnation ended, on `IncarnationFinished`; `None` otherwise.
+    member _.Outcome = payload.Outcome
+
+    /// How long the incarnation ran, on `IncarnationFinished`; `None` otherwise.
+    member _.Duration = payload.Duration
+
+    /// Whether the finished incarnation counts as a success under the command's `OkCodes`, on
+    /// `IncarnationFinished`; `None` otherwise. A `false` here is what the `RestartPolicy` reads as a
+    /// crash.
+    member _.IsSuccess = payload.IsSuccess
+
+    /// The failure's stable coarse class (`spawn`, `not_found`, `io`, …) on `IncarnationFailed` and
+    /// `SupervisionFailed`; `None` otherwise. Intentionally a classification rather than the error
+    /// itself — see the secret-safety note on this type.
+    member _.FailureKind = payload.FailureKind
+
+    /// The 1-based lifetime restart number, on `RestartScheduled`; `None` otherwise. Matches
+    /// `SupervisionOutcome.Restarts` once that restart becomes the last one.
+    member _.Restart = payload.Restart
+
+    /// The delay about to be slept out — the jittered backoff on `RestartScheduled`, the jittered
+    /// pause on `StormPaused`; `None` otherwise.
+    member _.Delay = payload.Delay
+
+    /// Why the restart is happening, on `RestartScheduled` (`RestartCause.Exit` or
+    /// `RestartCause.Liveness`); `None` otherwise. The same value the `OnRestart` callback receives.
+    member _.Cause = payload.Cause
+
+    /// The 1-based lifetime storm-pause number, on `StormPaused`; `None` otherwise.
+    member _.StormPause = payload.StormPause
+
+    /// On `HealthCheckFailed`: `true` when the probe failed fatally and supervision is ending,
+    /// `false` when the unhealthy streak tripped and the ordinary restart path takes over. `None` on
+    /// every other kind.
+    member _.IsTerminal = payload.IsTerminal
+
+    /// Why supervision ended, on `Stopped`; `None` otherwise. The same `StopReason` the final
+    /// `SupervisionOutcome` reports.
+    member _.Reason = payload.Reason
+
+    /// How many events were dropped in this gap, on `EventsDropped`; `None` otherwise. The running
+    /// lifetime total is `SupervisionSession.DroppedEventCount`.
+    member _.DroppedEvents = payload.DroppedEvents
+
+    static member internal IncarnationStarted(program: string, attempt: int, pid: int option) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.IncarnationStarted "incarnation_started" program with
+                Attempt = Some attempt
+                Pid = pid }
+        )
+
+    static member internal IncarnationFinished(program: string, attempt: int, result: ProcessResult<string>) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.IncarnationFinished "incarnation_finished" program with
+                Attempt = Some attempt
+                Outcome = Some result.Outcome
+                Duration = Some result.Duration
+                IsSuccess = Some result.IsSuccess }
+        )
+
+    static member internal IncarnationFailed(program: string, attempt: int, error: ProcessError) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.IncarnationFailed "incarnation_failed" program with
+                Attempt = Some attempt
+                FailureKind = Some(SupervisionEventPayload.failureKind error) }
+        )
+
+    static member internal RestartScheduled(program: string, restart: int, delay: TimeSpan, cause: RestartCause) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.RestartScheduled "restart_scheduled" program with
+                Restart = Some restart
+                Delay = Some delay
+                Cause = Some cause }
+        )
+
+    static member internal StormPaused(program: string, stormPause: int, delay: TimeSpan) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.StormPaused "storm_paused" program with
+                StormPause = Some stormPause
+                Delay = Some delay }
+        )
+
+    static member internal HealthCheckFailed(program: string, attempt: int, isTerminal: bool) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.HealthCheckFailed "health_check_failed" program with
+                Attempt = Some attempt
+                IsTerminal = Some isTerminal }
+        )
+
+    static member internal GaveUp(program: string, attempt: int) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.GaveUp "gave_up" program with
+                Attempt = Some attempt }
+        )
+
+    static member internal Stopped(program: string, reason: StopReason) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.Stopped "stopped" program with
+                Reason = Some reason }
+        )
+
+    static member internal SupervisionFailed(program: string, error: ProcessError) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.SupervisionFailed "supervision_failed" program with
+                FailureKind = Some(SupervisionEventPayload.failureKind error) }
+        )
+
+    static member internal EventsDropped(program: string, dropped: int64) =
+        SupervisionEvent(
+            { SupervisionEventPayload.create SupervisionEventKind.EventsDropped "events_dropped" program with
+                DroppedEvents = Some dropped }
+        )
+
+/// One step of a consumer's read from a `SupervisionEventBuffer`, decided atomically under the owning
+/// session's `gate` so a gap is always reported in exactly the position it happened.
+[<RequireQualifiedAccess; NoComparison>]
+type internal SupervisionEventStep =
+
+    /// This many events were discarded before the ones still queued behind them.
+    | Dropped of count: int64
+
+    /// The oldest queued event.
+    | Event of event: SupervisionEvent
+
+    /// Nothing to take right now — the consumer waits on the channel instead.
+    | Empty
+
+/// The bounded buffer behind `SupervisionSession.EventsAsync`: a fixed-capacity channel with
+/// ring-buffer (drop-oldest) semantics and an exact count of what it dropped.
+///
+/// **Not internally synchronized on purpose.** Every member here must be called with the owning
+/// `SupervisionSession`'s `gate` held. That is the whole point: publication then runs under the same
+/// single lock the session already uses for its stop/current-child/teardown state, so the supervision
+/// loop, the per-incarnation liveness monitor, and the loop's own teardown can never interleave around
+/// it — instead of this stream introducing a second, independent lock protocol beside that one (the
+/// rule the `stopCts`/`sleepCts` `Cancel()`-vs-`Dispose()` race left behind).
+///
+/// Nothing here blocks or runs consumer code: the writes are `TryWrite`/`TryRead` only, and the
+/// channel is built with `AllowSynchronousContinuations = false` so completing it (or filling it)
+/// cannot resume a parked consumer inline while the loop holds `gate`.
+type internal SupervisionEventBuffer(capacity: int) =
+
+    // `SingleReader = false` is required, not a preference: the drop-oldest path evicts through
+    // `Reader.TryRead()` from the writing side, so the channel must not assume one reader. `SingleWriter`
+    // is left false for the same conservatism — writes are serialized by `gate`, but two different
+    // threads (the loop and a liveness monitor) perform them. `FullMode.Wait` is what makes `TryWrite`
+    // report "full" honestly; the channel's own Drop modes always claim success, which would hide the
+    // very drops this buffer must count.
+    let channel =
+        Channel.CreateBounded<SupervisionEvent>(
+            BoundedChannelOptions(
+                capacity,
+                SingleReader = false,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+                AllowSynchronousContinuations = false
+            )
+        )
+
+    let mutable dropped = 0L
+    let mutable pendingDropped = 0L
+    let mutable completed = false
+
+    member _.Reader: ChannelReader<SupervisionEvent> = channel.Reader
+
+    /// Lifetime total of events discarded to make room for newer ones. Never reset.
+    member _.DroppedCount = dropped
+
+    /// The consumer's next step: an unreported gap first, then the oldest queued event, else nothing
+    /// to read right now. Deciding both in ONE critical section is what makes the gap's position
+    /// exact rather than approximate — a `Publish` cannot slip an eviction between "is there a gap?"
+    /// and "take the next event", which would report the gap one event later than it happened.
+    member _.TryTakeNext() : SupervisionEventStep =
+        if pendingDropped > 0L then
+            let gap = pendingDropped
+            pendingDropped <- 0L
+            SupervisionEventStep.Dropped gap
+        else
+            match channel.Reader.TryRead() with
+            | true, event -> SupervisionEventStep.Event event
+            | _ -> SupervisionEventStep.Empty
+
+    /// Queue one event, evicting the oldest queued events when full (ring-buffer semantics: the newest
+    /// lifecycle facts are the ones worth keeping) and counting every eviction. A no-op once the
+    /// session has completed the stream.
+    member _.Publish(event: SupervisionEvent) =
+        if not completed then
+            let mutable written = channel.Writer.TryWrite event
+            let mutable stalled = false
+
+            while not written && not stalled do
+                let evicted, _ = channel.Reader.TryRead()
+
+                if evicted then
+                    dropped <- dropped + 1L
+                    pendingDropped <- pendingDropped + 1L
+
+                written <- channel.Writer.TryWrite event
+
+                // The only writer is this `gate`-held path and the channel is not completed here, so a
+                // freed slot cannot be stolen from us. Stopping when a failed write found nothing to
+                // evict is therefore belt-and-braces against a livelock that would pin the supervision
+                // loop itself — never the expected path.
+                stalled <- not written && not evicted
+
+    /// Close the stream so a consumer's enumeration ends once it has drained what is queued. Called
+    /// exactly once, from the supervision loop's teardown.
+    member _.Complete() =
+        if not completed then
+            completed <- true
+            channel.Writer.TryComplete() |> ignore
+
+/// The enumerator behind `SupervisionSession.EventsAsync`. Hand-written rather than
+/// `ChannelReader.ReadAllAsync` for one reason: a drop gap has to be reported *in band*, immediately
+/// before the oldest event that survived it, and that check belongs on the reading side — synthesizing
+/// the marker into the channel itself would have to evict yet another event to make room for it.
+type internal SupervisionEventEnumerator
+    (
+        reader: ChannelReader<SupervisionEvent>,
+        takeNext: unit -> SupervisionEventStep,
+        program: string,
+        cancellationToken: CancellationToken
+    ) =
+
+    let mutable current = Unchecked.defaultof<SupervisionEvent>
+
+    interface IAsyncEnumerator<SupervisionEvent> with
+        member _.Current = current
+
+        member _.MoveNextAsync() : ValueTask<bool> =
+            ValueTask<bool>(
+                task {
+                    let mutable moved = false
+                    let mutable finished = false
+
+                    while not moved && not finished do
+                        match takeNext () with
+                        | SupervisionEventStep.Dropped count ->
+                            current <- SupervisionEvent.EventsDropped(program, count)
+                            moved <- true
+                        | SupervisionEventStep.Event event ->
+                            current <- event
+                            moved <- true
+                        | SupervisionEventStep.Empty ->
+                            // Waiting happens OUTSIDE the session's lock, on the channel itself. It
+                            // resolves `false` only once the session has completed the stream and it is
+                            // drained — the natural end of supervision, not an error.
+                            let! more = reader.WaitToReadAsync cancellationToken
+                            finished <- not more
+
+                    return moved
+                }
+            )
+
+        member _.DisposeAsync() = ValueTask.CompletedTask
+
+/// The `IAsyncEnumerable<SupervisionEvent>` that `SupervisionSession.EventsAsync` returns.
+type internal SupervisionEventStream
+    (reader: ChannelReader<SupervisionEvent>, takeNext: unit -> SupervisionEventStep, program: string) =
+
+    interface IAsyncEnumerable<SupervisionEvent> with
+        member _.GetAsyncEnumerator(cancellationToken: CancellationToken) : IAsyncEnumerator<SupervisionEvent> =
+            SupervisionEventEnumerator(reader, takeNext, program, cancellationToken)
+
 [<Sealed>]
 type private CaptureOnlyStopLever(source: CancellationTokenSource, startTime: DateTime, startedTimestamp: int64) =
     let identity = obj ()
@@ -360,6 +803,19 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     // taken *between* incarnations ends the loop promptly instead of waiting the delay out. Distinct
     // from the caller's `cancellationToken` (whose cancellation is an *error*): a stop is not an error.
     let stopCts = new CancellationTokenSource()
+
+    // The opt-in live event stream's bounded buffer (`Supervisor.Events`), or `None` — the default —
+    // when no stream was configured, in which case `emit` below allocates neither a channel nor a single
+    // event. Built here, in the constructor, BEFORE the loop is launched: a consumer that calls
+    // `EventsAsync` after `StartAsync` has returned still sees the first incarnation's events, because
+    // the buffer was already retaining them. Its members are called only under `gate` (see the type).
+    let eventBuffer = config.EventCapacity |> Option.map SupervisionEventBuffer
+
+    let eventProgram = config.Command.Program
+
+    // Latches when `EventsAsync` hands the stream out: reading a channel is destructive, so a second
+    // consumer would silently steal events from the first. One consumer, refused loudly after that.
+    let mutable eventsTaken = false
 
     // Loop-owned mirror fields (only the supervision loop writes them), republished into `status` under
     // `gate` on every change so external readers see a consistent snapshot.
@@ -487,6 +943,24 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
 
     let isStopping () = lock gate (fun () -> stopping)
 
+    // Publish one lifecycle transition to the opt-in event stream. `build` is a thunk, so a session
+    // without a configured stream — the default, and every `RunAsync` — never even allocates the event:
+    // supervision behaves exactly as it did before this stream existed.
+    //
+    // The queue write runs under the SAME `gate` as every other session state change rather than behind
+    // a lock of its own. That is what keeps the loop's own emissions, the per-incarnation liveness
+    // monitor's, and the loop's teardown (which completes the buffer beside the `stopCts`/`sleepCts`
+    // disposal, under this same lock) strictly serialized — the discipline the earlier
+    // `Cancel()`-vs-`Dispose()` race established for this session. The event itself is built OUTSIDE the
+    // lock, and the buffer only does non-blocking `TryWrite`/`TryRead`, so `gate` is never held across
+    // anything that could block or run consumer code.
+    let emit (build: unit -> SupervisionEvent) =
+        match eventBuffer with
+        | None -> ()
+        | Some buffer ->
+            let event = build ()
+            lock gate (fun () -> buffer.Publish event)
+
     // Record a graceful-stop request and snapshot the current live child atomically under `gate` (closing
     // the `StopAsync`-vs-spawn race, see `publishCurrent`). A capture-only incarnation has no graceful
     // process handle, so cancel its identity-scoped lever immediately. Then interrupt any in-flight
@@ -573,8 +1047,11 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     // the incarnation ended / the monitor was torn down. The probe is handed `None`/`None` for the child's
     // pipes: those belong to the incarnation's own `OutputStringAsync`, so the liveness probe only touches
     // the external endpoint/predicate and never a second reader on the child (KB K-016/K-031 untouched).
+    // `attemptNumber` is the incarnation this monitor belongs to — spelled out rather than `attempt`,
+    // which below names the per-tick health check itself.
     let monitorLiveness
         (running: RunningProcess)
+        (attemptNumber: int)
         (incarnation: Task<Result<ProcessResult<string>, ProcessError>>)
         (token: CancellationToken)
         : Task =
@@ -685,6 +1162,11 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                 if fatalResourceError then
                                     tripped <- true
                                     markLivenessFatalError error
+                                    // The probe itself failed fatally: supervision ends rather than
+                                    // restarting, so the event is reported as terminal.
+                                    emit (fun () ->
+                                        SupervisionEvent.HealthCheckFailed(eventProgram, attemptNumber, true))
+
                                     observeFault (running.StopAsync grace)
                                 else
                                     consecutiveFailures <- consecutiveFailures + 1
@@ -695,6 +1177,12 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                     // observes the flag once the graceful stop makes `OutputStringAsync`
                                     // return (the write is ordered before the stop under `gate`).
                                     markLivenessTripped ()
+
+                                    // The unhealthy streak tripped: not terminal, the ordinary policy /
+                                    // backoff path decides what happens next.
+                                    emit (fun () ->
+                                        SupervisionEvent.HealthCheckFailed(eventProgram, attemptNumber, false))
+
                                     // Gracefully stop the live child through its own path; fire-and-forget
                                     // with fault observation, exactly like the pending-graceful-stop path in
                                     // `captureIncarnation`. Its exit makes the incarnation's output verb
@@ -711,7 +1199,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     // The tracked path is a faithful inline of `CaptureVerbs.runToCompletion` (kept in step with it) —
     // same `CancelOn` linking, same up-front and post-consume cancellation checks — plus the live-handle
     // publication and the capture-only fallback.
-    let captureOnlyIncarnation (command: Command) : Task<Result<ProcessResult<string>, ProcessError>> =
+    let captureOnlyIncarnation (attempt: int) (command: Command) : Task<Result<ProcessResult<string>, ProcessError>> =
         task {
             let captureCts = CancellationTokenSource.CreateLinkedTokenSource cancellationToken
 
@@ -723,6 +1211,10 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 )
 
             publishCaptureOnly lever
+
+            // Same transition as the live path's, reported on the same terms: a capture-only runner has
+            // no live handle, so the incarnation is "started" when its capture begins and carries no pid.
+            emit (fun () -> SupervisionEvent.IncarnationStarted(eventProgram, attempt, None))
 
             try
                 try
@@ -765,9 +1257,9 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 clearCaptureOnly lever
         }
 
-    let captureIncarnation (command: Command) : Task<Result<ProcessResult<string>, ProcessError>> =
+    let captureIncarnation (attempt: int) (command: Command) : Task<Result<ProcessResult<string>, ProcessError>> =
         if not spawnCapable then
-            captureOnlyIncarnation command
+            captureOnlyIncarnation attempt command
         else
             task {
                 use linkedCts =
@@ -792,12 +1284,17 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             None
 
                     match spawned with
-                    | None -> return! captureOnlyIncarnation command
+                    | None -> return! captureOnlyIncarnation attempt command
                     | Some spawnTask ->
                         match! spawnTask with
                         | Error error -> return Error error
                         | Ok running ->
                             let pendingGrace = publishCurrent running
+
+                            // Published only for a child that really started: a spawn that failed above
+                            // never reaches here and is reported by the loop as `IncarnationFailed`.
+                            emit (fun () -> SupervisionEvent.IncarnationStarted(eventProgram, attempt, running.Pid))
+
                             use _registration = effectiveToken.Register(fun () -> running.Kill())
 
                             // A graceful stop landed just before this child became current: stop it now
@@ -819,7 +1316,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             use livenessCts = CancellationTokenSource.CreateLinkedTokenSource effectiveToken
 
                             let outputTask = running.OutputStringAsync()
-                            let monitorTask = monitorLiveness running outputTask livenessCts.Token
+                            let monitorTask = monitorLiveness running attempt outputTask livenessCts.Token
 
                             let mutable captured =
                                 Unchecked.defaultof<Result<ProcessResult<string>, ProcessError>>
@@ -1003,6 +1500,12 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             let jittered = Supervision.applyJitter pause config.Jitter
                             Log.stormPause config.Command.Config.Logger program jittered
                             Diag.stormPaused program
+
+                            // Reported beside the existing log/metric and BEFORE the user callback, so the
+                            // stream sees the pause even when a throwing `OnStormPause` ends supervision.
+                            let pauseNumber = stormPauses + 1
+                            emit (fun () -> SupervisionEvent.StormPaused(program, pauseNumber, jittered))
+
                             let mutable callbackError: ProcessError option = None
 
                             let callbackResult =
@@ -1059,6 +1562,10 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                         Diag.supervisorLivenessRestarted program
                     | RestartCause.Exit -> ()
 
+                    // Reported beside the existing log/metric and BEFORE the user callback, so the stream
+                    // sees the scheduled restart even when a throwing `OnRestart` ends supervision.
+                    emit (fun () -> SupervisionEvent.RestartScheduled(program, restartNumber, delay, cause))
+
                     let callbackResult =
                         match config.OnRestart with
                         | Some handler ->
@@ -1081,6 +1588,13 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
 
             let budgetExhausted () =
                 config.MaxRestarts |> Option.exists (fun limit -> restarts >= limit)
+
+            // The 1-based incarnation number every event of an incarnation is tagged with. Loop-local and
+            // loop-owned: it is bumped once per attempted incarnation (including one whose spawn fails, so
+            // an `IncarnationFailed` is still attributable) and handed down explicitly to the incarnation
+            // and its liveness monitor, rather than being re-derived from `restarts` — which only advances
+            // after a backoff, and would therefore misattribute events on the paths that never sleep.
+            let mutable attempt = 0
 
             try
                 while final.IsNone do
@@ -1115,9 +1629,14 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             // anything" shape the loop already reports for a cancelled run.
                             final <- Some(Error(ProcessError.Cancelled program))
                     else
-                        match! captureIncarnation command with
+                        attempt <- attempt + 1
+                        let attemptNumber = attempt
+
+                        match! captureIncarnation attemptNumber command with
                         | Ok result ->
                             lastResult <- Some result
+
+                            emit (fun () -> SupervisionEvent.IncarnationFinished(program, attemptNumber, result))
 
                             // Read-and-reset once per incarnation whether its liveness monitor forced this
                             // exit, so the restart below (if any) is attributed to `RestartCause.Liveness`.
@@ -1169,6 +1688,8 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                             match giveUpMatches result.FailureError with
                                             | Error error -> final <- Some(Error error)
                                             | Ok true ->
+                                                emit (fun () -> SupervisionEvent.GaveUp(program, attemptNumber))
+
                                                 final <-
                                                     Some(
                                                         Ok(
@@ -1243,6 +1764,8 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                                 escalation <- escalation + 1
                                                 bumpRestarts ()
                         | Error error ->
+                            emit (fun () -> SupervisionEvent.IncarnationFailed(program, attemptNumber, error))
+
                             // Consume the per-incarnation verdict even when capture itself failed: a
                             // live child can fault its pump after the monitor has stopped it.
                             let livenessCausedError = takeLivenessTripped ()
@@ -1265,7 +1788,9 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                 else
                                     match giveUpMatches error with
                                     | Error callbackError -> final <- Some(Error callbackError)
-                                    | Ok true -> final <- Some(Error error)
+                                    | Ok true ->
+                                        emit (fun () -> SupervisionEvent.GaveUp(program, attemptNumber))
+                                        final <- Some(Error error)
                                     | Ok false when budgetExhausted () -> final <- Some(Error error)
                                     | Ok false ->
                                         // Remember the reason this incarnation produced no result before
@@ -1291,9 +1816,19 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                                                 escalation <- escalation + 1
                                                 bumpRestarts ()
 
-                match final with
-                | Some result -> return result
-                | None -> return Error(ProcessError.Io "Supervisor loop ended without a final result.")
+                let terminal =
+                    match final with
+                    | Some result -> result
+                    | None -> Error(ProcessError.Io "Supervisor loop ended without a final result.")
+
+                // The last event of a session, published before the `finally` below closes the stream:
+                // exactly what `Completion` is about to report, so a consumer draining the stream learns
+                // how supervision ended without also having to await the session.
+                match terminal with
+                | Ok outcome -> emit (fun () -> SupervisionEvent.Stopped(program, outcome.Stopped))
+                | Error error -> emit (fun () -> SupervisionEvent.SupervisionFailed(program, error))
+
+                return terminal
             finally
                 // Always flip the live status to inactive before the loop's task completes, so an observer
                 // that awaits `Completion` then reads `Status` never sees `IsActive = true` on a finished
@@ -1309,6 +1844,14 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                 // `Cancel()`'s callback invocation. `sleepCts`'s own `use` still disposes it again once
                 // this function returns, but `Dispose()` is idempotent, so that is a harmless no-op.
                 lock gate (fun () ->
+                    // Close the opt-in event stream in the SAME critical section as the cancellation
+                    // teardown, so no emission (the loop's own, or a still-unwinding liveness monitor's)
+                    // can land between "supervision ended" and "the stream is closed", and a consumer's
+                    // enumeration ends once it has drained what is queued. Completing a channel built with
+                    // `AllowSynchronousContinuations = false` never runs consumer code inline, so this
+                    // cannot execute anything else while `gate` is held.
+                    eventBuffer |> Option.iter (fun buffer -> buffer.Complete())
+
                     sleepCts.Dispose()
                     stopCts.Dispose())
         }
@@ -1326,6 +1869,66 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     /// supervision ends — exactly what `Supervisor.RunAsync` returns. `await` it to block until
     /// supervision concludes on its own, via `StopAsync`, or via the `StartAsync` token's cancellation.
     member _.Completion: Task<Result<SupervisionOutcome, ProcessError>> = completion
+
+    /// This session's typed lifecycle-event stream — incarnation starts and outcomes, launch-failure
+    /// classes, scheduled restarts, storm pauses, health-check verdicts, give-up decisions, and the
+    /// terminal reason — as an `IAsyncEnumerable<SupervisionEvent>` you drain while supervision runs
+    /// (concurrently with `Completion`/`StopAsync`; the stream ends when supervision does).
+    ///
+    /// Requires the stream to have been enabled on the builder (`Supervisor.Events`), which is what
+    /// gives the session somewhere to retain events from its very first incarnation — before any
+    /// consumer could have asked for them. Without it this throws `InvalidOperationException`, rather
+    /// than handing back a stream that would silently be missing the beginning of supervision.
+    ///
+    /// **One consumer.** Reading the buffer is destructive, so a second consumer would steal events
+    /// from the first: call this once and share the enumeration, or a repeat call throws
+    /// `InvalidOperationException`. Purely additive to the `OnRestart`/`OnStormPause` callbacks and the
+    /// `Status` snapshot — enabling it changes no supervision decision, timing, or outcome.
+    ///
+    /// **Bounded, with an explicit gap marker.** The buffer holds at most the configured capacity of
+    /// unread events. A consumer that keeps up loses nothing; one that falls behind (or never reads)
+    /// makes the supervisor drop the OLDEST unread events to make room for newer ones — supervision is
+    /// never slowed down or blocked by its observer. Each such gap is reported: the next event the
+    /// consumer sees is a `SupervisionEventKind.EventsDropped` carrying exactly how many were lost,
+    /// immediately before the oldest event that survived, and `DroppedEventCount` keeps the lifetime
+    /// total.
+    member _.EventsAsync() : IAsyncEnumerable<SupervisionEvent> =
+        match eventBuffer with
+        | None ->
+            raise (
+                InvalidOperationException
+                    "This supervision session publishes no events. Enable the stream on the builder first, with Supervisor.Events()."
+            )
+        | Some buffer ->
+            let claimed =
+                lock gate (fun () ->
+                    if eventsTaken then
+                        false
+                    else
+                        eventsTaken <- true
+                        true)
+
+            if not claimed then
+                raise (
+                    InvalidOperationException
+                        "This supervision session's event stream was already taken; a second consumer would steal events from the first."
+                )
+
+            // The consumer's every step is taken under the same `gate` the loop publishes under, so a
+            // gap marker can never be reported out of order with the events around it. Only the wait
+            // for more events happens outside the lock, on the channel itself.
+            SupervisionEventStream(buffer.Reader, (fun () -> lock gate (fun () -> buffer.TryTakeNext())), eventProgram)
+            :> IAsyncEnumerable<SupervisionEvent>
+
+    /// How many events this session has dropped so far because the event stream's consumer fell behind
+    /// its bounded capacity (or never read it) — the lifetime total behind the in-band
+    /// `SupervisionEventKind.EventsDropped` markers, and the supervision analogue of
+    /// `RunningProcess.DroppedStreamLineCount`. Always `0` when no stream was enabled, and while a
+    /// consumer keeps up. Safe to read at any time, including after supervision has ended.
+    member _.DroppedEventCount: int64 =
+        match eventBuffer with
+        | None -> 0L
+        | Some buffer -> lock gate (fun () -> buffer.DroppedCount)
 
     /// Request a graceful stop with `gracePeriod`: stop a live-handle incarnation through its own
     /// graceful path (`RunningProcess.StopAsync`, honouring the grace window), or immediately cancel a
@@ -1434,6 +2037,14 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
 /// `Completion` task — use `StartAsync`, which returns a live `SupervisionSession` handle. `RunAsync`
 /// is a thin wrapper over `StartAsync` + awaiting `Completion`; the `Status` snapshot *adds* to the
 /// `OnRestart`/`OnStormPause` callbacks without replacing them.
+///
+/// **Event stream.** Where the callbacks push two specific transitions into your code, `Events` opts in
+/// to the whole lifecycle as a *pull*-based `IAsyncEnumerable<SupervisionEvent>`
+/// (`SupervisionSession.EventsAsync`): starts, outcomes, launch-failure classes, restarts, storm pauses,
+/// health-check verdicts, give-ups, and the terminal reason, each a non-secret typed value. It is a
+/// third additive view alongside the callbacks and `Status`, never a replacement — and because a
+/// supervisor must not be pacing itself against its observer, its buffer is bounded and drops the oldest
+/// unread events (counted, and marked in-band) instead of applying backpressure.
 [<Sealed>]
 type Supervisor internal (config: SupervisorConfig) =
 
@@ -1735,6 +2346,36 @@ type Supervisor internal (config: SupervisorConfig) =
     member _.LivenessGrace(grace: TimeSpan) =
         ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero, nameof grace)
         Supervisor({ config with LivenessGrace = grace })
+
+    /// Enable the **live event stream** on the sessions this supervisor starts: `StartAsync` then hands
+    /// out a typed `SupervisionEvent` sequence through `SupervisionSession.EventsAsync`, reporting every
+    /// incarnation start/outcome, launch-failure class, scheduled restart, storm pause, health-check
+    /// verdict, give-up decision, and the terminal reason. Off by default, and purely additive: the
+    /// `OnRestart`/`OnStormPause` callbacks and the `Status` snapshot keep working exactly as before, and
+    /// no supervision decision, delay, or outcome depends on whether a stream is enabled or read.
+    ///
+    /// It is enabled here, on the builder, rather than discovered when a consumer first asks: the
+    /// session must already be retaining events when its first incarnation starts, which happens as soon
+    /// as `StartAsync` returns. Without this opt-in a session allocates no buffer and builds no event at
+    /// all — `RunAsync` and every existing consumer pay nothing.
+    ///
+    /// `capacity` is the number of *unread* events the session retains (must be at least 1). Because an
+    /// observer must never be able to stall a supervisor, a consumer that falls behind does not apply
+    /// backpressure: the oldest unread events are dropped to make room for newer ones, and the gap is
+    /// reported explicitly — see `SupervisionSession.EventsAsync` and `DroppedEventCount`.
+    member _.Events(capacity: int) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1, nameof capacity)
+
+        Supervisor(
+            { config with
+                EventCapacity = Some capacity }
+        )
+
+    /// `Events` with the default capacity of 128 unread events — deep enough that an ordinary consumer
+    /// never lags (one crash-restart cycle costs three events), shallow enough that a stream nobody
+    /// reads still cannot grow the supervisor's memory.
+    member this.Events() =
+        this.Events Supervision.DefaultEventCapacity
 
     /// Internal test seam: inject a virtual clock (advance-on-sleep) for deterministic timing tests.
     member internal _.WithClock(now: unit -> float, sleep: TimeSpan -> CancellationToken -> Task) =

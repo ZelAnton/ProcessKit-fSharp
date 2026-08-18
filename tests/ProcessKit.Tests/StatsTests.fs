@@ -23,6 +23,7 @@ type internal MemberStatsSeamBackend(memberStats: unit -> Result<MemberStats lis
 
         member _.Track(_spawned) = Ok()
         member _.Adopt(_pid) = Ok()
+        member _.AdoptByPid(_pid) = Ok()
         member _.Release(_spawned) = ()
         member _.Wait(_handle) = Task.FromResult(Outcome.Exited 0)
         member _.PidOf(spawned) = Some(int spawned.Handle)

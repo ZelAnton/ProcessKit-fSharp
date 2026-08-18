@@ -260,6 +260,28 @@ type internal IContainmentBackend =
     /// process already in an incompatible Job), never a fabricated success.
     abstract Adopt: int -> Result<unit, ProcessError>
 
+    /// Place an already-running external process into the container from a **bare pid** — no `Process`,
+    /// no handle, nothing but the number (`ProcessGroup.AdoptByPid`). Same ownership contract as `Adopt`
+    /// (never reaped here, never `killpg`ed, listed and signalled with the group), and a different
+    /// IDENTITY contract, which is the whole reason it is its own member rather than a second caller of
+    /// `Adopt`.
+    ///
+    /// A pid is an address, not a handle: once a process is reaped the OS may hand its number to an
+    /// unrelated one. So the number is used to FIND the process, and each backend then binds the group to
+    /// an anchor of its own for whatever the number currently names — the process OBJECT behind one
+    /// `OpenProcess` (Job Object), kernel-maintained cgroup membership plus a start-time read on either
+    /// side of the write that moves it in (cgroup v2), or the pid PLUS the start-time token re-read
+    /// before every later probe and delivery (POSIX process group). What no backend can check is the
+    /// window BEFORE the call, in which the caller's number may already have changed hands.
+    ///
+    /// A backend that cannot take such an anchor at all returns `ProcessError.Unsupported` — a POSIX host
+    /// with no start-time reader (the BSDs), where tracking the number would mean signalling whatever
+    /// holds it at teardown — and a per-process failure (a pid that names nothing, a denied read or
+    /// write, an assign the kernel refuses, a target this process may not signal, a number that changed
+    /// hands during the call) is a typed `ProcessError.Adopt`. Never a silent downgrade to raw by-number
+    /// containment, and never a member the group would be unable to kill.
+    abstract AdoptByPid: int -> Result<unit, ProcessError>
+
     /// Stop tracking a reaped child (close its handle / drop it from the container's view).
     abstract Release: Native.Common.Spawned -> unit
 
@@ -371,6 +393,22 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
             // bound by the Job's limits — with NO per-child tracking here: it is not our child, so it has
             // no reap ledger entry and no `ctrlGroups` mapping (a foreign process was not started with
             // `Command.WindowsCtrlSignals()`, so it is not CTRL+BREAK-targetable through us).
+            Native.Windows.adoptIntoJob jobHandle pid
+
+        member _.AdoptByPid(pid) =
+            // The SAME native call, and that is the honest answer here rather than a shortcut: on this
+            // mechanism a bare pid is no weaker than a `Process`, because the anchor is the process
+            // OBJECT, not the number. `adoptIntoJob` uses the number exactly once, in its own
+            // `OpenProcess`; from there everything — the `AssignProcessToJobObject`, the failure
+            // disambiguation — runs on that handle, and the kernel keeps Job membership per object. So
+            // there is no window AFTER this call in which a recycled number could put a stranger in the
+            // Job, and nothing for a later re-verification to add: `Members`/`Suspend`/`Resume`/the Job
+            // kill all act through the Job itself, and per-member sampling already re-checks each pid
+            // against a creation-time generation snapshot.
+            //
+            // The one window that remains is the one no mechanism can close: whether the number still
+            // named the intended process when the CALLER read it. `ProcessGroup.AdoptByPid` documents it;
+            // `Adopt(Process)` is what closes it, because the caller's own open handle pins the pid.
             Native.Windows.adoptIntoJob jobHandle pid
 
         member _.Release(spawned) =
@@ -781,6 +819,59 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                 Ok()
             | Error detail -> Error(ProcessError.Adopt(pid, detail))
 
+        member _.AdoptByPid(pid) =
+            // Same containment as `Adopt` — one write to `cgroup.procs`, after which kernel-maintained
+            // membership (not our tracking set) is what `cgroup.kill`/`cgroup.freeze`/the per-member
+            // signal sweep/`Members`/`Stats` all work from — with the identity handling a BARE number
+            // requires around it.
+            //
+            // The anchor is read BEFORE the write and again AFTER it. Unlike Windows, nothing here pins a
+            // pid: `/proc/<pid>/stat`'s start time can only DETECT that the number changed hands across
+            // the write, never prevent it. So:
+            //
+            //  * no readable identity up front → refuse. Adopting on the strength of the number alone is
+            //    precisely what this path exists to avoid, and the anchor is also what keeps this
+            //    member's per-member stats identity-safe afterwards (see `adoptedIdentities`).
+            //  * a changed identity across the write → the write has already landed on a STRANGER, and
+            //    cgroup v2 membership is exclusive, so it is now in our cgroup and would be killed by our
+            //    teardown. Move it back out (to the cgroup our own directory lives in) and report the
+            //    race honestly, saying which of the two states it left behind.
+            //  * an identity that has become unreadable → the process exited during the call (the
+            //    ordinary case: a member leaves `cgroup.procs` on exit) or its `/proc` entry is no longer
+            //    readable. Neither is PROOF of a recycle, and the established rule here is that only two
+            //    KNOWN, differing tokens are (`Native.Posix.trackedTarget`), so the adoption stands with
+            //    the anchor captured up front — and every later per-member read stays gated on it.
+            match Native.Posix.readProcessIdentity pid with
+            | None ->
+                Error(
+                    ProcessError.Adopt(
+                        pid,
+                        "the process's start-time identity could not be read (/proc/<pid>/stat is missing — the process is gone — or unreadable under a hidepid mount or another user); a bare pid is never adopted on the strength of the number alone"
+                    )
+                )
+            | Some anchor ->
+                match Native.Cgroup.adoptIntoCgroup cgroupPath pid with
+                | Error detail -> Error(ProcessError.Adopt(pid, detail))
+                | Ok() ->
+                    match Native.Posix.readProcessIdentity pid with
+                    | Some current when current <> anchor ->
+                        let aftermath =
+                            match Native.Cgroup.releaseFromCgroup cgroupPath pid with
+                            | Ok() ->
+                                "it was moved back out into the parent cgroup, so this group's teardown no longer reaches it (its previous cgroup cannot be restored — the kernel does not report which one a task left)"
+                            | Error detail ->
+                                $"and it could NOT be moved back out ({detail}), so it remains a member of this group's cgroup and WILL be killed by this group's teardown"
+
+                        Error(
+                            ProcessError.Adopt(
+                                pid,
+                                $"the pid changed hands while the adoption ran: the start-time identity read after the cgroup.procs write differs from the one read before it, so the process now holding this number is not the one named — {aftermath}"
+                            )
+                        )
+                    | _ ->
+                        adoptedIdentities[pid] <- Some anchor
+                        Ok()
+
         member _.Release(spawned) =
             // A run verb has reaped this child; stop tracking so teardown does not waitpid it again.
             // (The kernel already removed it from cgroup.procs.)
@@ -1030,6 +1121,35 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
     // in lockstep (see `untrack`).
     let identities = ConcurrentDictionary<int, uint64 option>()
 
+    // Foreign processes adopted BY BARE PID (`ProcessGroup.AdoptByPid`), each with the start-time anchor
+    // captured when it was adopted. A SEPARATE ledger from `children`, and deliberately so — the two
+    // differ in every way that matters to teardown:
+    //
+    //  * `children` holds pgids WE created, so its entries may be `killpg`ed and MUST be `waitpid`ed (we
+    //    own their exit status). An adopted process is neither our child (a `waitpid` would `ECHILD`)
+    //    nor the leader of a group we own (a `killpg` would sweep a stranger's tree) — see K-016.
+    //  * its identity token is a plain `uint64`, not an option: this mechanism refuses to adopt a pid
+    //    whose identity it cannot read, so an entry here always has an anchor to re-verify against,
+    //    and there is no "unknown token → fall back to the by-number verdict" case to degrade into.
+    //
+    // What the group gives such a process is exactly what it can honestly give: it is listed by
+    // `Members`, sampled by `MemberStats`, receives `Signal`/`Suspend`/`Resume`, and is SIGKILLed by
+    // `KillTree`/teardown — each of those re-reading the anchor first (`Native.Posix.adoptedStillOurs`)
+    // so a recycled number is pruned rather than signalled. Processes it forks AFTERWARDS are not
+    // contained: this mechanism contains by tracking, and POSIX has no primitive that moves a foreign,
+    // already-`exec`ed process into our process group.
+    let adopted = ConcurrentDictionary<int, uint64>()
+
+    // A point-in-time copy of the adopted ledger, taken before any delivery — the same
+    // snapshot-then-work discipline `children.Snapshot()` follows, and what the off-lock graceful poll
+    // must hold on to instead of re-reading a dictionary a concurrent teardown can clear (K-086).
+    let adoptedSnapshot () : (int * uint64) list =
+        adopted |> Seq.map (fun entry -> entry.Key, entry.Value) |> List.ofSeq
+
+    // Drop an adopted pid from tracking — used when its anchor no longer matches (recycled) or nothing
+    // is at the number any more. Nothing is reaped or killed here: it never was ours to reap.
+    let untrackAdopted (pid: int) = adopted.TryRemove pid |> ignore
+
     // The single liveness + identity choke every probe/signal/kill path funnels through, so the reuse
     // check is never duplicated per call site: is `pgid` still the SAME live group we tracked, and where
     // does an operation on it go? It gates the by-number liveness probe through the pgid's captured
@@ -1063,11 +1183,22 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
     // instead, so a control operation can never target an unrelated process group. Continue after
     // failures to give every remaining group a chance to receive the operation, then report the first
     // delivery failure.
+    //
+    // The adopted pass that follows is the same shape over the OTHER ledger, with the one difference the
+    // ownership demands: delivery is to the exact pid (`deliverAdopted`, which re-reads the anchor), never
+    // to a process group we did not create. Its pruning is driven by the SAME verdict that decided the
+    // delivery rather than by a second probe — a `TargetGone` there means either a recycled number or an
+    // `ESRCH`, and in both cases nothing of ours is at that number any more.
     let sweep
         (deliver: Native.Posix.TrackedTarget -> int -> Native.Common.SignalDelivery)
+        (deliverAdopted: int -> uint64 -> Native.Common.SignalDelivery)
         (describeFailure: int -> string -> string)
         : Result<unit, ProcessError> =
         let mutable firstFailure: (int * string) option = None
+
+        let note (errno: int) (message: string) =
+            if firstFailure.IsNone then
+                firstFailure <- Some(errno, message)
 
         for pgid in children.Snapshot() do
             let target = targetOf pgid
@@ -1078,9 +1209,13 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                 match deliver target pgid with
                 | Native.Common.SignalDelivery.Delivered
                 | Native.Common.SignalDelivery.TargetGone -> ()
-                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) ->
-                    if firstFailure.IsNone then
-                        firstFailure <- Some(errno, message)
+                | Native.Common.SignalDelivery.DeliveryFailed(errno, message) -> note errno message
+
+        for pid, anchor in adoptedSnapshot () do
+            match deliverAdopted pid anchor with
+            | Native.Common.SignalDelivery.Delivered -> ()
+            | Native.Common.SignalDelivery.TargetGone -> untrackAdopted pid
+            | Native.Common.SignalDelivery.DeliveryFailed(errno, message) -> note errno message
 
         match firstFailure with
         | None -> Ok()
@@ -1123,6 +1258,60 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                     "adopting an external process into a POSIX process group is not possible (setpgid only relocates our own children, and only before exec); adoption needs a Windows Job Object or a Linux cgroup v2 group (created with resource limits)"
             )
 
+        member _.AdoptByPid(pid) =
+            // Unlike `Adopt`, this one IS supported here — because it asks for something this mechanism
+            // can actually do. `Adopt` fails above for a real reason: there is no kernel primitive that
+            // MOVES a foreign, already-`exec`ed process into our process group, and this backend's
+            // containment used to be nothing but that group. Bare-pid adoption does not need the move:
+            // this mechanism contains by TRACKING (the same way each spawned pgid is tracked), and an
+            // anchor makes tracking a foreign number safe. Nothing about the target is changed — no
+            // `setpgid` is attempted on it, which POSIX would refuse for a stranger anyway and which,
+            // where it did succeed, would make it a process-group leader and move where a terminal's
+            // job-control signals reach it.
+            //
+            // What that buys, stated exactly: the adopted process is listed, signalled, suspended/resumed
+            // and SIGKILLed with the group, every one of those re-verifying the anchor first. What it
+            // does NOT buy: processes it forks afterwards (they inherit ITS process group, not our
+            // tracking), and its exit status, which stays with its real parent — this library never
+            // `waitpid`s it.
+            //
+            // Three distinct refusals, never conflated. A host with no start-time reader at all (the BSDs)
+            // has no anchor to take for ANY pid: `Unsupported`, the whole-platform answer, rather than
+            // silently tracking a bare number that teardown would later SIGKILL whoever holds. A host
+            // with a reader that cannot read THIS pid (already gone, `hidepid`, another user's process on
+            // macOS) is a per-process `Adopt` failure. And a pid this process may not SIGNAL is a
+            // per-process `Adopt` failure too — see the signalability gate below, which is the one thing
+            // the anchor read cannot answer.
+            if not (Native.Posix.processIdentityReaderAvailable ()) then
+                Error(
+                    ProcessError.Unsupported
+                        "adopting an external process by bare pid needs a start-time identity anchor for it (Linux /proc/<pid>/stat, macOS proc_pidinfo); this platform ships no reader ProcessKit can verify, and a pid tracked by number alone would let teardown SIGKILL whatever holds that number later"
+                )
+            else
+                match Native.Posix.readProcessIdentity pid with
+                | None ->
+                    Error(
+                        ProcessError.Adopt(
+                            pid,
+                            "the process's start-time identity could not be read (it is already gone, or its /proc entry is unreadable under a hidepid mount or for another user); a bare pid is never tracked on the strength of the number alone"
+                        )
+                    )
+                | Some anchor ->
+                    // The anchor proves we can IDENTIFY this process; it says nothing about whether we can
+                    // CONTROL it, and on Linux the two come apart routinely (`/proc/<pid>/stat` is
+                    // world-readable, so another user's process reads back a perfectly good anchor while
+                    // every `kill` to it fails EPERM — unreported, because the teardown kill is
+                    // fire-and-forget). Accepting such a pid would report containment of a process this
+                    // group cannot signal or SIGKILL: the silent downgrade of the kill-on-dispose
+                    // guarantee. The other two mechanisms refuse it by construction — a denied
+                    // `OpenProcess`, a denied `cgroup.procs` write — so this one asks the same question
+                    // explicitly, with the probe that answers it and delivers nothing.
+                    match Native.Posix.ensureAdoptedSignalable pid with
+                    | Error detail -> Error(ProcessError.Adopt(pid, detail))
+                    | Ok() ->
+                        adopted[pid] <- anchor
+                        Ok()
+
         member _.Release(spawned) =
             // A pgid is a whole group; the reaped leader may have left backgrounded members behind, so
             // only stop tracking once the group is actually empty — or the pgid has been recycled by an
@@ -1162,6 +1351,14 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                 else
                     Native.Posix.killTracked target pgid
 
+            // Adopted foreign pids: the EXACT pid, and only while its anchor still matches — `killAdopted`
+            // re-reads it and reports whether the SIGKILL went out, so the mismatch that skips the kill is
+            // the same verdict that prunes the entry. No `killpg` behind it (that group is not ours), and
+            // no reap after it (it is not our child — its real parent, or `init`, reaps it).
+            for pid, anchor in adoptedSnapshot () do
+                if not (Native.Posix.killAdopted pid anchor) then
+                    untrackAdopted pid
+
             Ok()
 
         member _.GracefulKillTree (signal) (grace) =
@@ -1189,8 +1386,19 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                 | Some token -> Native.Posix.trackedTarget pgid token
                 | None -> Native.Posix.TrackedTarget.Gone
 
+            // The adopted ledger gets the same treatment for the same reason: a concurrent `HardRelease`
+            // clears it, so the poll — which runs OFF the lifecycle lock — must work from a copy taken
+            // here rather than re-reading it (K-086). The anchor itself never changes for a given entry;
+            // it is the identity re-read against it that happens per phase.
+            let adoptedPids = adoptedSnapshot ()
+
+            let anyAdoptedAliveSnap () =
+                adoptedPids
+                |> List.exists (fun (pid, anchor) -> Native.Posix.adoptedStillOurs pid anchor)
+
             let anyChildAliveSnap () =
                 pgids |> List.exists (fun pgid -> not (TrackedTargets.isGone (targetSnap pgid)))
+                || anyAdoptedAliveSnap ()
 
             GracefulTeardown.poll
                 // The soft sweep: `signalTracked` sends an OBSERVABLE signal, so a `LeaderPid` verdict
@@ -1202,7 +1410,11 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
 
                         if not (TrackedTargets.isGone target) then
                             Native.Posix.signalTracked target pgid (Native.Posix.signalNumber signal)
-                            |> ignore)
+                            |> ignore
+
+                    for pid, anchor in adoptedPids do
+                        Native.Posix.signalAdopted pid anchor (Native.Posix.signalNumber signal)
+                        |> ignore)
                 anyChildAliveSnap
                 // The escalation. `killTracked` is what makes this whole-tree even for a child still in
                 // its pre-`setsid()` window: the `LeaderPid` route SIGKILLs the pid and sweeps `killpg`
@@ -1214,7 +1426,14 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                         let target = targetSnap pgid
 
                         if not (TrackedTargets.isGone target) then
-                            Native.Posix.killTracked target pgid)
+                            Native.Posix.killTracked target pgid
+
+                    // The adopted half of the escalation: the exact pid, anchor re-read one last time
+                    // inside `killAdopted`. Nothing is pruned here — this snapshot is the poll's own copy
+                    // (the ledger it came from may have been drained by a concurrent `HardRelease`), so
+                    // the anchor verdict is used only to decide the delivery.
+                    for pid, anchor in adoptedPids do
+                        Native.Posix.killAdopted pid anchor |> ignore)
                 grace
 
         member _.SignalChild(spawned, signal) =
@@ -1241,8 +1460,16 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
         member _.Members() =
             // Report only the pgids still ours and alive (choke-gated): a drained or recycled pgid is not
             // a member of this group, while a freshly-spawned pty leader whose group does not exist yet
-            // is (it is a live child of ours). This is a read — it does not prune (a mutating op does).
-            Ok(children.Snapshot() |> List.filter stillOurs)
+            // is (it is a live child of ours). Adopted foreign pids are members on the same terms, gated
+            // on their own anchor. This is a read — it does not prune (a mutating op does).
+            let tracked = children.Snapshot() |> List.filter stillOurs
+
+            let adoptedMembers =
+                adoptedSnapshot ()
+                |> List.filter (fun (pid, anchor) -> Native.Posix.adoptedStillOurs pid anchor)
+                |> List.map fst
+
+            Ok(tracked @ adoptedMembers)
 
         member _.Signal(signal) =
             let signalNum = Native.Posix.signalNumber signal
@@ -1254,33 +1481,51 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
             match Native.Posix.ensureDeliverable signalNum with
             | Error error -> Error error
             | Ok() ->
-                sweep (fun target pgid -> Native.Posix.signalTracked target pgid signalNum) (fun errno message ->
-                    $"failed to deliver signal {signalNum} to process group: {message} (errno {errno})")
+                sweep
+                    (fun target pgid -> Native.Posix.signalTracked target pgid signalNum)
+                    (fun pid anchor -> Native.Posix.signalAdopted pid anchor signalNum)
+                    (fun errno message ->
+                        $"failed to deliver signal {signalNum} to process group: {message} (errno {errno})")
 
         member _.Suspend() =
-            sweep Native.Posix.suspendTracked (fun errno message ->
+            sweep Native.Posix.suspendTracked Native.Posix.suspendAdopted (fun errno message ->
                 $"failed to suspend process group: {message} (errno {errno})")
 
         member _.Resume() =
-            sweep Native.Posix.resumeTracked (fun errno message ->
+            sweep Native.Posix.resumeTracked Native.Posix.resumeAdopted (fun errno message ->
                 $"failed to resume process group: {message} (errno {errno})")
 
         member _.Stats() =
-            let active = children.Snapshot() |> List.filter stillOurs |> List.length
-            Ok(ProcessGroupStats(active, None, None, None, None))
+            let tracked = children.Snapshot() |> List.filter stillOurs |> List.length
+
+            let adoptedAlive =
+                adoptedSnapshot ()
+                |> List.filter (fun (pid, anchor) -> Native.Posix.adoptedStillOurs pid anchor)
+                |> List.length
+
+            Ok(ProcessGroupStats(tracked + adoptedAlive, None, None, None, None))
 
         member _.MemberStats() =
             let pids = children.Snapshot() |> List.filter stillOurs
 
-            pids
-            |> List.choose (fun pid ->
-                let identity =
-                    match identities.TryGetValue pid with
-                    | true, token -> token
-                    | false, _ -> None
+            let tracked =
+                pids
+                |> List.choose (fun pid ->
+                    let identity =
+                        match identities.TryGetValue pid with
+                        | true, token -> token
+                        | false, _ -> None
 
-                Native.Posix.readMemberStatsWithIdentity pid identity)
-            |> Ok
+                    Native.Posix.readMemberStatsWithIdentity pid identity)
+
+            // Adopted members sample against their own anchor, which the shared reader gates the metric
+            // read on before AND after it — so a number recycled mid-read contributes nothing rather
+            // than a stranger's CPU/memory figures.
+            let adoptedSampled =
+                adoptedSnapshot ()
+                |> List.choose (fun (pid, anchor) -> Native.Posix.readMemberStatsWithIdentity pid (Some anchor))
+
+            Ok(tracked @ adoptedSampled)
 
         member _.UpdateLimits(limits) =
             // The POSIX process-group mechanism has no whole-tree limit primitive to update — the exact
@@ -1343,3 +1588,16 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
 
                 pgid, identity)
             |> PosixReap.drain
+
+            // Adopted foreign pids are the deliberate exception to everything above: kill, never reap.
+            // Each is SIGKILLed by its EXACT pid while its anchor still matches — no `killpg` (that group
+            // is not ours) and no `waitpid`/ledger handoff (it is not our child; a wait would `ECHILD`,
+            // and its real parent or `init` reaps it). Drained first, so this teardown owns the kill
+            // exactly once however it is driven, and so a recycled entry cannot survive into a later pass.
+            for pid, anchor in adoptedSnapshot () do
+                // Take-then-kill, so this drain is exactly as one-shot as `children.Drain()` above: only
+                // the call that actually removes the entry delivers its SIGKILL, and a concurrent
+                // teardown that got there first owns that delivery instead of both of them repeating it.
+                match adopted.TryRemove pid with
+                | true, _ -> Native.Posix.killAdopted pid anchor |> ignore
+                | false, _ -> ()

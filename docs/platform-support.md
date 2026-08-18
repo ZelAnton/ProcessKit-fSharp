@@ -139,6 +139,7 @@ says why, and the matching verb still refuses with its own typed `ProcessError`.
 | `ResourceLimits` | one `Capability` per `ResourceLimits` dimension (`MemoryMax`, `OomGroupKill`, `MaxProcesses`, `CpuQuota`, `CpuTimeMax`, `CpuAffinity`, `IoMax`, `UiRestrictions`, and `LiveUpdate` for `UpdateLimits`) | [Resource limits](#capability-matrices) |
 | `Signals` | `Kill`, `SoftStop` (`Signal.Int`/`Signal.Term`), and `Arbitrary` (every other signal) | [Signals](#capability-matrices) |
 | `Adoption` | `ProcessGroup.Adopt` | [Adopting an external process](#capability-matrices) |
+| `AdoptionByPid` | `ProcessGroup.AdoptByPid` — a separate axis, because a bare pid needs an identity *anchor* rather than a relocation primitive, and the two answers differ on the POSIX process group | [Adopting an external process](#capability-matrices) |
 | `Pty` / `PtyResize` | `Command.Pty`, and `RunningProcess.ResizeAsync` on such a run | [PTY capabilities](#pseudo-terminal-pty-capabilities) |
 | `KillOnParentDeath` / `KillOnParentDeathScope` | `Command.KillOnParentDeath`, and how far its cleanup reaches | [Reaping on sudden parent death](#capability-matrices) |
 | `Helpers` | the external binaries this platform's spawn paths load (`setpriv`, `setsid`, `/bin/sh`; `cmd.exe` on Windows), what each is for, and whether this host holds it | [Caveats](#caveats) |
@@ -149,7 +150,11 @@ Two reading rules keep the answers honest, and are worth knowing before you bran
   *asking* for a whole-tree cap is itself what selects the cgroup v2 mechanism, so reporting
   `MemoryMax` as unsupported for a limit-free options set would understate a host that can enforce it
   the moment it is requested. `Mechanism` and `Creation` are the members that answer for the options
-  as they stand; `Adoption` and `Signals` follow the mechanism those options select.
+  as they stand; `Adoption`, `AdoptionByPid` and `Signals` follow the mechanism those options select.
+- **`Adoption` and `AdoptionByPid` can disagree on the same host, deliberately.** They ask different
+  questions: whether the mechanism can *move* a foreign process into the container, and whether it can
+  *anchor* a bare number safely. A limit-free Linux or a macOS group answers no to the first and yes to
+  the second.
 - **A mounted cgroup v2 hierarchy is reported as `Qualified`, not `Available`.** Enabling the
   controllers a cap needs is permitted only at the *real* hierarchy root, and a cgroup namespace root
   (an ordinary container, a systemd scope) is indistinguishable from it without attempting the write —
@@ -264,11 +269,12 @@ terminates the Job — so a child with no window (or one that vetoes the close) 
 as before, and the kill-on-dispose guarantee is never weakened. On the Unix mechanisms it is the
 configured `ProcessGroupOptions.StopSignal` (default `Signal.Term`), then a grace window, then `SIGKILL`.
 
-**Adopting an external process (`Adopt`)**
+**Adopting an external process (`Adopt`, `AdoptByPid`)**
 
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
 |---|:---:|:---:|:---:|
 | `Adopt(process)` an already-running external process | ✅ `AssignProcessToJobObject` | 🟡 write pid to `cgroup.procs` — **limited groups only** | ❌ `ProcessError.Unsupported` |
+| `AdoptByPid(pid)` the same, from a bare pid | ✅ the process **object** behind one `OpenProcess` | 🟡 cgroup membership + a start-time read either side of the write — **limited groups only** | 🟡 tracked individually against a re-verified start-time token, and only for a target this caller may signal (Linux/macOS) — ❌ `ProcessError.Unsupported` on the BSDs |
 
 `Adopt` brings a process ProcessKit did *not* start into the container, so kill-on-dispose and every
 whole-tree control/stat/limit thereafter covers it. It takes a `System.Diagnostics.Process` (not a raw
@@ -280,6 +286,29 @@ foreign process (`setpgid` moves only our own children, before `exec`) and refus
 in an incompatible Job returns the typed `ProcessError.Adopt`. The adopted process is not ProcessKit's
 child: it is contained and killed through the OS primitive alone (`KILL_ON_JOB_CLOSE` / `cgroup.kill`) and
 never `waitpid`ed, so its exit is observed through the caller's own `Process`, not a `RunningProcess`.
+
+`AdoptByPid` is the same containment for a caller who holds only the number (a pidfile, a registry, an
+FFI or IPC boundary). Because a pid is an address rather than a handle, it captures an identity **anchor**
+of its own for whatever the number currently names and binds the group to that — the process object on
+Windows, kernel cgroup membership plus a start-time read on either side of the `cgroup.procs` write on
+cgroup v2, and the pid plus a start-time token **re-read before every probe, signal, suspend/resume and
+teardown kill** on the POSIX process group. So the row that cannot `Adopt` at all *can* adopt by pid,
+which is why the two axes are reported separately (`Capabilities().Adoption` vs `.AdoptionByPid`): that
+mechanism contains by tracking rather than by moving, and tracking a foreign number is safe once anchored.
+Its qualification is real, though: only the adopted process itself is contained there, not the processes
+it forks afterwards. A platform with **no start-time reader** (the BSDs) has no anchor to take and returns
+`ProcessError.Unsupported` rather than tracking a bare number teardown would later SIGKILL whoever holds.
+`pid <= 0` and this process's own pid are refused up front with `ProcessError.Adopt`, and so is a number
+that changed hands during the call — on cgroup v2 that case is rolled back by moving the stranger out to
+the parent cgroup, or, if even that is refused, reported as still contained here. A process this caller
+may **not signal** (another user's, a protected one) is refused with `ProcessError.Adopt` too: the POSIX
+process group asks with an explicit `kill(pid, 0)` probe at adoption, because reading a start-time anchor
+proves only that the process can be identified — on Linux `/proc/<pid>/stat` is world-readable — never
+that it can be controlled, while the Job Object and cgroup v2 rows reach the same refusal through their
+denied `OpenProcess`/`cgroup.procs` write. Ownership is unchanged:
+nothing adopted is ever `waitpid`ed by ProcessKit. The window this cannot close is the one before the
+call — whether the number still named the intended process when you passed it — so where a live `Process`
+is available, `Adopt` remains the stronger of the two on Windows.
 
 **Launching outside containment (`Command.LaunchDetached`)**
 
@@ -362,7 +391,7 @@ the verb was set):
 
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
 |---|:---:|:---:|:---:|
-| `Members()` snapshot | ✅ whole tree | ✅ whole tree | 🟡 tracked group leaders only |
+| `Members()` snapshot | ✅ whole tree | ✅ whole tree | 🟡 tracked group leaders, plus any `AdoptByPid` member whose anchor still matches |
 
 `MembersInfo()` returns that same membership enriched per pid (`MemberInfo`: `Pid`, `Ppid`, `ExeName`,
 `StartTime`). Enrichment follows the **OS**, not the mechanism — on Linux both the cgroup v2 and the
@@ -449,6 +478,23 @@ restrictions with `ProcessError.Unsupported`, leaving the previous caps untouche
 process-group mechanism (macOS/BSD, or Linux without cgroup v2) returns
 `ProcessError.ResourceLimit` — never a silent no-op. See
 [process-groups.md](process-groups.md) for the API and semantics.
+
+**`argv[0]` override (`Command.Arg0`)**
+
+| Capability | Windows | Linux / macOS / BSD (POSIX) |
+|---|:---:|:---:|
+| Override `argv[0]` independently of `Program` | ❌ `ProcessError.Unsupported` (no separate `argv[0]` contract) | ✅ distinct `argv[0]` on `posix_spawnp` |
+| Combined with a `Uid`/`Gid`/`Groups`/`KillOnParentDeath` drop | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (`setpriv` has no `argv[0]` seam) |
+| Combined with `Command.Pty` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (`setsid --ctty` has no `argv[0]` seam) |
+| Combined with a run under the Linux cgroup backend | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the `/bin/sh` migration launcher has no `argv[0]` seam) |
+| Combined with `ResourceLimits.CpuTimeMax` on the POSIX process-group mechanism | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the `/bin/sh` `RLIMIT_CPU` shim has no `argv[0]` seam) |
+| Combined with a lone `Setsid` (no privilege drop) | ❌ `ProcessError.Unsupported` | ✅ composes normally (no helper involved) |
+
+`Program` alone still drives PATH/`PreferLocal` resolution, preflight, and spawn diagnostics — the
+override changes only what the child observes as `argv[0]`. Every refusal above is a typed
+`ProcessError.Unsupported`, checked before any child exists, never a silent fallback to `Program` or
+a misapplication to a wrapping helper's own `argv[0]`. See
+[Running commands](commands.md#posix-argv0-override-arg0).
 
 **Windows privilege drop (`Command.WindowsRestrictedToken` / `WindowsIntegrityLevel`)**
 
@@ -589,6 +635,17 @@ than a mutable raw command line, so requesting it there fails with `ProcessError
 Automatic `.cmd`/`.bat` wrapping is also refused when raw fragments are present; invoke `cmd.exe`
 explicitly if its grammar is intentionally the parser. See
 [Running commands](commands.md#windows-raw-command-line-fragments) for ordering and injection rules.
+
+**`Command.Arg0` is Unix-only.** It overrides the child's `argv[0]` independently of the program
+that is actually launched (multicall binaries, login-shell conventions). Windows has no separate
+`argv[0]` contract (`CreateProcessW` takes one raw command line), so requesting it there fails with
+`ProcessError.Unsupported` — the mirror image of `WindowsRawArg` above. On POSIX it further refuses
+(same typed error, at spawn time) when combined with a knob whose spawn path re-`exec`s the target
+by name through a helper with no seam of its own for a distinct `argv[0]`: a `Uid`/`Gid`/`Groups`/
+`KillOnParentDeath` drop (`setpriv`), `Pty` (`setsid --ctty`), a run under the Linux cgroup
+backend (the `/bin/sh` migration launcher), or a `ResourceLimits.CpuTimeMax` run on the POSIX
+process-group mechanism (the `/bin/sh` `RLIMIT_CPU` shim) — see
+[Running commands](commands.md#posix-argv0-override-arg0).
 
 **POSIX process groups: a `setsid` child can escape.** The process-group mechanism tracks each
 child's pgid, and teardown signals those pgids. A descendant that deliberately starts a new

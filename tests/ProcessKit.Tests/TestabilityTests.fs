@@ -597,6 +597,25 @@ type TestabilityTests() =
         }
 
     [<Test>]
+    member _.``ScriptedRunner.Received.Arg0 reflects Command.Arg0, None when unset``() : Task =
+        task {
+            let scripted = ScriptedRunner().Fallback(Reply.Ok "")
+            let runner = scripted :> IProcessRunner
+
+            let withOverride =
+                Command.create "busybox" |> Command.arg0 "ls" |> Command.args [ "-la" ]
+
+            let withoutOverride = Command.create "busybox" |> Command.args [ "-la" ]
+
+            let! _ = runner.OutputStringAsync(withOverride, CancellationToken.None)
+            let! _ = runner.OutputStringAsync(withoutOverride, CancellationToken.None)
+
+            let received = scripted.Received
+            Assert.That(received[0].Arg0, Is.EqualTo(Some "ls"))
+            Assert.That(received[1].Arg0, Is.EqualTo(None: string option))
+        }
+
+    [<Test>]
     member _.``ScriptedRunner.CountReceived counts matching invocations without a decorator``() : Task =
         task {
             let scripted = ScriptedRunner().Fallback(Reply.Ok "")

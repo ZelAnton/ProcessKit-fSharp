@@ -94,6 +94,7 @@ module ProcessKit.CliClientModule
 
 class ProcessKit.Command
   member Arg(System.String) : ProcessKit.Command
+  member Arg0(System.String) : ProcessKit.Command
   member Args(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
   member CancelOn(System.Threading.CancellationToken) : ProcessKit.Command
   member CreateNoWindow() : ProcessKit.Command
@@ -161,6 +162,7 @@ class ProcessKit.Command
 
 module ProcessKit.CommandModule
   static member arg(System.String, ProcessKit.Command) : ProcessKit.Command
+  static member arg0(System.String, ProcessKit.Command) : ProcessKit.Command
   static member args(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Command) : ProcessKit.Command
   static member cancelOn(System.Threading.CancellationToken, ProcessKit.Command) : ProcessKit.Command
   static member create(System.String) : ProcessKit.Command
@@ -242,6 +244,7 @@ module ProcessKit.ConsoleEncoding
 
 class ProcessKit.ContainmentCapabilities
   property Adoption : ProcessKit.Capability { get }
+  property AdoptionByPid : ProcessKit.Capability { get }
   property Creation : ProcessKit.Capability { get }
   property Helpers : System.Collections.Generic.IReadOnlyList<ProcessKit.PlatformHelper> { get }
   property KillOnParentDeath : ProcessKit.Capability { get }
@@ -952,6 +955,7 @@ class ProcessKit.ProcessGroup
   :> System.IAsyncDisposable
   :> System.IDisposable
   member Adopt(System.Diagnostics.Process) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member AdoptByPid(System.Int32) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member Finalize() : System.Void
   member KillAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member MemberStats() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<ProcessKit.MemberStats>, ProcessKit.ProcessError>
@@ -1311,6 +1315,7 @@ class ProcessKit.RunningProcess
   member ProfileAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.RunProfile>
   member ResizeAsync(System.Int32, System.Int32) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member Signal(ProcessKit.Signal) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member StderrChunksAsync() : System.Collections.Generic.IAsyncEnumerable<System.ReadOnlyMemory<System.Byte>>
   member StdoutChunksAsync() : System.Collections.Generic.IAsyncEnumerable<System.ReadOnlyMemory<System.Byte>>
   member StdoutJsonLinesAsync<T>(System.Text.Json.JsonSerializerOptions) : System.Collections.Generic.IAsyncEnumerable<T>
   member StdoutJsonLinesAsync<T>(System.Text.Json.Serialization.Metadata.JsonTypeInfo<T>) : System.Collections.Generic.IAsyncEnumerable<T>
@@ -1527,6 +1532,41 @@ module ProcessKit.StreamFullMode+Tags
   field literal DropOldest : System.Int32
   field literal Error : System.Int32
 
+class ProcessKit.SupervisionEvent
+  property Attempt : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Cause : Microsoft.FSharp.Core.FSharpOption<ProcessKit.RestartCause> { get }
+  property Delay : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+  property DroppedEvents : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+  property Duration : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
+  property FailureKind : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property IsSuccess : Microsoft.FSharp.Core.FSharpOption<System.Boolean> { get }
+  property IsTerminal : Microsoft.FSharp.Core.FSharpOption<System.Boolean> { get }
+  property Kind : ProcessKit.SupervisionEventKind { get }
+  property Name : System.String { get }
+  property Outcome : Microsoft.FSharp.Core.FSharpOption<ProcessKit.Outcome> { get }
+  property Pid : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property Program : System.String { get }
+  property Reason : Microsoft.FSharp.Core.FSharpOption<ProcessKit.StopReason> { get }
+  property Restart : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property StormPause : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+
+enum ProcessKit.SupervisionEventKind
+  :> System.IComparable
+  :> System.IConvertible
+  :> System.IFormattable
+  :> System.ISpanFormattable
+  field literal EventsDropped : ProcessKit.SupervisionEventKind
+  field literal GaveUp : ProcessKit.SupervisionEventKind
+  field literal HealthCheckFailed : ProcessKit.SupervisionEventKind
+  field literal IncarnationFailed : ProcessKit.SupervisionEventKind
+  field literal IncarnationFinished : ProcessKit.SupervisionEventKind
+  field literal IncarnationStarted : ProcessKit.SupervisionEventKind
+  field literal RestartScheduled : ProcessKit.SupervisionEventKind
+  field literal Stopped : ProcessKit.SupervisionEventKind
+  field literal StormPaused : ProcessKit.SupervisionEventKind
+  field literal SupervisionFailed : ProcessKit.SupervisionEventKind
+  field value__ : System.Int32
+
 class ProcessKit.SupervisionOutcome
   property FinalResult : ProcessKit.ProcessResult<System.String> { get }
   property Restarts : System.Int32 { get }
@@ -1534,9 +1574,11 @@ class ProcessKit.SupervisionOutcome
   property StormPauses : System.Int32 { get }
 
 class ProcessKit.SupervisionSession
+  member EventsAsync() : System.Collections.Generic.IAsyncEnumerable<ProcessKit.SupervisionEvent>
   member StopAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>>
   member StopAsync(System.TimeSpan) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>>
   property Completion : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.SupervisionOutcome, ProcessKit.ProcessError>> { get }
+  property DroppedEventCount : System.Int64 { get }
   property Status : ProcessKit.SupervisionStatus { get }
 
 class ProcessKit.SupervisionStatus
@@ -1549,6 +1591,8 @@ class ProcessKit.SupervisionStatus
 class ProcessKit.Supervisor
   member Backoff(System.TimeSpan, System.Double) : ProcessKit.Supervisor
   member Capture(ProcessKit.OutputBufferPolicy) : ProcessKit.Supervisor
+  member Events() : ProcessKit.Supervisor
+  member Events(System.Int32) : ProcessKit.Supervisor
   member FailureDecay(System.TimeSpan) : ProcessKit.Supervisor
   member FailureThreshold(System.Double) : ProcessKit.Supervisor
   member GiveUpWhen(System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Supervisor
