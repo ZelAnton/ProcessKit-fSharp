@@ -54,8 +54,9 @@ type DryRunRunner() =
     let seam = Seam.runner resolve
 
     /// Render `command` deterministically: the program, ordinarily quoted arguments, Windows raw fragments
-    /// verbatim, then `(cwd: <directory>)` when the command set a working directory. Two commands built the
-    /// same way always render identically.
+    /// verbatim, then `(argv0: <value>)` when `Command.Arg0` overrode the child's `argv[0]`, then
+    /// `(cwd: <directory>)` when the command set a working directory. Two commands built the same way
+    /// always render identically.
     static member Render(command: Command) : string =
         ArgumentNullException.ThrowIfNull command
 
@@ -64,6 +65,11 @@ type DryRunRunner() =
         let tokens = command.Program :: (ordinary @ raw)
 
         let line = String.Join(" ", tokens)
+
+        let line =
+            match command.Config.Arg0 with
+            | Some arg0 -> $"{line} (argv0: {quoteIfNeeded arg0})"
+            | None -> line
 
         match command.WorkingDirectory with
         | Some dir -> $"{line} (cwd: {dir})"

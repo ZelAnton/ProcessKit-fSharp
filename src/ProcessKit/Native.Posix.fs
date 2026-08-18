@@ -3578,7 +3578,11 @@ module internal Posix =
                 try
                     fileActions <- Marshal.AllocHGlobal 1024
                     attributes <- Marshal.AllocHGlobal 1024
-                    let argv = command.Program :: List.ofSeq command.Config.Args
+                    // `argv[0]` is `Command.Arg0` when set, else `Program` (the ordinary, unchanged
+                    // behaviour) — `command.Program` below still names the FILE `posix_spawnp` resolves
+                    // and executes; only the first element of the argv array it hands the child differs.
+                    let argv0 = config.Arg0 |> Option.defaultValue command.Program
+                    let argv = argv0 :: List.ofSeq command.Config.Args
 
                     let envp =
                         effectiveEnvironment command
@@ -4278,6 +4282,29 @@ module internal Posix =
         else
             None
 
+    /// The honest typed refusal for `Command.Arg0` combined with a knob whose POSIX spawn path re-`exec`s
+    /// the target BY NAME through a helper — `setpriv` (a `Uid`/`Gid`/`Groups` drop or `KillOnParentDeath`)
+    /// or the `setsid --ctty` pty shim (`Pty`). Neither helper's CLI has a seam for a distinct `argv[0]`
+    /// separate from the program it execs, so honouring the override there would mean either applying it
+    /// to the WRONG process (the helper's own `argv[0]`) or inventing a new native shim — refused loudly
+    /// instead, before any child exists. A lone `Setsid` does not route through either helper, so it is
+    /// deliberately not checked here (see `Command.Arg0`).
+    let private arg0HelperConflict (config: CommandConfig) : ProcessError option =
+        if config.Arg0.IsNone then
+            None
+        elif needsSetpriv config then
+            Some(
+                ProcessError.Unsupported
+                    "Command.Arg0 combined with a Uid/Gid/Groups drop or KillOnParentDeath: the setpriv helper re-execs the target by name and has no seam for a distinct argv[0]"
+            )
+        elif config.Pty.IsSome then
+            Some(
+                ProcessError.Unsupported
+                    "Command.Arg0 combined with Pty: the setsid --ctty helper re-execs the target by name and has no seam for a distinct argv[0]"
+            )
+        else
+            None
+
     /// Spawn `command` as a contained POSIX child. A command requesting a privilege drop (`Uid`/`Gid`) or
     /// `Command.KillOnParentDeath` (Linux) is rewritten to run through the `setpriv` helper and spawned on
     /// the ordinary `posix_spawn` path — the drop / `--pdeathsig` arming runs in `setpriv` before it
@@ -4293,48 +4320,54 @@ module internal Posix =
         let config = command.Config
 
         // The Windows-only token knobs are refused first, before any other dispatch: a POSIX host has no
-        // restricted token and no integrity label to honour them with.
+        // restricted token and no integrity label to honour them with. `Arg0` combined with a
+        // helper-routing knob is refused right behind it, for the same "refuse before any child exists"
+        // reason.
         match windowsOnlyOptionsUnsupported config with
         | Some error -> Error error
         | None ->
-            if
-                config.KillOnParentDeath
-                && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux)
-            then
-                // macOS/BSD have no `PR_SET_PDEATHSIG` analog to reap a child on sudden parent death. Refuse
-                // the request honestly rather than silently ignoring it (matching
-                // `KillOnParentDeathScope.Nothing`).
-                Error(
-                    ProcessError.Unsupported
-                        "KillOnParentDeath needs Linux's PR_SET_PDEATHSIG (armed via setpriv); macOS/BSD have no parent-death-signal analog"
-                )
-            elif config.Pty.IsSome then
-                // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper (see
-                // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9). A
-                // `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`, via `setpriv`).
-                spawnPosixPty command
-            else
 
-                match groupsRequireDropError command with
-                | Some error -> Error error
-                | None ->
-                    if needsSetpriv config then
-                        // A uid/gid drop needs the non-root precheck; a lone `KillOnParentDeath` (no credential
-                        // change) does not, so the precheck runs only when a drop is actually requested.
-                        let precheck =
-                            if config.Uid.IsSome || config.Gid.IsSome then
-                                privilegeDropPrecheck command
-                            else
-                                None
+            match arg0HelperConflict config with
+            | Some error -> Error error
+            | None ->
+                if
+                    config.KillOnParentDeath
+                    && not (RuntimeInformation.IsOSPlatform OSPlatform.Linux)
+                then
+                    // macOS/BSD have no `PR_SET_PDEATHSIG` analog to reap a child on sudden parent death. Refuse
+                    // the request honestly rather than silently ignoring it (matching
+                    // `KillOnParentDeathScope.Nothing`).
+                    Error(
+                        ProcessError.Unsupported
+                            "KillOnParentDeath needs Linux's PR_SET_PDEATHSIG (armed via setpriv); macOS/BSD have no parent-death-signal analog"
+                    )
+                elif config.Pty.IsSome then
+                    // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper (see
+                    // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9). A
+                    // `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`, via `setpriv`).
+                    spawnPosixPty command
+                else
 
-                        match precheck with
-                        | Some error -> Error error
-                        | None ->
-                            match setprivCommand command with
-                            | Error error -> Error error
-                            | Ok dropping -> spawnPosixViaSpawn dropping |> remapSetprivNotFound command
-                    else
-                        spawnPosixViaSpawn command
+                    match groupsRequireDropError command with
+                    | Some error -> Error error
+                    | None ->
+                        if needsSetpriv config then
+                            // A uid/gid drop needs the non-root precheck; a lone `KillOnParentDeath` (no credential
+                            // change) does not, so the precheck runs only when a drop is actually requested.
+                            let precheck =
+                                if config.Uid.IsSome || config.Gid.IsSome then
+                                    privilegeDropPrecheck command
+                                else
+                                    None
+
+                            match precheck with
+                            | Some error -> Error error
+                            | None ->
+                                match setprivCommand command with
+                                | Error error -> Error error
+                                | Ok dropping -> spawnPosixViaSpawn dropping |> remapSetprivNotFound command
+                        else
+                            spawnPosixViaSpawn command
 
     // ----------------------------------------------------------------------------------
     // Linux cgroup v2: place the child INSIDE its cgroup atomically with its own execution
@@ -4404,7 +4437,12 @@ module internal Posix =
                     Groups = None
                     // `--pdeathsig=SIGKILL` (when requested) is nested in `innerArgv` via `setpriv` above;
                     // cleared here so `spawnPosixViaSpawn` does not wrap the `/bin/sh` launcher in another one.
-                    KillOnParentDeath = false }
+                    KillOnParentDeath = false
+                    // Defense in depth: the dispatch below already refuses `Arg0` for a cgroup-backend run
+                    // (the launcher's `exec "$@"` has no seam for a distinct `argv[0]` either), so this
+                    // config should never carry one here — cleared so a caller reaching this some other
+                    // way can never see it silently misapplied to the `/bin/sh` LAUNCHER's own `argv[0]`.
+                    Arg0 = None }
 
             match spawnPosixViaSpawn (Command launcherConfig) with
             | Error(ProcessError.NotFound _) ->
@@ -4449,12 +4487,24 @@ module internal Posix =
 
         // The Windows-only token knobs have no POSIX equivalent and are refused first (the same gate
         // `spawnPosix` applies); a PTY then gates the same unsupported-host check as `spawnPosixPty` before
-        // the cgroup launch. The rest of the dispatch (Groups-need-a-drop, non-root drop precheck) is
-        // shared with the non-pty path.
+        // the cgroup launch. `Arg0` is refused unconditionally here — UNLIKE `spawnPosix`/
+        // `spawnDetachedPosix`, this path ALWAYS routes the target through the `/bin/sh` migration
+        // launcher's `exec "$@"`, which (like `setpriv`/`setsid --ctty`) has no seam for a distinct
+        // `argv[0]`, whether or not a privilege drop or PTY is also requested. The rest of the dispatch
+        // (Groups-need-a-drop, non-root drop precheck) is shared with the non-pty path.
         let unsupportedGate =
             match windowsOnlyOptionsUnsupported config with
             | Some error -> Some error
-            | None -> if config.Pty.IsSome then ptyHostUnsupported () else None
+            | None ->
+                if config.Arg0.IsSome then
+                    Some(
+                        ProcessError.Unsupported
+                            "Command.Arg0 combined with a cgroup-backend run: the /bin/sh migration launcher re-execs the target by name and has no seam for a distinct argv[0]"
+                    )
+                elif config.Pty.IsSome then
+                    ptyHostUnsupported ()
+                else
+                    None
 
         match unsupportedGate with
         | Some error -> Error error
@@ -4609,7 +4659,10 @@ module internal Posix =
                 try
                     fileActions <- Marshal.AllocHGlobal 1024
                     attributes <- Marshal.AllocHGlobal 1024
-                    let argv = command.Program :: List.ofSeq config.Args
+                    // See `spawnPosixViaSpawn`'s matching comment: `argv[0]` is `Command.Arg0` when set,
+                    // else `Program`; `command.Program` still names the file `posix_spawnp` resolves.
+                    let argv0 = config.Arg0 |> Option.defaultValue command.Program
+                    let argv = argv0 :: List.ofSeq config.Args
 
                     let envp =
                         effectiveEnvironment command
@@ -4847,21 +4900,27 @@ module internal Posix =
 
         // The Windows-only token knobs are refused here too, before any launch work: a detached child gets
         // no weaker honesty guarantee than a contained one just because nothing tracks it afterwards.
+        // `Pty` never reaches here (the verb layer already refuses it for a detached launch), so
+        // `arg0HelperConflict` only ever fires here for the `Uid`/`Gid`/`Groups` drop it also guards.
         match windowsOnlyOptionsUnsupported config with
         | Some error -> Error error
         | None ->
-            match groupsRequireDropError command with
+
+            match arg0HelperConflict config with
             | Some error -> Error error
             | None ->
-                if config.Uid.IsSome || config.Gid.IsSome then
-                    match privilegeDropPrecheck command with
-                    | Some error -> Error error
-                    | None ->
-                        match setprivCommand command with
-                        | Error error -> Error error
-                        | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
-                else
-                    spawnDetachedPosixCore command
+                match groupsRequireDropError command with
+                | Some error -> Error error
+                | None ->
+                    if config.Uid.IsSome || config.Gid.IsSome then
+                        match privilegeDropPrecheck command with
+                        | Some error -> Error error
+                        | None ->
+                            match setprivCommand command with
+                            | Error error -> Error error
+                            | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
+                    else
+                        spawnDetachedPosixCore command
 
     // ----------------------------------------------------------------------------------
     // Capability probes — read-only, no spawn, no side effects

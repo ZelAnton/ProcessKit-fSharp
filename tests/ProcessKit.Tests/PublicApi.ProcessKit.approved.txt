@@ -90,6 +90,7 @@ module ProcessKit.CliClientModule
 
 class ProcessKit.Command
   member Arg(System.String) : ProcessKit.Command
+  member Arg0(System.String) : ProcessKit.Command
   member Args(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
   member CancelOn(System.Threading.CancellationToken) : ProcessKit.Command
   member CreateNoWindow() : ProcessKit.Command
@@ -157,6 +158,7 @@ class ProcessKit.Command
 
 module ProcessKit.CommandModule
   static member arg(System.String, ProcessKit.Command) : ProcessKit.Command
+  static member arg0(System.String, ProcessKit.Command) : ProcessKit.Command
   static member args(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Command) : ProcessKit.Command
   static member cancelOn(System.Threading.CancellationToken, ProcessKit.Command) : ProcessKit.Command
   static member create(System.String) : ProcessKit.Command

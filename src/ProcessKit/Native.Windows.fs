@@ -4376,12 +4376,14 @@ module internal Windows =
                 Error(ProcessError.Spawn(command.Program, ex.Message))
 
     let spawnWindows (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
-        // `Command.Umask`/`Uid`/`Gid`/`Groups`/`Setsid` are Unix-only primitives with no Windows
-        // equivalent (a file-mode creation mask, `setuid`/`setgid`/supplementary-group privilege drop,
-        // and a `setsid()` session detach). Honour each request honestly as `ProcessError.Unsupported`
-        // BEFORE any spawn work, rather than silently ignoring it — symmetric to the port's other
-        // Unix-only gates (e.g. every non-`Kill` `Signal` on Windows → `Unsupported` in `Backend.fs`).
-        // Reported one at a time; the first requested-but-unsupported knob names the failure.
+        // `Command.Umask`/`Uid`/`Gid`/`Groups`/`Setsid`/`Arg0` are Unix-only primitives with no Windows
+        // equivalent (a file-mode creation mask, `setuid`/`setgid`/supplementary-group privilege drop, a
+        // `setsid()` session detach, and a distinct `argv[0]` — `CreateProcessW` takes one raw command
+        // line, not an argv array with an independent first element). Honour each request honestly as
+        // `ProcessError.Unsupported` BEFORE any spawn work, rather than silently ignoring it — symmetric
+        // to the port's other Unix-only gates (e.g. every non-`Kill` `Signal` on Windows → `Unsupported`
+        // in `Backend.fs`). Reported one at a time; the first requested-but-unsupported knob names the
+        // failure.
         let config = command.Config
 
         if config.ExtraFds.Count > 0 then
@@ -4394,13 +4396,14 @@ module internal Windows =
                     $"Command.StopSignal({config.StopSignal}) on Windows; graceful stop uses the existing WM_CLOSE/CTRL+BREAK mechanisms and only the default Signal.Term contract is representable"
             )
         else
-            match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups with
-            | Some _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
-            | _, Some _, _, _, _ -> Error(ProcessError.Unsupported "uid")
-            | _, _, Some _, _, _ -> Error(ProcessError.Unsupported "gid")
-            | _, _, _, true, _ -> Error(ProcessError.Unsupported "setsid")
-            | _, _, _, _, Some _ -> Error(ProcessError.Unsupported "groups")
-            | None, None, None, false, None ->
+            match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups, config.Arg0 with
+            | Some _, _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
+            | _, Some _, _, _, _, _ -> Error(ProcessError.Unsupported "uid")
+            | _, _, Some _, _, _, _ -> Error(ProcessError.Unsupported "gid")
+            | _, _, _, true, _, _ -> Error(ProcessError.Unsupported "setsid")
+            | _, _, _, _, Some _, _ -> Error(ProcessError.Unsupported "groups")
+            | _, _, _, _, _, Some _ -> Error(ProcessError.Unsupported "arg0")
+            | None, None, None, false, None, None ->
                 match config.Pty with
                 | Some pty ->
                     // ConPTY needs Windows 10 1809+; probe the export rather than blind-calling so a pre-1809
@@ -4481,18 +4484,19 @@ module internal Windows =
     /// Launch `command` as a detached child — running, contained by nothing, unowned (see the section
     /// comment above). Returns its pid and the OS-reported start time, read while our own process handle
     /// is still open so the pid cannot have been recycled underneath the identity pair. The `Umask`/
-    /// `Uid`/`Gid`/`Groups`/`Setsid` Unix-only knobs are refused exactly as `spawnWindows` refuses them,
-    /// so the detached path diverges from the ordinary one only where detachment itself requires it.
+    /// `Uid`/`Gid`/`Groups`/`Setsid`/`Arg0` Unix-only knobs are refused exactly as `spawnWindows` refuses
+    /// them, so the detached path diverges from the ordinary one only where detachment itself requires it.
     let spawnDetachedWindows (command: Command) : Result<DetachedSpawn, ProcessError> =
         let config = command.Config
 
-        match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups with
-        | Some _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
-        | _, Some _, _, _, _ -> Error(ProcessError.Unsupported "uid")
-        | _, _, Some _, _, _ -> Error(ProcessError.Unsupported "gid")
-        | _, _, _, true, _ -> Error(ProcessError.Unsupported "setsid")
-        | _, _, _, _, Some _ -> Error(ProcessError.Unsupported "groups")
-        | None, None, None, false, None ->
+        match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups, config.Arg0 with
+        | Some _, _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
+        | _, Some _, _, _, _, _ -> Error(ProcessError.Unsupported "uid")
+        | _, _, Some _, _, _, _ -> Error(ProcessError.Unsupported "gid")
+        | _, _, _, true, _, _ -> Error(ProcessError.Unsupported "setsid")
+        | _, _, _, _, Some _, _ -> Error(ProcessError.Unsupported "groups")
+        | _, _, _, _, _, Some _ -> Error(ProcessError.Unsupported "arg0")
+        | None, None, None, false, None, None ->
             // Decide the launch (PATHEXT / effective-child-`PATH` substitution / cmd.exe batch wrapper)
             // BEFORE any handle is allocated, exactly as `spawnWindowsCore` does — an unsafe batch
             // argument, or a program the command's own overridden child `PATH` does not hold, is refused

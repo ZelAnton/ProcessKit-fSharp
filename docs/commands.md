@@ -125,6 +125,59 @@ truly required. Test doubles and record/replay cassettes keep each raw fragment 
 one opaque match token — they do not try to parse it — and `DryRunRunner` renders
 that token verbatim after its ordinarily quoted arguments.
 
+### POSIX `argv[0]` override (`Arg0`)
+
+`Arg0` is the POSIX counterpart of `WindowsRawArg` above: a deliberately loud,
+opt-in escape hatch, this time for overriding the child's **`argv[0]`**
+independently of the program it actually runs. It supports **multicall
+binaries** — BusyBox/Toybox and similar tools dispatch on their own `argv[0]`
+— and the **login-shell convention** of a leading `-` (`-bash`).
+
+**F#**
+
+```fsharp
+let busybox =
+    Command.create "/bin/busybox"
+    |> Command.arg0 "ls" // busybox dispatches to its built-in `ls` applet
+    |> Command.args [ "-la" ]
+```
+
+**C#**
+
+```csharp
+var busybox =
+    new Command("/bin/busybox")
+        .Arg0("ls") // busybox dispatches to its built-in `ls` applet
+        .Args(["-la"]);
+```
+
+Only the argument vector the child observes changes: `Program` (`/bin/busybox`
+above) alone still drives PATH/`PreferLocal` resolution, preflight, and spawn
+diagnostics (`ProcessError`) — exactly as if `Arg0` had never been called.
+`arg0` must be non-empty and must not contain an embedded NUL, rejected with
+`ArgumentException` at the builder boundary.
+
+**Unix-only**, with the same honest `ProcessError.Unsupported` on Windows as
+every other Unix-only knob (`CreateProcessW` takes one raw command line, not an
+argv array with an independent first element). It is refused with the same typed
+error — at spawn time, on POSIX — when combined with a knob whose spawn path
+re-`exec`s the target **by name** through a helper that has no CLI seam of its
+own for a distinct `argv[0]`: a `Uid`/`Gid`/`Groups`/`KillOnParentDeath` drop
+(the `setpriv` helper, below), `Pty` (the `setsid --ctty` helper), or a run under
+`ProcessGroup`'s Linux cgroup backend (the `/bin/sh` migration launcher).
+Honouring the override there would mean either applying it to the *wrong*
+process (the helper's own `argv[0]`) or inventing a new native shim — refused
+loudly instead. A lone `Setsid` (no privilege drop) does not route through
+either helper, so it composes with `Arg0` normally.
+
+Test doubles and record/replay cassettes reflect the override wherever they
+already reflect the program and its arguments: `DryRunRunner` renders it as
+`(argv0: <value>)`, `RecordedInvocation.Arg0` (`ScriptedRunner.Received`) carries
+it, and a `RecordReplayRunner` cassette entry's `Arg0` field is part of the
+replay match key — a recording made with one `argv[0]` never replays for a call
+with a different one (or none), since a multicall binary can genuinely behave
+differently depending on it.
+
 The program name normally reaches the OS verbatim: a bare name is resolved on
 `PATH` by the OS, and setting a working directory does **not** re-anchor a
 *relative* program path against it (a relative path resolves against the current
@@ -1084,6 +1137,11 @@ Honest by construction — never a silent downgrade:
   its own process-group leader, so the kill-on-drop group teardown reaches it. (The
   session detach replaces the group's default `POSIX_SPAWN_SETPGROUP` for that one
   command; it is never combined with it.)
+- **`Arg0` cannot combine with a `Uid`/`Gid`/`Groups` drop.** The `setpriv` helper
+  below re-`exec`s the target by name and has no CLI seam for a distinct `argv[0]`,
+  so pairing the two fails the spawn with `ProcessError.Unsupported` rather than
+  silently applying the override to `setpriv`'s own `argv[0]` — see
+  [POSIX `argv[0]` override](#posix-argv0-override-arg0).
 
 Because `posix_spawn` has no uid/gid attribute (and forking a managed .NET runtime
 to drop privileges in the child is unsafe), a command requesting `Uid`/`Gid` is

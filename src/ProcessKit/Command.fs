@@ -253,6 +253,20 @@ type internal CommandConfig =
       // than combining with it; the kill-on-drop `killpg(pid)` teardown still reaches the whole session,
       // so containment is preserved (see `Native.Posix`).
       Setsid: bool
+      // Unix override of the child's `argv[0]` independently of `Program` (see `Command.Arg0`).
+      // `None` (the default) is the ordinary behaviour: `Program` supplies both the executable
+      // lookup AND `argv[0]`, byte-identical to before this knob existed. Applied only on the two
+      // POSIX paths that spawn the target directly (`spawnPosixViaSpawn`/`spawnDetachedPosixCore`
+      // in `Native.Posix`); `Program` itself is UNCHANGED and still drives PATH resolution,
+      // `PreferLocal`, and every diagnostic (`ProcessError`, logging, cassette matching). A helper
+      // that must re-`exec` the target by name — `setpriv` (`Uid`/`Gid`/`Groups`/
+      // `KillOnParentDeath`), the `setsid --ctty` pty shim, or the cgroup migration launcher — has
+      // no CLI seam of its own to carry a distinct `argv[0]`, so combining `Arg0` with any of them
+      // is refused with a typed `ProcessError.Unsupported` rather than silently applying to the
+      // WRONG process (the helper's own `argv[0]`) or being dropped. Windows has no separate
+      // `argv[0]` contract, so a set value there fails the spawn with `ProcessError.Unsupported`
+      // too, never a silent fallback to `Program`.
+      Arg0: string option
       // Opt-in reaping of the child if the PARENT process dies SUDDENLY (SIGKILL / crash /
       // `TerminateProcess`) — a case the deterministic `Dispose`/`DisposeAsync` kill-on-drop cannot
       // cover because no managed teardown runs. `false` (the default) leaves the behaviour unchanged.
@@ -335,6 +349,7 @@ module internal CommandConfig =
           WindowsRestrictedToken = false
           WindowsIntegrityLevel = None
           Setsid = false
+          Arg0 = None
           KillOnParentDeath = false
           Pty = None
           Logger = None
@@ -1489,6 +1504,39 @@ type Command internal (config: CommandConfig) =
         CommandConfig.ensureNoWindowsTokenHardening config "Setsid"
         Command({ config with Setsid = true })
 
+    /// Override the child's **`argv[0]`** independently of the executable that is actually launched
+    /// (`Program`) — the mechanism behind multicall binaries such as BusyBox/Toybox (which dispatch on
+    /// their own `argv[0]`) and the login-shell convention of a leading `-` (`-bash`). Only the argument
+    /// vector the child observes changes: `Program` alone still drives PATH/`PreferLocal` resolution,
+    /// preflight, spawn diagnostics (`ProcessError`), and containment — exactly as if `Arg0` had never
+    /// been called. Repeated calls are last-write-wins, like every other builder knob.
+    ///
+    /// `arg0` must be non-empty and must not contain an embedded NUL (`'\000'`) — both rejected with
+    /// `ArgumentException` at the builder boundary rather than reaching the native layer, where an empty
+    /// or NUL-truncated value could let the observed `argv[0]` silently diverge from what was requested.
+    ///
+    /// **Unix-only**, applied on the POSIX spawn path by handing the native layer a distinct `argv[0]`
+    /// separate from the file `posix_spawnp` resolves and executes. **Windows** has no separate `argv[0]`
+    /// contract (`CreateProcessW` takes one raw command line, not an argv array with an independent first
+    /// element), so a set value fails the spawn there with `ProcessError.Unsupported`, never a silent
+    /// fallback to `Program`. It is likewise refused with `ProcessError.Unsupported` — at spawn time, on
+    /// POSIX — when combined with a knob that routes the launch through a helper which must re-`exec` the
+    /// target BY NAME and has no CLI seam of its own for a distinct `argv[0]`: a `Uid`/`Gid`/`Groups`/
+    /// `KillOnParentDeath` privilege/parent-death drop (the `setpriv` helper), `Pty` (the `setsid --ctty`
+    /// helper), or a run under `ProcessGroup`'s Linux cgroup backend (the `/bin/sh` migration launcher).
+    /// Honouring the override there would mean either handing it to the WRONG process (the helper's own
+    /// `argv[0]`, silently discarding what was actually requested) or inventing a new native shim — this
+    /// library does neither; it refuses loudly instead. A lone `Setsid` (no privilege drop) does not route
+    /// through any such helper, so it composes with `Arg0` normally.
+    member _.Arg0(arg0: string) =
+        ArgumentNullException.ThrowIfNull arg0
+
+        if arg0.Length = 0 then
+            raise (ArgumentException("arg0 must not be empty", nameof arg0))
+
+        CommandConfig.rejectEmbeddedNul (nameof arg0) arg0
+        Command({ config with Arg0 = Some arg0 })
+
     /// Run the child with a **restricted token**: a copy of this process's own primary token created
     /// with `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)`, which strips every privilege the caller
     /// holds except the always-present `SeChangeNotifyPrivilege`. The child is then started with
@@ -1863,6 +1911,12 @@ module Command =
     /// Detach the child into a new session (`setsid()`). Unix-only: a set request fails a Windows spawn
     /// with `ProcessError.Unsupported`. Containment is preserved. See `Command.Setsid`.
     let setsid (command: Command) = command.Setsid()
+
+    /// Override the child's `argv[0]` independently of `Program` (multicall binaries, login-shell
+    /// conventions). Unix-only: a set value fails a Windows spawn with `ProcessError.Unsupported`, as
+    /// does combining it with a `Uid`/`Gid`/`Groups`/`KillOnParentDeath` drop, `Pty`, or a cgroup-backend
+    /// run — none of their re-`exec`ing helpers has a seam for a distinct `argv[0]`. See `Command.Arg0`.
+    let arg0 (value: string) (command: Command) = command.Arg0 value
 
     /// Run the child with a restricted token (`CreateRestrictedToken` + `DISABLE_MAX_PRIVILEGE`), keeping
     /// the caller's identity but none of its privileges. Windows-only: a set request fails a POSIX spawn

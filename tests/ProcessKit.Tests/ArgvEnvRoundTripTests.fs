@@ -351,6 +351,51 @@ return 0;
 
             Assert.That(echoed, Is.EqualTo<string[]>([| "raw one"; "raw-two" |]))
 
+    // --- Arg0 (POSIX argv[0] override) round-trip -----------------------------------------------
+
+    // `Arg0` overrides `argv[0]` of the spawned process itself, which the .NET echo child above cannot
+    // observe (`Main(string[] args)` never includes argv[0]). `/bin/sh -c 'printf %s "$0"'` is the
+    // portable POSIX way to read a process's OWN argv[0] back: with no `command_name` operand after the
+    // script, POSIX sets `$0` from the shell's own `argv[0]` — exactly the element our native marshalling
+    // overrides — so this observes the real `posix_spawnp` argv, not a re-quoted proxy.
+    [<Test>]
+    member _.``Arg0 overrides the observed argv[0] of a real POSIX child (ASCII and non-ASCII)``() =
+        if isWindows then
+            Assert.Ignore "Arg0 is POSIX-only; see the Windows Unsupported test below"
+        else
+            let cases =
+                [ "multicall-name" // a BusyBox/Toybox-style applet dispatch name
+                  "-bash" // the login-shell leading-dash convention
+                  "bmp-é-中-€" // BMP Unicode
+                  "nonbmp-" + Char.ConvertFromUtf32 0x1F600 ] // a surrogate-pair code point
+
+            for case in cases do
+                let command =
+                    Command.create "/bin/sh"
+                    |> Command.arg0 case
+                    |> Command.args [ "-c"; "printf %s \"$0\"" ]
+                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                match command.RunAsync().GetAwaiter().GetResult() with
+                | Error error -> Assert.Fail $"Arg0 round-trip failed for '{case}': {error.Message}"
+                | Ok observed -> Assert.That(observed, Is.EqualTo case, $"case: {case}")
+
+    [<Test>]
+    member _.``Arg0 on Windows is a typed Unsupported, never a silent fallback to Program``() =
+        if not isWindows then
+            Assert.Ignore
+                "Arg0's Windows refusal is tested only on Windows; POSIX honors it (see the round-trip test above)"
+        else
+            let command =
+                Command.create "cmd.exe"
+                |> Command.arg0 "override"
+                |> Command.args [ "/c"; "exit 0" ]
+
+            match command.RunUnitAsync().GetAwaiter().GetResult() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Unsupported on Windows, got {other}"
+            | Ok() -> Assert.Fail "Windows silently accepted a POSIX argv[0] override"
+
     // --- env round-trip ------------------------------------------------------------------------
 
     [<Test>]

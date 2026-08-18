@@ -31,7 +31,9 @@ module internal DetachedLaunch =
     /// involvement: `CurrentDir`, `Env`/`EnvClear`/`PreferLocal`, `StdoutToFile`/`StderrToFile`,
     /// `MergeStderr`, `Stdout`/`Stderr` `Null`/`Inherit`, `InheritStdin`, `CreateNoWindow`,
     /// `WindowsCtrlSignals`, `WindowsRestrictedToken`, `WindowsIntegrityLevel`, `Priority`, `Umask`,
-    /// `Uid`/`Gid`/`Groups`, and `Setsid` (which a POSIX detached launch performs anyway). The Windows
+    /// `Uid`/`Gid`/`Groups`, `Setsid` (which a POSIX detached launch performs anyway), and `Arg0` (applied
+    /// directly on the POSIX detached spawn path; refused there only if paired with a `Uid`/`Gid`/`Groups`
+    /// drop, exactly as on the contained path — see `Native.Posix.arg0HelperConflict`). The Windows
     /// hardening knobs are honoured by the Windows detached spawn and fail with the same typed
     /// `ProcessError.Unsupported` as every Windows-only hardening request on POSIX. `StdioMode.Piped` —
     /// the default — is wired to the null device

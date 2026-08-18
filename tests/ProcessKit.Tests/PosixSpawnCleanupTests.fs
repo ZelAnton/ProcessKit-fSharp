@@ -674,6 +674,44 @@ exec "$sp" --pdeathsig=SIGKILL /bin/sh -c "$g" sh "$e" "$@"
             | Error err -> Assert.Fail $"KillOnParentDeath must not affect a Windows run: {err.Message}"
         }
 
+    // ---- Arg0 combined with a helper-routing knob (T-376) --------------------------------------
+    //
+    // `setpriv` (a Uid/Gid/Groups drop or KillOnParentDeath) and the `setsid --ctty` pty shim both
+    // re-`exec` the target BY NAME and have no CLI seam for a distinct `argv[0]`, so `Command.Arg0`
+    // combined with either is refused with a typed `ProcessError.Unsupported` — never silently applied
+    // to the WRONG process (the helper's own `argv[0]`). Checked before the up-front non-root drop
+    // precheck, so these do not need root to exercise. A lone `Setsid` does not route through either
+    // helper, so it composes with `Arg0` normally — covered by the round-trip test in
+    // `ArgvEnvRoundTripTests`, which pins the same `sh -c` observation trick this file already relies on.
+
+    [<Test>]
+    member _.``Arg0 combined with a Uid drop is a typed Unsupported, not a silent misapplication``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "Arg0/Uid are both POSIX-only"
+
+            let cmd = shell "echo hi" |> Command.arg0 "override" |> Command.uid 0
+
+            match! cmd.OutputStringAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+            | Ok _ -> Assert.Fail "Arg0 combined with a Uid drop should be Unsupported, not silently accepted"
+        }
+
+    [<Test>]
+    member _.``Arg0 combined with Pty is a typed Unsupported, not a silent misapplication``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "Arg0/Pty are both POSIX-only here"
+
+            let cmd = Command.create "/bin/sh" |> Command.arg0 "override" |> Command.pty
+
+            match! cmd.OutputStringAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | Error other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+            | Ok _ -> Assert.Fail "Arg0 combined with Pty should be Unsupported, not silently accepted"
+        }
+
     // ---- The pre-arm window (T-361) -----------------------------------------------------------
     //
     // `setpriv --pdeathsig=SIGKILL` arms `PR_SET_PDEATHSIG` INSIDE the child, so a parent that dies

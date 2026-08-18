@@ -450,6 +450,22 @@ process-group mechanism (macOS/BSD, or Linux without cgroup v2) returns
 `ProcessError.ResourceLimit` — never a silent no-op. See
 [process-groups.md](process-groups.md) for the API and semantics.
 
+**`argv[0]` override (`Command.Arg0`)**
+
+| Capability | Windows | Linux / macOS / BSD (POSIX) |
+|---|:---:|:---:|
+| Override `argv[0]` independently of `Program` | ❌ `ProcessError.Unsupported` (no separate `argv[0]` contract) | ✅ distinct `argv[0]` on `posix_spawnp` |
+| Combined with a `Uid`/`Gid`/`Groups`/`KillOnParentDeath` drop | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (`setpriv` has no `argv[0]` seam) |
+| Combined with `Command.Pty` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (`setsid --ctty` has no `argv[0]` seam) |
+| Combined with a run under the Linux cgroup backend | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the `/bin/sh` migration launcher has no `argv[0]` seam) |
+| Combined with a lone `Setsid` (no privilege drop) | ❌ `ProcessError.Unsupported` | ✅ composes normally (no helper involved) |
+
+`Program` alone still drives PATH/`PreferLocal` resolution, preflight, and spawn diagnostics — the
+override changes only what the child observes as `argv[0]`. Every refusal above is a typed
+`ProcessError.Unsupported`, checked before any child exists, never a silent fallback to `Program` or
+a misapplication to a wrapping helper's own `argv[0]`. See
+[Running commands](commands.md#posix-argv0-override-arg0).
+
 **Windows privilege drop (`Command.WindowsRestrictedToken` / `WindowsIntegrityLevel`)**
 
 The mirror image of the Unix privilege drop below: Windows has no `setuid`, so a child is hardened by
@@ -589,6 +605,15 @@ than a mutable raw command line, so requesting it there fails with `ProcessError
 Automatic `.cmd`/`.bat` wrapping is also refused when raw fragments are present; invoke `cmd.exe`
 explicitly if its grammar is intentionally the parser. See
 [Running commands](commands.md#windows-raw-command-line-fragments) for ordering and injection rules.
+
+**`Command.Arg0` is Unix-only.** It overrides the child's `argv[0]` independently of the program
+that is actually launched (multicall binaries, login-shell conventions). Windows has no separate
+`argv[0]` contract (`CreateProcessW` takes one raw command line), so requesting it there fails with
+`ProcessError.Unsupported` — the mirror image of `WindowsRawArg` above. On POSIX it further refuses
+(same typed error, at spawn time) when combined with a knob whose spawn path re-`exec`s the target
+by name through a helper with no seam of its own for a distinct `argv[0]`: a `Uid`/`Gid`/`Groups`/
+`KillOnParentDeath` drop (`setpriv`), `Pty` (`setsid --ctty`), or a run under the Linux cgroup
+backend (the `/bin/sh` migration launcher) — see [Running commands](commands.md#posix-argv0-override-arg0).
 
 **POSIX process groups: a `setsid` child can escape.** The process-group mechanism tracks each
 child's pgid, and teardown signals those pgids. A descendant that deliberately starts a new

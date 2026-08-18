@@ -705,6 +705,40 @@ type CassetteTests() =
             })
 
     [<Test>]
+    member _.``Command.Arg0 is part of the match key``() : Task =
+        withCassette (fun path ->
+            task {
+                let recorder = RecordReplayRunner.Record(path, FixedRunner("multicall-out", 0))
+                let recorded = Command.create "busybox" |> Command.arg0 "ls"
+                let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
+                recorder.Save() |> ignore
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok replayer ->
+                    // Same Arg0 matches.
+                    let same = Command.create "busybox" |> Command.arg0 "ls"
+
+                    match! (runner replayer).OutputStringAsync(same, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "multicall-out")
+                    | Error error -> Assert.Fail $"same Arg0 should match: {error}"
+
+                    // A different Arg0 misses — a multicall binary can genuinely behave differently.
+                    let different = Command.create "busybox" |> Command.arg0 "-bash"
+
+                    match! (runner replayer).OutputStringAsync(different, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss _) -> ()
+                    | other -> Assert.Fail $"different Arg0 should miss, got {other}"
+
+                    // No Arg0 at all also misses — not the same as recording with one.
+                    let none = Command.create "busybox"
+
+                    match! (runner replayer).OutputStringAsync(none, CancellationToken.None) with
+                    | Error(ProcessError.CassetteMiss _) -> Assert.Pass()
+                    | other -> Assert.Fail $"no Arg0 should miss a recording made with one, got {other}"
+            })
+
+    [<Test>]
     member _.``an inherited-stdin command records and strict-replays``() : Task =
         withCassette (fun path ->
             task {
@@ -1729,7 +1763,12 @@ type CassetteTests() =
                 let onDisk = File.ReadAllText path
                 Assert.That(onDisk, Does.Not.Contain "hunter2", "a projected argument must not reach disk")
                 Assert.That(onDisk, Does.Contain "--password=[REDACTED]", "the projected text is what is stored")
-                Assert.That(onDisk, Does.Contain "\"Version\": 9", "the command fingerprint is a v9 field")
+
+                Assert.That(
+                    onDisk,
+                    Does.Contain "\"Version\": 10",
+                    "the command fingerprint is stored under the current format"
+                )
 
                 Assert.That(
                     onDisk,
@@ -1779,6 +1818,28 @@ type CassetteTests() =
                     match! (runner replayer).OutputStringAsync(other, CancellationToken.None) with
                     | Error(ProcessError.CassetteMiss _) -> ()
                     | other -> Assert.Fail $"a different command line must still miss, got {other}"
+            })
+
+    [<Test>]
+    member _.``Command.Arg0 is stored verbatim on disk, never through WithCommandProjection``() : Task =
+        withCassette (fun path ->
+            task {
+                // WithCommandProjection scrubs only Program/Args; Arg0 has no projection hook of its own
+                // (documented alongside Cwd) and always reaches disk as invoked.
+                let options =
+                    RecordReplayOptions().WithCommandProjection(fun program args -> struct (program, args))
+
+                let recorded = Command.create "busybox" |> Command.arg0 "unprojected-arg0"
+
+                do!
+                    task {
+                        use recorder = RecordReplayRunner.Record(path, FixedRunner("ok", 0), options)
+                        let! _ = (runner recorder).OutputStringAsync(recorded, CancellationToken.None)
+                        recorder.Complete()
+                    }
+
+                let onDisk = File.ReadAllText path
+                Assert.That(onDisk, Does.Contain "\"Arg0\": \"unprojected-arg0\"")
             })
 
     [<Test>]
@@ -2676,7 +2737,7 @@ type CassetteTests() =
                     }
 
                 let onDisk = File.ReadAllText path
-                Assert.That(onDisk, Does.Contain "\"Version\": 9", "a PTY recording writes the current format")
+                Assert.That(onDisk, Does.Contain "\"Version\": 10", "a PTY recording writes the current format")
                 Assert.That(onDisk, Does.Contain "\"Pty\": true")
                 // PtyConfig.Default geometry is 80x24.
                 Assert.That(onDisk, Does.Contain "\"PtyCols\": 80")
@@ -2684,9 +2745,11 @@ type CassetteTests() =
             })
 
     [<Test>]
-    member _.``pre-v9 cassettes v1 through v8 still load and replay as recorded results under the v9 build``() : Task =
+    member _.``pre-v9 cassettes v1 through v8 still load and replay as recorded results under the current build``
+        ()
+        : Task =
         task {
-            // One hand-crafted fixture per legacy version. Each must load under the v9 build (a missing
+            // One hand-crafted fixture per legacy version. Each must load under the current build (a missing
             // Pty field defaults to false / non-PTY, a missing Signalled field preserves legacy signal
             // behavior, a missing Failure keeps the entry the recorded RESULT it always was, a missing
             // OutputWiring keys the entry as a legacy one served to a call that captures its output, and
@@ -2734,7 +2797,8 @@ type CassetteTests() =
                     File.WriteAllText(path, json)
 
                     match RecordReplayRunner.Replay path with
-                    | Error error -> Assert.Fail $"a v{version} cassette must still load under the v9 build: {error}"
+                    | Error error ->
+                        Assert.Fail $"a v{version} cassette must still load under the current build: {error}"
                     | Ok replayer ->
                         match! (runner replayer).OutputStringAsync(Command.create program, CancellationToken.None) with
                         | Ok result ->
@@ -2980,7 +3044,7 @@ type CassetteTests() =
                     }
 
                 let onDisk = File.ReadAllText path
-                Assert.That(onDisk, Does.Contain "\"Version\": 9", "a recorded failure writes the current format")
+                Assert.That(onDisk, Does.Contain "\"Version\": 10", "a recorded failure writes the current format")
                 Assert.That(onDisk, Does.Contain "\"Kind\": \"NotFound\"", "the discriminant names the error case")
                 Assert.That(onDisk, Does.Contain "\"Searched\": \"/usr/bin\"", "the payload keeps the searched path")
 
@@ -4004,7 +4068,7 @@ type CassetteTests() =
                         }
 
                     let onDisk = File.ReadAllText path
-                    Assert.That(onDisk, Does.Contain "\"Version\": 9", "a recording writes the current format")
+                    Assert.That(onDisk, Does.Contain "\"Version\": 10", "a recording writes the current format")
                     Assert.That(onDisk, Does.Contain "\"OutputWiring\"", "every recording stores its own wiring")
                     Assert.That(onDisk, Does.Contain "o:file:", "a redirect keys as a file destination")
 
