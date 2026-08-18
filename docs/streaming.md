@@ -77,14 +77,17 @@ controls the tree's fate (see [Process groups](process-groups.md)).
 Consume the handle **exactly one way** — stdout is read once:
 
 - `StdoutLinesAsync()` / `OutputEventsAsync()` — stream output as it arrives (below).
+- `StdoutChunksAsync()` / `StderrChunksAsync()` — stream one stream's raw bytes (below).
 - `OutputStringAsync()` / `OutputBytesAsync()` — capture everything, like the one-shot verbs.
 - `WaitAsync()` — just the `Outcome`; output is discarded.
-- `FinishAsync()` — after streaming stdout, collect the `Outcome` and drained stderr.
+- `FinishAsync()` — after streaming, collect the `Outcome` and (unless you streamed it) drained stderr.
 - `ProfileAsync()` — capture plus periodic resource samples ([profiling](#profiling-a-run)).
 
 `StdoutLinesAsync()` / `StdoutChunksAsync()` / `OutputEventsAsync()` need a **piped** stdout, which is the default for
 `StartAsync()`; if you set `Command.Stdout` to `StdioMode.Inherit` or `StdioMode.Null`
-there is nothing to stream. The live gauges `Pid`, `Elapsed`, `StartTime`,
+there is nothing to stream. `StderrChunksAsync()` likewise needs a **piped, unmerged** stderr, and
+says so with a typed error when the run has none (see
+[Streaming stderr as byte chunks](#streaming-stderr-as-byte-chunks)). The live gauges `Pid`, `Elapsed`, `StartTime`,
 `StdoutLineCount`, and `StderrLineCount` are cheap to read at any time, including
 mid-stream. There is also `Kill()` — "stop it now, I'll `WaitAsync()` for the
 `Outcome` myself" — which begins teardown without blocking.
@@ -222,8 +225,9 @@ behaviour can transform bytes before ProcessKit reads them. `Inherit` and `Null`
 to stream.
 
 Chunk streaming claims the stdout pipe exactly once. `OutputStringAsync()`, `OutputBytesAsync()`,
-`WaitAsync()`, `StdoutLinesAsync()`, `OutputEventsAsync()`, and framed/interactive sessions are
-refused on the same handle; a second `StdoutChunksAsync()` is refused too. After consuming chunks,
+`WaitAsync()`, `StdoutLinesAsync()`, `StderrChunksAsync()`, `OutputEventsAsync()`, and
+framed/interactive sessions are refused on the same handle; a second `StdoutChunksAsync()` is refused
+too. After consuming chunks,
 call `FinishAsync()` to await the process and obtain drained stderr. `StopAsync()` and disposal remain
 valid lifecycle operations; `WaitAsync()` is not a companion to a claimed streaming session.
 
@@ -235,6 +239,103 @@ the existing dropped-stream-item counter); `Error` ends the stream with `Process
 `OutputBuffer`'s line/byte caps do not apply to chunk contents. A genuine stdout read failure ends
 the enumerator and `FinishAsync()` with `ProcessError.Io`; an `IOException`/`ObjectDisposedException`
 caused by this handle's teardown is quiet.
+
+## Streaming stderr as byte chunks
+
+`StderrChunksAsync()` is the same verb for the **other** stream: an
+`IAsyncEnumerable<ReadOnlyMemory<byte>>` of byte-exact stderr, with no text decoding and no line
+framing. Reach for it when stderr carries something text is the wrong abstraction for — a binary
+progress protocol, a high-volume diagnostic log you relay or hash byte-for-byte — where the decoded
+`Finished.Stderr`, `OutputEventsAsync()` and `StderrTee` all frame, decode, or push instead of
+handing you the bytes to pull.
+
+**F#**
+
+```fsharp
+open System.IO
+
+task {
+    match! (Command.create "ffmpeg" |> Command.args [ "-i"; "clip.mp4"; "-progress"; "pipe:2"; "-f"; "null"; "-" ])
+        .StartAsync() with
+    | Error err -> eprintfn $"{err.Message}"
+    | Ok proc ->
+        use _ = proc
+        let destination = Stream.Null
+
+        let e = proc.StderrChunksAsync().GetAsyncEnumerator()
+
+        try
+            let mutable go = true
+
+            while go do
+                let! more = e.MoveNextAsync()
+
+                if more then
+                    do! destination.WriteAsync(e.Current)
+                else
+                    go <- false
+        finally
+            e.DisposeAsync().AsTask().Wait()
+
+        match! proc.FinishAsync() with
+        | Ok finished -> printfn $"progress stream ended: {finished.Outcome}"
+        | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+**C#**
+
+```csharp
+using System.IO;
+
+await using var proc = (await new Command("ffmpeg")
+    .Args(["-i", "clip.mp4", "-progress", "pipe:2", "-f", "null", "-"])
+    .StartAsync()).GetValueOrThrow();
+using var destination = Stream.Null;
+
+await foreach (var chunk in proc.StderrChunksAsync())
+    await destination.WriteAsync(chunk);
+
+var finished = (await proc.FinishAsync()).GetValueOrThrow();
+```
+
+Everything the stdout chunk stream promises holds here, on stderr: each non-empty item is exactly
+one underlying read (NUL bytes, invalid UTF-8, and boundaries inside a multibyte character all
+survive), each item owns its backing array, `StderrTee` receives the same bytes as a raw tee, the
+claim is one-shot — a second `StderrChunksAsync()`, or any other consuming verb, is refused with the
+already-consumed `InvalidOperationException` — and `Command.StreamBuffer` bounds the unread backlog
+in exactly the same modes (`Backpressure` pauses the stderr pump, the drop modes bump
+`DroppedStreamLineCount`, `Error` ends the stream with `ProcessError.OutputTooLarge`).
+`OutputBuffer`'s caps do not apply to chunk contents, and `StderrLineCount` stays `0` because
+nothing on this path frames a line. A genuine stderr read failure ends the enumerator and
+`FinishAsync()` with `ProcessError.Io`; the `IOException`/`ObjectDisposedException` of this handle's
+own teardown is quiet, and `StopAsync()`/disposal release an abandoned bounded stream.
+
+**This run's stdout is drained and discarded.** A handle is consumed one way, and `Finished` carries
+the outcome and the captured stderr — which you have just taken as bytes — so there is nothing for a
+terminal verb to hand stdout back through, and retaining it would pin a whole run's output in memory
+for a reader that cannot exist. stdout is still read, framed, teed (`StdoutTee`), handed to
+`OnStdoutLine` and counted into `StdoutLineCount`, so a chatty child never blocks on a full pipe; it
+is simply never retained, and asking for it afterwards (`StdoutLinesAsync()`, `StdoutChunksAsync()`,
+`OutputStringAsync()`, …) is refused rather than answered with an empty stream. Keep stdout with
+`Command.StdoutTee` or `Command.StdoutToFile` if you need both streams, or stream stdout and take
+stderr as the decoded `Finished.Stderr`. `FinishAsync()` after this verb still returns the honest
+`Outcome`; its `Stderr` is empty by construction, because those bytes went to you.
+
+**A run with no separate stderr refuses honestly.** `Command.MergeStderr()` folds stderr into stdout
+at the OS level, a `Command.Pty` run gives the child one terminal device, and
+`Command.StderrToFile`/`StdioMode.Inherit`/`StdioMode.Null` leave no parent-side stream at all — in
+each case there is no byte-exact stderr to stream, so `StderrChunksAsync()` throws
+`ProcessException` carrying `ProcessError.Unsupported` (naming which of them it was) instead of
+returning an empty enumerable that would read as "the child wrote nothing to stderr". Under a merge
+or a PTY the bytes really are in stdout: stream them with `StdoutChunksAsync()`. The refusal is
+decided before the pipes are claimed, so the handle is left untouched and every other verb is still
+available on it.
+
+`FakeProcess`, `ScriptedRunner`, and cassette replay hand out the same chunks a real run would, so a
+consumer of this verb is testable without a subprocess. A cassette records stderr as text, so a
+replayed stream is that recorded text in the command's stderr encoding; script arbitrary bytes into
+a double when a test needs stderr that no encoding round-trip survives.
 
 ## Streaming NDJSON / JSON Lines
 
@@ -457,7 +558,7 @@ instances for stdout and stderr.
 
 ## Bounding the streaming backlog
 
-By default, the channel that feeds `StdoutLinesAsync()` / `StdoutChunksAsync()` / `OutputEventsAsync()` / `WaitForLineAsync()`
+By default, the channel that feeds `StdoutLinesAsync()` / `StdoutChunksAsync()` / `StderrChunksAsync()` / `OutputEventsAsync()` / `WaitForLineAsync()`
 is **unbounded**: a producer far outrunning your consumer (a chatty child, a slow line handler) just
 grows the in-flight backlog — exactly the behavior ProcessKit has always had. `Command.StreamBuffer`
 opts in to a bounded channel instead, capping that backlog with one of four `StreamFullMode`s:
@@ -789,8 +890,8 @@ answers on the input it has, which for an interactive-only run is none at all.
 
 The other direction is safe and unchanged: a writer you took stays yours. No verb closes a
 handle it gave away, and completion waits for your own `FinishAsync()`/dispose. Streaming
-(`StdoutLinesAsync`/`StdoutChunksAsync`/`OutputEventsAsync` and the `FinishAsync` that concludes
-them), the readiness probes, and a live `StartAsync` handle you have not yet driven to
+(`StdoutLinesAsync`/`StdoutChunksAsync`/`StderrChunksAsync`/`OutputEventsAsync` and the `FinishAsync`
+that concludes them), the readiness probes, and a live `StartAsync` handle you have not yet driven to
 completion all leave the pipe exactly as they found it. A `PtySession` or `ContentLengthSession`
 takes the writer for its own send verbs when it is created — that is the "already taken" case,
 and `TakeStdin()` afterwards returns `None` for the same one-owner reason.

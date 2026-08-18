@@ -6,14 +6,15 @@ open System.Threading
 open System.Threading.Tasks
 
 /// The single output consumption a `RunningProcess` has been claimed for. Its output pipes are
-/// pumped exactly once: a buffered one-shot verb, a stdout-streaming session, a byte-chunk session, or
-/// an event-streaming session — never two readers on the same pipe.
+/// pumped exactly once: a buffered one-shot verb, a stdout-streaming session, either byte-chunk
+/// session, or an event-streaming session — never two readers on the same pipe.
 [<RequireQualifiedAccess>]
 type internal Consumption =
     | Fresh
     | Buffered
     | StdoutStreaming
     | StdoutChunkStreaming
+    | StderrChunkStreaming
     | EventStreaming
     | Interactive
 
@@ -79,6 +80,10 @@ type internal ConsumptionGate(interactiveStdin: Stream option, extraFdStreams: (
     // The chunk-streaming analogue of `stdoutLinesClaimed`: the session setup is deliberately
     // reentrant for `FinishAsync`/`ExitTask`, but the public enumerator is handed out only once.
     let mutable stdoutChunksClaimed = false
+
+    // The same one-enumerator guard for the STDERR byte-chunk session (`StderrChunksAsync`), which is
+    // reentrant for `FinishAsync`/`ExitTask` for exactly the same reason its stdout twin is.
+    let mutable stderrChunksClaimed = false
 
     // Latched by the TERMINAL `FinishAsync` when it takes over a stdout LINE-streaming session whose one
     // enumerator was never handed out — the "fresh handle, nobody ever streamed" shape `FinishAsync`
@@ -268,6 +273,48 @@ type internal ConsumptionGate(interactiveStdin: Stream option, extraFdStreams: (
                 false
             else
                 stdoutChunksClaimed <- true
+                true)
+
+    /// The STDERR byte-chunk session's claim — `TryClaimStdoutChunkStreaming` with the two pipes' roles
+    /// swapped: stderr is the caller's byte stream, and stdout is the one this session retains nothing
+    /// of. Same atomic check + claim + setup under this lock, and the same reentrancy for
+    /// `FinishAsync`/`ExitTask`.
+    ///
+    /// Needs no `terminalOnly` discard counterpart either, and the audit KB K-163 asks for is worth
+    /// spelling out, because this session is the one that drops output by CONSTRUCTION:
+    ///   - the stderr side cannot have a "fresh, nobody took the stream" shape. `StderrChunksAsync` —
+    ///     the verb that hands out the enumerator — is the ONLY caller that can start this session from
+    ///     `Fresh`; `FinishAsync`/`ExitTask` reach here only once `consumption` is ALREADY
+    ///     `StderrChunkStreaming` (on a fresh handle the stdout line claim wins ahead of them), i.e.
+    ///     only after a caller took the chunk enumerator. So no stderr chunk is ever queued for a
+    ///     consumer that does not exist, and there is nothing for a discard latch to turn off.
+    ///   - the stdout side IS dropped — it is drained so the child keeps moving and retained nowhere,
+    ///     because `Finished` carries no stdout for a terminal verb to hand back (the same rule T-357
+    ///     applied to an untaken stdout line stream). What keeps that drop honest is exactly what K-163
+    ///     requires of the latched one: the paired gate closes with it. Claiming this session sets
+    ///     `consumption`, so EVERY later stdout consumer — `StdoutLinesAsync`/`StdoutJsonLinesAsync`,
+    ///     `StdoutChunksAsync`, `WaitForLineAsync`, `OutputEventsAsync`, the buffered verbs — is refused
+    ///     with the ordinary already-consumed error by the claims above, under this same lock. None of
+    ///     them can be handed a stream that could only ever be empty.
+    member _.TryClaimStderrChunkStreaming(startSession: unit -> unit) =
+        lock gate (fun () ->
+            if consumption = Consumption.StderrChunkStreaming then
+                true
+            elif consumption <> Consumption.Fresh then
+                false
+            else
+                consumption <- Consumption.StderrChunkStreaming
+                startSession ()
+                true)
+
+    /// Hand out the stderr chunk session's ONE enumerator, or refuse — the stderr twin of
+    /// `TryTakeStdoutChunksEnumerator` (no latch to re-check, for the reason given on the claim above).
+    member _.TryTakeStderrChunksEnumerator() =
+        lock gate (fun () ->
+            if stderrChunksClaimed then
+                false
+            else
+                stderrChunksClaimed <- true
                 true)
 
     /// Claim the event-streaming session, running `startSession` under this lock on the ONE call that

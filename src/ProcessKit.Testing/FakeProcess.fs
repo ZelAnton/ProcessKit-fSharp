@@ -98,6 +98,7 @@ type FakeProcess
         stdout: string,
         stdoutBytes: byte[] option,
         stderr: string,
+        stderrBytes: byte[] option,
         outcome: Outcome,
         pid: int option,
         pty: PtyResizeRecorder option,
@@ -114,6 +115,7 @@ type FakeProcess
             "",
             None,
             "",
+            None,
             Outcome.Exited 0,
             None,
             None,
@@ -128,12 +130,23 @@ type FakeProcess
     /// buffer, line handlers — so it behaves like a real run of that command. Internal: `ScriptedRunner`
     /// uses it so `SpawnAsync` and the capture verbs agree on success/encoding semantics.
     static member internal OfCommand(command: Command) =
-        FakeProcess(command, "", None, "", Outcome.Exited 0, None, None, FakeStdinRecorder(), FakeSignalRecorder())
+        FakeProcess(
+            command,
+            "",
+            None,
+            "",
+            None,
+            Outcome.Exited 0,
+            None,
+            None,
+            FakeStdinRecorder(),
+            FakeSignalRecorder()
+        )
 
     /// The captured stdout the fake replays (split on `\n` into lines for the streaming verbs).
     member _.WithStdout(text: string) =
         ArgumentNullException.ThrowIfNull(text, nameof text)
-        FakeProcess(template, text, None, stderr, outcome, pid, pty, stdin, signals)
+        FakeProcess(template, text, None, stderr, stderrBytes, outcome, pid, pty, stdin, signals)
 
     /// The captured stdout as EXACT bytes, with no text round-trip: the built handle's stdout stream
     /// carries them verbatim, so a byte-exact observer — a `StdoutTee`, `OutputBytesAsync`,
@@ -144,12 +157,12 @@ type FakeProcess
     /// recording (its base64 stdout) with this, so all three replay APIs hand out the recorded bytes.
     member internal _.WithStdoutBytes(bytes: byte[]) =
         ArgumentNullException.ThrowIfNull(bytes, nameof bytes)
-        FakeProcess(template, "", Some(Array.copy bytes), stderr, outcome, pid, pty, stdin, signals)
+        FakeProcess(template, "", Some(Array.copy bytes), stderr, stderrBytes, outcome, pid, pty, stdin, signals)
 
     /// The captured stdout as a sequence of lines (joined with `\n`).
     member _.WithStdoutLines(lines: seq<string>) =
         ArgumentNullException.ThrowIfNull(lines, nameof lines)
-        FakeProcess(template, String.Join('\n', lines), None, stderr, outcome, pid, pty, stdin, signals)
+        FakeProcess(template, String.Join('\n', lines), None, stderr, stderrBytes, outcome, pid, pty, stdin, signals)
 
     /// Script byte-exact Content-Length frames on stdout. The fake writes canonical CRLF headers and
     /// preserves each payload verbatim, including non-UTF-8 bytes, for `ContentLengthSession` tests.
@@ -167,27 +180,42 @@ type FakeProcess
                 framed.Write(header, 0, header.Length)
                 framed.Write(payload, 0, payload.Length)
 
-        FakeProcess(template, "", Some(framed.ToArray()), stderr, outcome, pid, pty, stdin, signals)
+        FakeProcess(template, "", Some(framed.ToArray()), stderr, stderrBytes, outcome, pid, pty, stdin, signals)
 
     /// The captured stderr. On a PTY fake (see `WithPty`) or a `Command.MergeStderr()` fake there is no
     /// separate stderr stream: this text is folded into the single merged stdout stream rather than
     /// surfaced as `OutputEvent.Stderr`.
     member _.WithStderr(text: string) =
         ArgumentNullException.ThrowIfNull(text, nameof text)
-        FakeProcess(template, stdout, stdoutBytes, text, outcome, pid, pty, stdin, signals)
+        FakeProcess(template, stdout, stdoutBytes, text, None, outcome, pid, pty, stdin, signals)
+
+    /// The captured stderr as EXACT bytes, with no text round-trip — the stderr twin of
+    /// `WithStdoutBytes`, and for the same reason: the built handle's stderr stream carries them
+    /// verbatim, so a byte-exact observer (a `StderrTee`, `StderrChunksAsync`) sees what was scripted
+    /// even when those bytes are not valid in the command's stderr encoding. Scripting the same output
+    /// as *text* would decode it first (turning an invalid sequence into U+FFFD) and then re-encode
+    /// that replacement — exactly the loss a byte-exact stderr stream exists to avoid. Replaces any
+    /// text set by `WithStderr` (and vice versa: the last one wins, as for stdout). On a PTY /
+    /// `MergeStderr` fake there is no separate stderr stream, so these bytes are folded verbatim into
+    /// the single merged stdout stream, exactly where a real merged run would put them.
+    ///
+    /// Internal: the byte-exact stderr regressions script it, mirroring `WithStdoutBytes`'s visibility.
+    member internal _.WithStderrBytes(bytes: byte[]) =
+        ArgumentNullException.ThrowIfNull(bytes, nameof bytes)
+        FakeProcess(template, stdout, stdoutBytes, "", Some(Array.copy bytes), outcome, pid, pty, stdin, signals)
 
     /// Make the fake exit with `code`.
     member _.WithExit(code: int) =
-        FakeProcess(template, stdout, stdoutBytes, stderr, Outcome.Exited code, pid, pty, stdin, signals)
+        FakeProcess(template, stdout, stdoutBytes, stderr, stderrBytes, Outcome.Exited code, pid, pty, stdin, signals)
 
     /// Make the fake conclude with an explicit `Outcome` (e.g. `Outcome.TimedOut` or `Signalled`).
     member _.WithOutcome(value: Outcome) =
         ArgumentNullException.ThrowIfNull(value, nameof value)
-        FakeProcess(template, stdout, stdoutBytes, stderr, value, pid, pty, stdin, signals)
+        FakeProcess(template, stdout, stdoutBytes, stderr, stderrBytes, value, pid, pty, stdin, signals)
 
     /// Set the pid the handle reports.
     member _.WithPid(value: int) =
-        FakeProcess(template, stdout, stdoutBytes, stderr, outcome, Some value, pty, stdin, signals)
+        FakeProcess(template, stdout, stdoutBytes, stderr, stderrBytes, outcome, Some value, pty, stdin, signals)
 
     /// Model a pseudo-terminal (`Command.Pty`) run, so the built handle mirrors the observable
     /// merged-stream contract (ADR D3/D10):
@@ -217,7 +245,18 @@ type FakeProcess
     /// not reproducible here — only the *observable merged-stream shape* is. Test that child-tty
     /// behaviour against a real `Command.Pty` run. See `docs/testing.md`.
     member _.WithPty() =
-        FakeProcess(template, stdout, stdoutBytes, stderr, outcome, pid, Some(PtyResizeRecorder()), stdin, signals)
+        FakeProcess(
+            template,
+            stdout,
+            stdoutBytes,
+            stderr,
+            stderrBytes,
+            outcome,
+            pid,
+            Some(PtyResizeRecorder()),
+            stdin,
+            signals
+        )
 
     /// Keep the built handle's stdin open, exactly as `Command.KeepStdinOpen()` does on a real run, so
     /// `TakeStdin()` hands back a writable pipe — and so a `PtySession` built over this fake can
@@ -227,7 +266,18 @@ type FakeProcess
     /// `Command` (through `ScriptedRunner`) already inherits that command's `KeepStdinOpen`. Applying
     /// it twice is harmless.
     member _.WithStdinOpen() =
-        FakeProcess(template.KeepStdinOpen(), stdout, stdoutBytes, stderr, outcome, pid, pty, stdin, signals)
+        FakeProcess(
+            template.KeepStdinOpen(),
+            stdout,
+            stdoutBytes,
+            stderr,
+            stderrBytes,
+            outcome,
+            pid,
+            pty,
+            stdin,
+            signals
+        )
 
     /// The last `(cols, rows)` requested via `ResizeAsync` on this fake's built PTY handle, or `None`
     /// if this is not a PTY fake (see `WithPty`) or no resize has been requested. Shared across the
@@ -263,16 +313,41 @@ type FakeProcess
             && config.StderrFile.IsNone
             && config.StderrMode = StdioMode.Piped
 
+        // The scripted stderr as the bytes a real spawn would hand the parent: verbatim when it was
+        // scripted with `WithStderrBytes` (no text round-trip, so a byte-exact observer sees exactly
+        // those bytes), else the text encoded with the command's stderr encoding, exactly as before.
+        let stderrPayload =
+            match stderrBytes with
+            | Some bytes -> Array.copy bytes
+            | None -> config.StderrEncoding.GetBytes stderr
+
         // A PTY or MergeStderr has one observable stdout stream: the child's stdout and stderr share a
         // terminal device or the OS folds stderr into stdout. The fake joins scripted stderr on a newline
         // so it forms its own line. A fake cannot reproduce real OS interleaving, so folded stderr simply
         // follows the stdout text.
         let stdoutPayload =
+            // A BYTE-scripted stderr folds into a merged stream verbatim — byte-scripting exists
+            // precisely so nothing re-encodes it — after the same newline separator the text fold uses
+            // (and no separator at all when there is no stdout for it to separate from). A
+            // TEXT-scripted stderr keeps the existing text-level fold below, encoded with stdout's
+            // encoding as a merged stream's bytes always were.
+            let foldScriptedStderrBytes (baseBytes: byte[]) =
+                match stderrBytes with
+                | Some bytes when hasMergedStderr && bytes.Length > 0 ->
+                    let separator =
+                        if baseBytes.Length = 0 then
+                            Array.empty
+                        else
+                            config.StdoutEncoding.GetBytes "\n"
+
+                    Array.concat [ baseBytes; separator; bytes ]
+                | _ -> baseBytes
+
             match stdoutBytes with
             | Some bytes when hasMergedStderr && stderr.Length > 0 ->
                 let suffix = config.StdoutEncoding.GetBytes("\n" + stderr)
-                Array.append bytes suffix
-            | Some bytes -> Array.copy bytes
+                foldScriptedStderrBytes (Array.append bytes suffix)
+            | Some bytes -> foldScriptedStderrBytes (Array.copy bytes)
             | None ->
                 let text =
                     if hasMergedStderr && stderr.Length > 0 then
@@ -283,7 +358,7 @@ type FakeProcess
                     else
                         stdout
 
-                config.StdoutEncoding.GetBytes text
+                foldScriptedStderrBytes (config.StdoutEncoding.GetBytes text)
 
         let stdoutStream =
             if hasStdout then
@@ -295,7 +370,7 @@ type FakeProcess
         // `Spawned.Stderr` is `None`; a normal fake keeps its own stderr stream.
         let stderrStream =
             if hasStderr then
-                Some(new MemoryStream(config.StderrEncoding.GetBytes stderr) :> Stream)
+                Some(new MemoryStream(stderrPayload) :> Stream)
             else
                 None
 

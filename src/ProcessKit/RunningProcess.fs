@@ -53,7 +53,7 @@ type RunningProcess
     //   `RunTerminal` — the shared terminal waits and teardown: the configured timeout race, the
     //     bounded post-kill reap window, the bounded post-exit output drain, this handle's lifecycle
     //     tokens, and the reap guard every terminal verb reaps in.
-    //   `OutputSessions` — the pumps, their streaming channels and counters, and the four session
+    //   `OutputSessions` — the pumps, their streaming channels and counters, and the five session
     //     shapes a claimed handle can take. Platform-agnostic, and bounded only through `RunTerminal`.
     //
     // The verbs below COMPOSE those three; they never reach around them. So a new streaming or
@@ -149,6 +149,28 @@ type RunningProcess
     let alreadyConsumedMessage = ConsumptionRefusal.message
 
     let alreadyConsumedError () = ConsumptionRefusal.error ()
+
+    // Why a byte-exact stderr stream is impossible for THIS run, if it is — the one place that decides
+    // it, so `StderrChunksAsync` refuses honestly (a typed `ProcessError.Unsupported`) instead of
+    // handing back a stream that could only ever be empty. The condition is the ground truth (is there
+    // a parent-side stderr pipe to read at all: `host.Stderr`), never the config alone — a test double
+    // that models a merged run answers exactly as the spawn it stands in for. The config only explains
+    // WHICH configuration removed the stream, so the message names the real cause.
+    let stderrChunksUnsupported () : ProcessError option =
+        match stderrStream with
+        | Some _ -> None
+        | None ->
+            let reason =
+                if config.MergeStderr then
+                    "this run merges stderr into stdout (MergeStderr), so there is no separate stderr stream; stream the merged bytes with StdoutChunksAsync"
+                elif hasPseudoTerminal then
+                    "a PTY run gives the child one terminal device, so there is no separate stderr stream; stream the merged bytes with StdoutChunksAsync"
+                elif config.StderrFile.IsSome then
+                    "this run redirects stderr straight to a file, so there is no parent-side stderr stream to read"
+                else
+                    "this run does not pipe stderr, so there is no parent-side stderr stream to read"
+
+            Some(ProcessError.Unsupported $"StderrChunksAsync: {reason}")
 
     // Hand `stdoutStream`/`stderrStream` to a readiness probe (`WaitForPortAsync`/`WaitForAsync`) for
     // its background drain — but only a still-`Fresh` handle's pipes: if a buffered verb or a
@@ -492,8 +514,9 @@ type RunningProcess
 
     /// Stream items dropped so far by a bounded streaming policy's `StreamFullMode.DropOldest`/
     /// `DropNewest` (always `0` unless `Command.StreamBuffer` is configured with one of those modes).
-    /// For line/event streams this counts dropped lines/events; for `StdoutChunksAsync` it counts
-    /// dropped chunks. It is the streaming analogue of a buffered verb's `ProcessResult.Truncated`.
+    /// For line/event streams this counts dropped lines/events; for `StdoutChunksAsync`/
+    /// `StderrChunksAsync` it counts dropped chunks. It is the streaming analogue of a buffered verb's
+    /// `ProcessResult.Truncated`.
     member _.DroppedStreamLineCount = sessions.DroppedStreamLineCount
 
     /// Take the parent side of the POSIX full-duplex channel connected to `targetFd` in the child.
@@ -1176,6 +1199,55 @@ type RunningProcess
 
         sessions.StdoutChunks
 
+    // The stderr counterpart to `StartStdoutChunkStreaming`: the same claim shape with the two pipes'
+    // roles swapped — stderr is pumped raw for the caller, stdout is pumped and retained nowhere (see
+    // `OutputSessions.StartStderrChunkSession`). Reentrant for `FinishAsync`/`ExitTask`, while the
+    // public `StderrChunksAsync` below keeps its own one-enumerator guard, and it needs no
+    // `terminalOnly` discard counterpart either (see `ConsumptionGate.TryClaimStderrChunkStreaming`,
+    // which spells out the K-163 audit for both halves of this session).
+    member private _.StartStderrChunkStreaming() : bool =
+        gate.TryClaimStderrChunkStreaming(fun () -> sessions.StartStderrChunkSession())
+
+    /// Stream **stderr** as raw byte chunks — the exact counterpart of `StdoutChunksAsync`, for
+    /// diagnostics that text is the wrong abstraction for (a binary progress protocol, a high-volume
+    /// log a caller wants to relay or hash byte-for-byte). Each item is a non-empty
+    /// `ReadOnlyMemory&lt;byte&gt;` containing exactly one underlying read, including NUL bytes,
+    /// invalid UTF-8, and arbitrary read boundaries; the returned memory owns its backing array and
+    /// remains valid after the next item is produced. Same `Command.StreamBuffer` backpressure/drop/
+    /// fail-loud policy, same `StderrTee` raw tee, same teardown behaviour as the stdout chunk stream,
+    /// and the same one-shot contract: a second call — or any other consuming verb — is refused with
+    /// the already-consumed `InvalidOperationException`. Call `FinishAsync()` afterwards for the
+    /// process outcome.
+    ///
+    /// **This run's stdout is drained and discarded.** `Finished` carries the outcome and the captured
+    /// stderr, which this verb has just handed to the caller as bytes, so there is nothing for a
+    /// terminal verb to return stdout through — and retaining it would pin a whole run's output in
+    /// memory for nobody (T-357). stdout is still read, framed, teed (`StdoutTee`), handed to
+    /// `OnStdoutLine` and counted into `StdoutLineCount`, so the child never blocks on a full pipe; it
+    /// is simply never retained, and asking for it afterwards (`StdoutLinesAsync`/`StdoutChunksAsync`/
+    /// `OutputStringAsync`/...) is refused rather than answered with an empty stream. Capture stdout
+    /// with `Command.StdoutTee`/`StdoutToFile` if you need both.
+    ///
+    /// **No separate stderr, no fake stream.** A run whose stderr does not reach the parent as its own
+    /// pipe cannot have a byte-exact stderr stream at all: `Command.MergeStderr` folds stderr into
+    /// stdout at the OS level, a `Command.Pty` run gives the child one terminal device, and
+    /// `StderrToFile`/`StdioMode.Inherit`/`StdioMode.Null` leave no parent-side stream. Each of those
+    /// raises `ProcessException` carrying `ProcessError.Unsupported` (naming which one it was) instead
+    /// of returning an empty enumerable that would read as "the child wrote nothing to stderr" — under
+    /// a merge, use `StdoutChunksAsync()`, where those bytes really are. The refusal happens BEFORE the
+    /// pipes are claimed, so the handle is left untouched and every other verb remains available.
+    member this.StderrChunksAsync() : IAsyncEnumerable<ReadOnlyMemory<byte>> =
+        match stderrChunksUnsupported () with
+        | Some error -> raise (ProcessException error)
+        | None ->
+            if not (this.StartStderrChunkStreaming()) then
+                raise (InvalidOperationException alreadyConsumedMessage)
+
+            if not (gate.TryTakeStderrChunksEnumerator()) then
+                raise (InvalidOperationException alreadyConsumedMessage)
+
+            sessions.StderrChunks
+
     /// Stream stdout line by line as it arrives. Call `FinishAsync` afterwards for stderr + outcome.
     /// Hands out its ONE enumerator exactly once per handle — a second call (directly, or via
     /// `StdoutJsonLinesAsync`, which itself calls this) throws `InvalidOperationException`, same as any
@@ -1266,6 +1338,10 @@ type RunningProcess
     /// A stream that WAS handed out keeps the existing hand-off semantics unchanged: everything the
     /// child wrote stays queued for its enumerator, dropped or bounded only by the `StreamBuffer`
     /// policy the caller opted into.
+    ///
+    /// After `StderrChunksAsync()` this is still the terminal hand-off, with `Finished.Stderr` empty by
+    /// construction: that session hands the stderr BYTES to the caller instead of capturing them, so
+    /// there is no text capture to return (see `StderrChunksAsync`).
     member this.FinishAsync() : Task<Result<Finished, ProcessError>> =
         let outcomeTask =
             // `terminalOnly`: this verb ends the run, it does not consume stdout. With no enumerator
@@ -1276,6 +1352,12 @@ type RunningProcess
                 Some sessions.LineOutcome
             elif this.StartStdoutChunkStreaming() then
                 Some sessions.ChunkOutcome
+            elif this.StartStderrChunkStreaming() then
+                // Only ever reached for a handle a `StderrChunksAsync` consumer already claimed (the
+                // two claims above win on a fresh one), so this is the terminal hand-off after that
+                // stream — never a session this call starts. `Finished.Stderr` is then empty by
+                // construction: those bytes are the caller's, not a capture to hand back.
+                Some sessions.StderrChunkOutcome
             else
                 None
 
@@ -1646,6 +1728,7 @@ type RunningProcess
                 match claimed with
                 | Consumption.StdoutStreaming -> sessions.LineOutcome
                 | Consumption.StdoutChunkStreaming -> sessions.ChunkOutcome
+                | Consumption.StderrChunkStreaming -> sessions.StderrChunkOutcome
                 // The event pumps already drain both pipes; reuse their shared outcome rather than
                 // starting our own drains here, which would race a second reader on the same streams.
                 | Consumption.EventStreaming -> sessions.EventOutcome

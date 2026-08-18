@@ -19,6 +19,8 @@ Fresh -> StdoutStreaming
   via StdoutLinesAsync or StdoutJsonLinesAsync
 Fresh -> ChunkStreaming
   via StdoutChunksAsync
+Fresh -> StderrChunkStreaming
+  via StderrChunksAsync
 Fresh -> EventStreaming
   via OutputEventsAsync
 Fresh -> ContentLengthSession
@@ -61,6 +63,11 @@ The transition labels have these exact meanings:
   stderr. `StdoutJsonLinesAsync` is a wrapper over this same channel and claim.
 - **ChunkStreaming** — the implementation's `StdoutChunkStreaming` state. One pump writes raw,
   non-empty OS reads to the byte channel while stderr is captured separately.
+- **StderrChunkStreaming** — the same shape with the two pipes' roles swapped. One pump writes raw,
+  non-empty OS reads of *stderr* to its own byte channel, while stdout is pumped exactly as elsewhere
+  (framed, teed, handed to `OnStdoutLine`, counted) and retained nowhere: `Finished` has no stdout
+  field to return it through, so retaining it would repeat T-357's unbounded backlog. The claim gate
+  refuses every later stdout consumer, so the drop is loud rather than an empty answer.
 - **EventStreaming** — stdout and stderr have independent line pumps writing tagged events to one
   channel.
 - **ContentLengthSession** — the `Interactive` claim is established by constructing
@@ -87,6 +94,7 @@ still owns output draining, exit observation, and release.
 | Buffered | Permanent `Buffered` claim | `ensureBufferedWait()` creates one `bufferedOutcome` | The winning capture/drain verb owns both pipes | `OutputStringAsync`, `OutputBytesAsync`, `WaitAsync`, and `ProfileAsync` are alternatives and each is once-only. A later consuming verb is refused. |
 | StdoutStreaming | Permanent `StdoutStreaming` claim | `streamOutcome` combines exit with both pumps | stdout line pump → single-reader channel; stderr pump → `LineBuffer` | The line/NDJSON enumerator is handed out once. `FinishAsync` rejoins this outcome, returns stderr plus `Outcome`, and reaps. `WaitForLineAsync` may join the same line session. |
 | ChunkStreaming | Permanent `StdoutChunkStreaming` claim | `chunkOutcome` combines exit with both pumps | stdout byte pump → single-reader channel; stderr pump → `LineBuffer` | The chunk enumerator is handed out once. `FinishAsync` rejoins this outcome, returns stderr plus `Outcome`, and reaps. |
+| StderrChunkStreaming | Permanent `StderrChunkStreaming` claim | `stderrChunkOutcome` combines exit with both pumps | stderr byte pump → single-reader channel; stdout line pump → nothing retained | The stderr chunk enumerator is handed out once. `FinishAsync` rejoins this outcome and reaps; its `Finished.Stderr` is empty by construction, because those bytes went to the caller. |
 | EventStreaming | Permanent `EventStreaming` claim | `eventOutcome` combines exit with both pumps | stdout and stderr line pumps → one tagged event channel | `OutputEventsAsync` is handed out once. `FinishAsync` is not a companion; use `StopAsync`, `ExitTask` through the wait helpers followed by disposal, or disposal. |
 | ContentLengthSession | Permanent `Interactive` claim | `interactiveOutcome` combines exit, frame parser, and stderr drain | Content-Length parser → frame channel; raw stderr drain | One session per handle; `FramesAsync()` is handed out once. Dispose the run/group to reap after the conversation. |
 | JsonRpcSession | The underlying Content-Length session owns the one `Interactive` claim | Same `interactiveOutcome` | JSON-RPC router owns the transport's sole frame reader | One framed transport and one router. Raw frame enumeration and a second session are unavailable. |
@@ -138,8 +146,8 @@ lifecycle transition even though they share the backend safety gate.
 
 ### Output consumption exclusivity
 
-- Exactly one buffered, line-streaming, chunk-streaming, event-streaming, or interactive session
-  claims a `RunningProcess`.
+- Exactly one buffered, line-streaming, stdout-chunk-streaming, stderr-chunk-streaming,
+  event-streaming, or interactive session claims a `RunningProcess`.
 - A claim is permanent for the lifetime of the handle. Pump completion or failure does not return the
   state to `Fresh`, so starting another stream afterward is an error.
 - Line/NDJSON, chunk, event, Content-Length frame, and PTY consumers each expose only one reader.
@@ -151,10 +159,11 @@ lifecycle transition even though they share the backend safety gate.
 
 ### Terminal operation reuse
 
-- `FinishAsync()` may rejoin `StdoutStreaming` or `ChunkStreaming` and collect the captured stderr
-  plus `Outcome`. It cannot finish event or interactive sessions. Calling it on a fresh handle starts
-  the stdout-streaming machinery even if no enumerator was requested, but its intended use is the
-  terminal hand-off after line or chunk streaming.
+- `FinishAsync()` may rejoin `StdoutStreaming`, `ChunkStreaming`, or `StderrChunkStreaming` and
+  collect the captured stderr plus `Outcome` (empty stderr for the stderr-chunk session, whose bytes
+  the caller already took). It cannot finish event or interactive sessions. Calling it on a fresh
+  handle starts the stdout-streaming machinery even if no enumerator was requested, but its intended
+  use is the terminal hand-off after line or chunk streaming.
 - Reaching `FinishAsync()` with the line-stream enumerator never handed out — a fresh handle, or one
   only `WaitForLineAsync` looked at — latches a retain-nothing stdout sink for the rest of the run:
   the pump keeps framing lines (handlers, tee, counters, and fault classification are unchanged) but
@@ -173,7 +182,7 @@ lifecycle transition even though they share the backend safety gate.
 
 ### Abandoned streams
 
-Creating `StdoutLinesAsync`, `StdoutChunksAsync`, or `OutputEventsAsync` starts its pumps immediately;
+Creating `StdoutLinesAsync`, `StdoutChunksAsync`, `StderrChunksAsync`, or `OutputEventsAsync` starts its pumps immediately;
 enumeration is not what starts them. If the returned channel is never consumed or an enumerator is
 abandoned, the claim remains and the pumps continue. An unbounded channel can continue accumulating
 items. A bounded backpressure channel can leave its writer parked when the backlog fills.

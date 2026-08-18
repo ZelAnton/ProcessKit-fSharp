@@ -97,8 +97,9 @@ type internal JsonLinesEnumerable<'T>(program: string, source: IAsyncEnumerable<
             :> IAsyncEnumerator<'T>
 
 /// Everything that reads ONE handle's stdout/stderr: the pumps themselves, the streaming channels
-/// they fill, the line/byte counters they publish, and the four session shapes a claimed handle can
-/// take (stdout lines, stdout byte chunks, merged output events, and a raw interactive session).
+/// they fill, the line/byte counters they publish, and the five session shapes a claimed handle can
+/// take (stdout lines, stdout byte chunks, stderr byte chunks, merged output events, and a raw
+/// interactive session).
 ///
 /// The claim decisions are NOT here — `ConsumptionGate` owns which of these sessions a handle is
 /// allowed to start, and calls the `Start*` members below from inside its own lock so a session is
@@ -143,6 +144,7 @@ type internal OutputSessions
     let mutable stdoutStreamedByteCount = 0L
     let mutable stderrStreamedByteCount = 0L
     let mutable stdoutChunkStreamedByteCount = 0L
+    let mutable stderrChunkStreamedByteCount = 0L
 
     // The stderr capture a streaming/chunk session fills for `FinishAsync` (stdout goes to the
     // caller's channel; stderr is what `Finished` carries). Assigned by the session setup, which
@@ -151,6 +153,11 @@ type internal OutputSessions
 
     let mutable streamOutcome = Unchecked.defaultof<Task<Outcome>>
     let mutable chunkOutcome = Unchecked.defaultof<Task<Outcome>>
+
+    // The stderr byte-chunk session's combined outcome (exit wait + the stderr chunk pump + the
+    // retain-nothing stdout drain). `FinishAsync`/`ExitTask` share it exactly as they share the stdout
+    // chunk session's own outcome.
+    let mutable stderrChunkOutcome = Unchecked.defaultof<Task<Outcome>>
 
     // The event-streaming session's single combined outcome (waiting for exit + draining both pipes via
     // the two pumps). `ExitTask` reuses it for an `EventStreaming` handle so it does not start a second,
@@ -212,6 +219,9 @@ type internal OutputSessions
     let bumpStdoutChunkStreamedBytes (delta: int) =
         Interlocked.Add(&stdoutChunkStreamedByteCount, int64 delta) |> ignore
 
+    let bumpStderrChunkStreamedBytes (delta: int) =
+        Interlocked.Add(&stderrChunkStreamedByteCount, int64 delta) |> ignore
+
     // Saturating reads, mirroring `Pump.LineBuffer.TotalBytes` — these only ever feed an `int`-typed
     // `ProcessError.OutputTooLarge.TotalBytes`.
     let readStdoutStreamedByteCount () =
@@ -229,6 +239,9 @@ type internal OutputSessions
     let readStdoutChunkStreamedByteCount () =
         Volatile.Read(&stdoutChunkStreamedByteCount) |> saturateInt64ToInt
 
+    let readStderrChunkStreamedByteCount () =
+        Volatile.Read(&stderrChunkStreamedByteCount) |> saturateInt64ToInt
+
     // The streaming channels and their policy-aware writer live in `StreamChannel`: the stdout channel
     // is written by exactly one pump, the event channel by two (stdout + stderr), and either is bounded
     // when `config.StreamBuffer` opts in (else unbounded, as before).
@@ -238,6 +251,14 @@ type internal OutputSessions
     // The byte-chunk session has its own channel type but shares the same configured capacity and
     // full-mode policy. It remains dormant unless `StdoutChunksAsync` claims this handle.
     let stdoutChunkChannel: StreamChannel.Channel<ReadOnlyMemory<byte>> =
+        StreamChannel.create config.StreamBuffer true
+
+    // The stderr byte-chunk session's own channel, dormant unless `StderrChunksAsync` claims this
+    // handle. A separate channel rather than a shared one: the two chunk sessions are alternatives
+    // (the claim gate lets exactly one of them own the pipes), and one item on each channel means one
+    // read of THAT stream — merging them would lose which pipe a chunk came from, the very distinction
+    // this verb exists to keep.
+    let stderrChunkChannel: StreamChannel.Channel<ReadOnlyMemory<byte>> =
         StreamChannel.create config.StreamBuffer true
 
     let eventChannel: StreamChannel.Channel<OutputEvent> =
@@ -289,6 +310,22 @@ type internal OutputSessions
             stdoutChunkChannel
             (fun _policy ->
                 ProcessError.OutputTooLarge(config.Program, None, None, 0, readStdoutChunkStreamedByteCount ()))
+            bumpDroppedStreamLine
+            item
+
+    // The stderr twin of `writeChunkItem`, on the stderr chunk channel and with the same honest
+    // totals: a raw stderr chunk has no line structure either, so `LineLimit`/`ByteLimit`/`TotalLines`
+    // stay `None`/`0` and the cumulative chunk BYTES are the one real total this site can report. It
+    // shares `ChunkBackpressureToken` with the stdout chunk channel because the two sessions are
+    // alternatives — at most one of them ever has a bounded writer parked on it — so the terminal
+    // paths keep releasing an abandoned chunk consumer through the one token they already cancel.
+    let writeStderrChunkItem (item: ReadOnlyMemory<byte>) : ValueTask =
+        StreamChannel.writeItem
+            config.StreamBuffer
+            terminal.ChunkBackpressureToken
+            stderrChunkChannel
+            (fun _policy ->
+                ProcessError.OutputTooLarge(config.Program, None, None, 0, readStderrChunkStreamedByteCount ()))
             bumpDroppedStreamLine
             item
 
@@ -398,7 +435,8 @@ type internal OutputSessions
     member _.AnyStreamLinesDropped = Volatile.Read(&droppedStreamLineCount) > 0
 
     /// The stderr a streaming/chunk session captured for `FinishAsync`. Valid only once such a session
-    /// has been claimed — which is exactly when `FinishAsync` reads it.
+    /// has been claimed — which is exactly when `FinishAsync` reads it. Empty by construction for the
+    /// STDERR chunk session, whose stderr went to the caller as bytes (see `StartStderrChunkSession`).
     member _.SessionStderrText = stderrStreamBuffer.Text
 
     member _.SessionStderrTruncated = stderrStreamBuffer.Truncated
@@ -482,6 +520,10 @@ type internal OutputSessions
     member _.StdoutChunks: IAsyncEnumerable<ReadOnlyMemory<byte>> =
         stdoutChunkChannel.Reader.ReadAllAsync()
 
+    /// The stderr CHUNK session's one enumerator source.
+    member _.StderrChunks: IAsyncEnumerable<ReadOnlyMemory<byte>> =
+        stderrChunkChannel.Reader.ReadAllAsync()
+
     /// The merged output-event session's one enumerator source.
     member _.OutputEvents: IAsyncEnumerable<OutputEvent> =
         eventChannel.Reader.ReadAllAsync()
@@ -491,6 +533,9 @@ type internal OutputSessions
 
     /// The stdout chunk session's combined outcome.
     member _.ChunkOutcome = chunkOutcome
+
+    /// The stderr chunk session's combined outcome.
+    member _.StderrChunkOutcome = stderrChunkOutcome
 
     /// The event session's combined outcome.
     member _.EventOutcome = eventOutcome
@@ -704,6 +749,108 @@ type internal OutputSessions
         // The enumerator may be abandoned without a subsequent FinishAsync; keep the combined
         // task observed while preserving its original exception for a real awaiter.
         RunTerminal.ObserveFault chunkOutcome
+
+    /// Build the STDERR byte-chunk session — `StartChunkSession` with the two pipes' roles swapped.
+    /// stderr is pumped raw for the caller's enumerator (one channel item is one non-empty OS read, no
+    /// decoding and no line framing), and stdout is pumped exactly as every other session pumps it but
+    /// retained NOWHERE. Called by `ConsumptionGate.TryClaimStderrChunkStreaming` under its lock.
+    ///
+    /// **Why stdout is dropped rather than captured.** `Finished` — all a terminal `FinishAsync` can
+    /// hand back — carries the outcome and the captured stderr, never stdout, and this session's stderr
+    /// is already the caller's own byte stream. Holding a whole run's stdout for something with nowhere
+    /// to return it is precisely the unbounded retention T-357 removed from an untaken stdout line
+    /// stream. The drop is the same shape as that one, and equally loud: stdout is still read, framed,
+    /// teed (`StdoutTee`), handed to `OnStdoutLine` and counted into `StdoutLineCount` — so a child
+    /// writing stdout never blocks on a full pipe and every observation knob behaves as it does
+    /// elsewhere — it is only never retained, and every later stdout consumer is refused by the claim
+    /// gate with the ordinary already-consumed error rather than handed an empty answer (KB K-163).
+    member _.StartStderrChunkSession() =
+        // `FinishAsync` reads this session's stderr capture like it reads any other's. Here it is
+        // deliberately an EMPTY buffer nothing writes into, because the stderr bytes went to the
+        // caller's channel: `Finished.Stderr` is "" (documented on the verb) and `Truncated`/`TooLarge`
+        // then report on a capture that genuinely holds nothing, instead of dereferencing an unassigned
+        // buffer.
+        let stderrBuffer = GuardedLineBuffer config.OutputBuffer
+        stderrStreamBuffer <- stderrBuffer
+
+        let stderrPump =
+            task {
+                try
+                    match stderrStream with
+                    | Some stream ->
+                        do!
+                            Pump.readBytesUntilDone
+                                stream
+                                config.StderrTee
+                                (fun chunk ->
+                                    bumpStderrChunkStreamedBytes chunk.Length
+
+                                    writeStderrChunkItem chunk)
+                                (fun () -> terminal.DisposalToken.IsCancellationRequested)
+                                CancellationToken.None
+                    | None -> ()
+
+                    stderrChunkChannel.TryComplete() |> ignore
+                with
+                | :? OperationCanceledException when terminal.ChunkBackpressureToken.IsCancellationRequested ->
+                    // The shared chunk backpressure token released an abandoned writer; routine
+                    // completion, not a read/tee fault for the chunk stream (as on the stdout twin).
+                    stderrChunkChannel.TryComplete() |> ignore
+                | ex ->
+                    // A genuine read fault, a throwing tee, or a bounded-channel failure must
+                    // wake the chunk consumer and remain visible through the session outcome.
+                    let reported = reportedPumpFault ex
+                    stderrChunkChannel.TryComplete reported |> ignore
+                    ExceptionDispatchInfo.Throw reported
+            }
+
+        let stdoutPump =
+            task {
+                try
+                    do!
+                        StreamChannel.pumpLines
+                            stdoutStream
+                            config.StdoutEncoding
+                            config.StdoutLineTerminator
+                            config.StdoutTee
+                            (fun line ->
+                                invokeLine config.OnStdoutLine line
+                                bumpStdoutLine ()
+                                // Retained nowhere: no channel to queue into (no consumer can be
+                                // handed one) and no capture to grow. Everything observable about the
+                                // line has already happened above.
+                                ValueTask.CompletedTask)
+                            // The buffer policy's byte cap doubles as the in-flight line ceiling, as it
+                            // does for every pump whose lines no consumer paces: a newline-free flood
+                            // must not grow an assembly buffer for output this session retains nothing
+                            // of. `None` (the default) keeps the previous unbounded assembly.
+                            config.OutputBuffer.MaxBytes
+                            (fun () -> terminal.DisposalToken.IsCancellationRequested)
+                with ex ->
+                    // Complete the stderr chunk channel on a sibling failure so a consumer cannot wait
+                    // forever for a channel whose stdout pump has already failed the combined session.
+                    let reported = reportedPumpFault ex
+                    stderrChunkChannel.TryComplete reported |> ignore
+                    ExceptionDispatchInfo.Throw reported
+            }
+
+        terminal.KillTreeOnPumpFault(stderrPump :> Task)
+        terminal.KillTreeOnPumpFault(stdoutPump :> Task)
+
+        stderrChunkOutcome <-
+            task {
+                let! outcome = terminal.WaitWithTimeout()
+                do! terminal.DrainPumpsBounded [| stderrPump :> Task; stdoutPump :> Task |]
+                // As on both other streaming sessions: end the channel here as well, so a consumer is
+                // never left enumerating a channel whose abandoned pump can no longer complete it.
+                // Idempotent with the pump's own completion.
+                stderrChunkChannel.TryComplete() |> ignore
+                return outcome
+            }
+
+        // The enumerator may be abandoned without a subsequent FinishAsync; keep the combined task
+        // observed while preserving its original exception for a real awaiter (KB K-084).
+        RunTerminal.ObserveFault stderrChunkOutcome
 
     /// Build the merged output-event session: one line pump per stream, both writing into the shared
     /// event channel, plus their combined outcome. Called by `ConsumptionGate.TryClaimEventStreaming`
