@@ -745,6 +745,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     ///    BSDs) returns `ProcessError.Unsupported`: there is no anchor to capture, and tracking a bare
     ///    number would mean SIGKILLing whatever holds it at teardown. Never a silent downgrade to raw
     ///    by-number containment.
+    ///  * a process this caller may **not signal** — another user's, or a protected/system one — is
+    ///    refused with `ProcessError.Adopt` on the POSIX process-group mechanism, which checks it with a
+    ///    `kill(pid, 0)` probe at adoption. Reading a start-time anchor proves only that the process can be
+    ///    *identified* (on Linux `/proc/<pid>/stat` is world-readable), never that it can be controlled,
+    ///    and a member this group could not signal or SIGKILL would be containment reported but not held.
+    ///    The Job Object and cgroup v2 mechanisms refuse the same case by construction, through the denied
+    ///    `OpenProcess`/`cgroup.procs` write below. The check is about the moment of adoption: a process
+    ///    that changes credentials afterwards is no more foreseeable here than one that exits afterwards.
     ///  * a pid that names nothing, an identity that cannot be read (a `hidepid` `/proc` mount, another
     ///    user's process on macOS), a denied `OpenProcess`/`cgroup.procs` write, a Windows assign the
     ///    kernel refuses, or a number that changed hands *while this call ran*, all return

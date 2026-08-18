@@ -582,7 +582,7 @@ module internal CapabilityProbe =
                 // pid is narrower than the other two mechanisms give, and both halves of that are things
                 // a caller has to plan around.
                 Capability.Qualified
-                    "the process is tracked INDIVIDUALLY against a start-time anchor re-verified before every signal and kill: it is listed, signalled and killed with the group, but processes it forks afterwards are NOT contained (no POSIX primitive moves a foreign, already-exec'ed process into our process group), and a number whose anchor stops matching is dropped from the group rather than signalled"
+                    "the process is tracked INDIVIDUALLY against a start-time anchor re-verified before every signal and kill: it is listed, signalled and killed with the group, but processes it forks afterwards are NOT contained (no POSIX primitive moves a foreign, already-exec'ed process into our process group), a number whose anchor stops matching is dropped from the group rather than signalled, and a pid this process may not signal (another user's, a protected one) is refused at adoption rather than accepted as a member the group could not kill"
             else
                 Capability.Unsupported
                     "a start-time identity reader for the pid (Linux /proc/<pid>/stat, macOS proc_pidinfo); this platform ships none ProcessKit can verify, so there is no anchor to bind the group to and a bare number would let teardown SIGKILL whatever holds it later — refused rather than downgraded"

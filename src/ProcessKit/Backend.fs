@@ -277,8 +277,9 @@ type internal IContainmentBackend =
     /// A backend that cannot take such an anchor at all returns `ProcessError.Unsupported` — a POSIX host
     /// with no start-time reader (the BSDs), where tracking the number would mean signalling whatever
     /// holds it at teardown — and a per-process failure (a pid that names nothing, a denied read or
-    /// write, an assign the kernel refuses, a number that changed hands during the call) is a typed
-    /// `ProcessError.Adopt`. Never a silent downgrade to raw by-number containment.
+    /// write, an assign the kernel refuses, a target this process may not signal, a number that changed
+    /// hands during the call) is a typed `ProcessError.Adopt`. Never a silent downgrade to raw by-number
+    /// containment, and never a member the group would be unable to kill.
     abstract AdoptByPid: int -> Result<unit, ProcessError>
 
     /// Stop tracking a reaped child (close its handle / drop it from the container's view).
@@ -1274,11 +1275,13 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
             // tracking), and its exit status, which stays with its real parent — this library never
             // `waitpid`s it.
             //
-            // Two distinct refusals, never conflated. A host with no start-time reader at all (the BSDs)
+            // Three distinct refusals, never conflated. A host with no start-time reader at all (the BSDs)
             // has no anchor to take for ANY pid: `Unsupported`, the whole-platform answer, rather than
             // silently tracking a bare number that teardown would later SIGKILL whoever holds. A host
             // with a reader that cannot read THIS pid (already gone, `hidepid`, another user's process on
-            // macOS) is a per-process `Adopt` failure.
+            // macOS) is a per-process `Adopt` failure. And a pid this process may not SIGNAL is a
+            // per-process `Adopt` failure too — see the signalability gate below, which is the one thing
+            // the anchor read cannot answer.
             if not (Native.Posix.processIdentityReaderAvailable ()) then
                 Error(
                     ProcessError.Unsupported
@@ -1294,8 +1297,20 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                         )
                     )
                 | Some anchor ->
-                    adopted[pid] <- anchor
-                    Ok()
+                    // The anchor proves we can IDENTIFY this process; it says nothing about whether we can
+                    // CONTROL it, and on Linux the two come apart routinely (`/proc/<pid>/stat` is
+                    // world-readable, so another user's process reads back a perfectly good anchor while
+                    // every `kill` to it fails EPERM — unreported, because the teardown kill is
+                    // fire-and-forget). Accepting such a pid would report containment of a process this
+                    // group cannot signal or SIGKILL: the silent downgrade of the kill-on-dispose
+                    // guarantee. The other two mechanisms refuse it by construction — a denied
+                    // `OpenProcess`, a denied `cgroup.procs` write — so this one asks the same question
+                    // explicitly, with the probe that answers it and delivers nothing.
+                    match Native.Posix.ensureAdoptedSignalable pid with
+                    | Error detail -> Error(ProcessError.Adopt(pid, detail))
+                    | Ok() ->
+                        adopted[pid] <- anchor
+                        Ok()
 
         member _.Release(spawned) =
             // A pgid is a whole group; the reaped leader may have left backgrounded members behind, so

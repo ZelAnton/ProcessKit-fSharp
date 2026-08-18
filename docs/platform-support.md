@@ -274,7 +274,7 @@ configured `ProcessGroupOptions.StopSignal` (default `Signal.Term`), then a grac
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
 |---|:---:|:---:|:---:|
 | `Adopt(process)` an already-running external process | ✅ `AssignProcessToJobObject` | 🟡 write pid to `cgroup.procs` — **limited groups only** | ❌ `ProcessError.Unsupported` |
-| `AdoptByPid(pid)` the same, from a bare pid | ✅ the process **object** behind one `OpenProcess` | 🟡 cgroup membership + a start-time read either side of the write — **limited groups only** | 🟡 tracked individually against a re-verified start-time token (Linux/macOS) — ❌ `ProcessError.Unsupported` on the BSDs |
+| `AdoptByPid(pid)` the same, from a bare pid | ✅ the process **object** behind one `OpenProcess` | 🟡 cgroup membership + a start-time read either side of the write — **limited groups only** | 🟡 tracked individually against a re-verified start-time token, and only for a target this caller may signal (Linux/macOS) — ❌ `ProcessError.Unsupported` on the BSDs |
 
 `Adopt` brings a process ProcessKit did *not* start into the container, so kill-on-dispose and every
 whole-tree control/stat/limit thereafter covers it. It takes a `System.Diagnostics.Process` (not a raw
@@ -300,7 +300,12 @@ it forks afterwards. A platform with **no start-time reader** (the BSDs) has no 
 `ProcessError.Unsupported` rather than tracking a bare number teardown would later SIGKILL whoever holds.
 `pid <= 0` and this process's own pid are refused up front with `ProcessError.Adopt`, and so is a number
 that changed hands during the call — on cgroup v2 that case is rolled back by moving the stranger out to
-the parent cgroup, or, if even that is refused, reported as still contained here. Ownership is unchanged:
+the parent cgroup, or, if even that is refused, reported as still contained here. A process this caller
+may **not signal** (another user's, a protected one) is refused with `ProcessError.Adopt` too: the POSIX
+process group asks with an explicit `kill(pid, 0)` probe at adoption, because reading a start-time anchor
+proves only that the process can be identified — on Linux `/proc/<pid>/stat` is world-readable — never
+that it can be controlled, while the Job Object and cgroup v2 rows reach the same refusal through their
+denied `OpenProcess`/`cgroup.procs` write. Ownership is unchanged:
 nothing adopted is ever `waitpid`ed by ProcessKit. The window this cannot close is the one before the
 call — whether the number still named the intended process when you passed it — so where a live `Process`
 is available, `Adopt` remains the stronger of the two on Windows.

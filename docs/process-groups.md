@@ -410,6 +410,15 @@ parent's `wait` can.
 - A POSIX host with **no start-time identity reader** (the BSDs) returns
   `ProcessError.Unsupported`: with no anchor to capture, tracking the bare number would
   mean SIGKILLing whatever holds it at teardown. Never a silent downgrade.
+- A process this caller **may not signal** — another user's, or a protected/system one —
+  is refused with `ProcessError.Adopt`. On the POSIX process group that is an explicit
+  `kill(pid, 0)` probe at adoption, because reading the anchor proves only that the
+  process can be *identified* (on Linux `/proc/<pid>/stat` is world-readable), never that
+  it can be controlled; the Job Object and cgroup v2 mechanisms reach the same refusal
+  through their denied `OpenProcess`/`cgroup.procs` write. A member the group could not
+  signal or SIGKILL would be containment reported but not held. The check speaks for the
+  moment of adoption — a process that changes credentials afterwards is no more
+  foreseeable here than one that exits afterwards.
 - A pid that names nothing, an identity that cannot be read (a `hidepid` `/proc` mount,
   another user's process on macOS), a denied `OpenProcess` or `cgroup.procs` write, an
   assign Windows refuses, or a number that changed hands *while the call ran* all return

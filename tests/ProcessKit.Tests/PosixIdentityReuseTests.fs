@@ -24,6 +24,12 @@ open ProcessKit
 /// `[Parallelizable]`), so they never race a concurrent probe. The synthetic pgid numbers are far above
 /// any real pid, so the delivery primitives' own (still real) `kill`/`killpg`/`waitpid` calls are
 /// harmless `ESRCH`/`ECHILD` no-ops.
+///
+/// That last point holds for a TRACKED pgid, whose sweep ignores a `TargetGone` verdict, and stops
+/// holding for a pid adopted by NUMBER, whose ledger treats the same verdict as proof the process is
+/// gone and prunes the entry on it. The bare-pid tests therefore add one more seam
+/// (`adoptedPidKillForTests`, through `runWithAdoptionSeams`) to pin what that exact-pid `kill` reports;
+/// see the comment on the T-371 section below.
 [<TestFixture>]
 type PosixIdentityReuseTests() =
 
@@ -102,6 +108,58 @@ type PosixIdentityReuseTests() =
             Native.Posix.readProcessIdentityForTests <- None
             Native.Posix.groupDeliveryObserverForTests <- None
             Native.Posix.leaderPidDeliveryObserverForTests <- None
+
+    // Drive the BARE-PID adoption paths (`AdoptByPid`) deterministically: the same identity/liveness/
+    // delivery-observer seams as `runWithReuseSeams`, plus the one an adopted FOREIGN pid additionally
+    // needs — the exact-pid `kill` that path runs for its signalability gate (`kill(pid, 0)`) and for
+    // every delivery.
+    //
+    // Without that last seam a synthetic number is not merely imprecise, it is untestable: its real
+    // `kill` always answers `ESRCH`, which refuses the adoption outright at the gate and — for an entry
+    // that did get in — makes the ledger legitimately PRUNE it on its first delivery, so nothing after
+    // that first call is exercised at all. `EPERM` (another user's process) cannot be produced on a build
+    // host by any pid the test is allowed to signal, either. `outcomes` maps a pid to what its exact-pid
+    // `kill` reports; an unmapped pid answers `TargetGone`, the honest "nothing is at this number".
+    // Seams are always reset in the `finally`.
+    let runWithAdoptionSeams
+        (body:
+            Dictionary<int, uint64 option> -> Dictionary<int, Native.Common.SignalDelivery> -> ResizeArray<int> -> unit)
+        =
+        let current = Dictionary<int, uint64 option>()
+        let outcomes = Dictionary<int, Native.Common.SignalDelivery>()
+        let delivered = ResizeArray<int>()
+
+        Native.Posix.processGroupAliveForTests <- Some(fun _ -> true)
+
+        Native.Posix.readProcessIdentityForTests <-
+            Some(fun pid ->
+                match current.TryGetValue pid with
+                | true, token -> token
+                | false, _ -> None)
+
+        Native.Posix.groupDeliveryObserverForTests <- Some(fun pid -> delivered.Add pid)
+
+        Native.Posix.adoptedPidKillForTests <-
+            Some(fun pid _signalNum ->
+                match outcomes.TryGetValue pid with
+                | true, outcome -> outcome
+                | false, _ -> Native.Common.SignalDelivery.TargetGone)
+
+        try
+            body current outcomes delivered
+        finally
+            Native.Posix.processGroupAliveForTests <- None
+            Native.Posix.readProcessIdentityForTests <- None
+            Native.Posix.groupDeliveryObserverForTests <- None
+            Native.Posix.adoptedPidKillForTests <- None
+
+    // Adopt `pid` into `backend` and fail the test if the mechanism refuses — a precondition, never the
+    // assertion under test, so a refusal reads as "the setup did not hold" rather than as a control-path
+    // result.
+    let adoptOrFail (backend: IContainmentBackend) (pid: int) =
+        match backend.AdoptByPid pid with
+        | Ok() -> ()
+        | Error error -> Assert.Fail $"AdoptByPid {pid} failed: {error.Message}"
 
     // How many deliveries an observer recorded for `id`. Both observers fire once per native delivery
     // ATTEMPT, so the count is what tells a single delivery apart from the exact-leader hard kill's two
@@ -435,25 +493,34 @@ type PosixIdentityReuseTests() =
     //
     // A foreign process adopted by NUMBER is tracked against the start-time anchor captured when it was
     // adopted, and that anchor is re-read before every probe, signal, suspend/resume and teardown kill —
-    // never once at adoption and then trusted. Two things separate it from a tracked child of ours: the
+    // never once at adoption and then trusted. Three things separate it from a tracked child of ours: the
     // delivery is always to the EXACT pid (its process group belongs to whoever started it, so `killpg`
-    // there would sweep strangers), and an unreadable identity is fail-CLOSED (an adopted number has no
-    // unreaped-child slot holding it, so a bare number is never evidence of anything).
+    // there would sweep strangers), an unreadable identity is fail-CLOSED (an adopted number has no
+    // unreaped-child slot holding it, so a bare number is never evidence of anything), and the adoption
+    // itself is refused unless this process can actually SIGNAL the target — an anchor proves identity,
+    // never control.
+    //
+    // They run on `runWithAdoptionSeams`, which additionally pins the verdict of that exact-pid `kill`.
+    // A synthetic number's real `kill` answers ESRCH, which is a legitimate "gone" here: it refuses the
+    // adoption at the gate, and for an entry already in the ledger it prunes on the first delivery — so
+    // with the real syscall in the loop nothing past that first call is exercised at all, and the
+    // permission verdict cannot be produced on a build host by any pid a test may signal.
 
     [<Test>]
     member _.``an adopted pid is listed, signalled and killed with the group while its anchor matches``() =
         if isWindows then
             Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
 
-        runWithReuseSeams (fun current delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered ->
             let adoptedPid = 2_000_000_401
             current[adoptedPid] <- Some 4_010UL
+            // A live, signalable target: its exact-pid kill passes the adoption gate AND reports a real
+            // delivery, so the ledger entry survives each operation exactly as a live process's would.
+            // The next test drives the opposite verdict deliberately.
+            outcomes[adoptedPid] <- Native.Common.SignalDelivery.Delivered
 
             let backend = ProcessGroupBackend() :> IContainmentBackend
-
-            match backend.AdoptByPid adoptedPid with
-            | Ok() -> ()
-            | Error e -> Assert.Fail $"AdoptByPid failed: {e.Message}"
+            adoptOrFail backend adoptedPid
 
             match backend.Members() with
             | Ok members -> Assert.That(members, Does.Contain adoptedPid, "an adopted pid is a member of the group")
@@ -468,6 +535,10 @@ type PosixIdentityReuseTests() =
             | Error e -> Assert.Fail $"Signal failed: {e.Message}"
 
             Assert.That(delivered, Does.Contain adoptedPid, "the adopted process must receive the group's signal")
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Does.Contain adoptedPid, "a delivered signal leaves it in the group")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}"
 
             delivered.Clear()
 
@@ -495,6 +566,52 @@ type PosixIdentityReuseTests() =
             | Error e -> Assert.Fail $"Members failed: {e.Message}")
 
     [<Test>]
+    member _.``an adopted pid that exits before a delivery lands is dropped from the group, not retried``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // The other half of the ledger's contract, and the reason the test above has to pin a DELIVERED
+        // verdict explicitly. An adopted foreign process is nobody's tracked child, so an `ESRCH` from its
+        // exact-pid kill proves nothing of ours is at that number any more: the entry is pruned on that
+        // same verdict — no second probe to disagree with it — and no later operation revisits the number.
+        // A tracked pgid deliberately does the opposite (its sweep ignores `TargetGone`), because a group
+        // that answers ESRCH may still be a live pre-`setsid()` child of ours; nothing here can be.
+        runWithAdoptionSeams (fun current outcomes delivered ->
+            let adoptedPid = 2_000_000_408
+            current[adoptedPid] <- Some 4_080UL
+            outcomes[adoptedPid] <- Native.Common.SignalDelivery.Delivered
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            adoptOrFail backend adoptedPid
+
+            // It exits between the anchor re-read and the kill: the anchor still matched, so the delivery
+            // was attempted, and the kernel answers that no such process exists.
+            outcomes[adoptedPid] <- Native.Common.SignalDelivery.TargetGone
+
+            match backend.Signal Signal.Term with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Signal failed: {e.Message}"
+
+            Assert.That(deliveries delivered adoptedPid, Is.EqualTo 1, "the delivery was attempted exactly once")
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Is.Empty, "and that same verdict pruned the entry")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}"
+
+            match backend.Suspend() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Suspend failed: {e.Message}"
+
+            backend.KillTree() |> ignore
+            backend.HardRelease()
+
+            Assert.That(
+                deliveries delivered adoptedPid,
+                Is.EqualTo 1,
+                "nothing revisits a number the group has already dropped"
+            ))
+
+    [<Test>]
     member _.``a pid recycled after it was adopted by number is never signalled, suspended or killed``() =
         if isWindows then
             Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
@@ -502,17 +619,21 @@ type PosixIdentityReuseTests() =
         // The regression this feature could most easily introduce: adopting by NUMBER and then acting on
         // the number. Here the adoption captures a real anchor and the number then changes hands — every
         // later path must treat it as gone, exactly as a recycled tracked pgid is treated.
-        runWithReuseSeams (fun current delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered ->
             let kept = 2_000_000_402
             let recycled = 2_000_000_403
             current[kept] <- Some 4_020UL
             current[recycled] <- Some 4_030UL
+            outcomes[kept] <- Native.Common.SignalDelivery.Delivered
+            outcomes[recycled] <- Native.Common.SignalDelivery.Delivered
 
             let backend = ProcessGroupBackend() :> IContainmentBackend
-            backend.AdoptByPid kept |> ignore
-            backend.AdoptByPid recycled |> ignore
+            adoptOrFail backend kept
+            adoptOrFail backend recycled
 
             // A stranger now holds the second number (its start-time token differs from the captured one).
+            // Its exact-pid kill would still SUCCEED — which is precisely the danger: nothing but the
+            // anchor stands between this group's teardown and a process it never adopted.
             current[recycled] <- Some 9_999UL
 
             match backend.Members() with
@@ -550,12 +671,14 @@ type PosixIdentityReuseTests() =
         // unreaped child of ours holds its number. An adopted foreign process is not our child: nothing
         // holds its number, so with no readable identity there is no evidence left and nothing is
         // delivered — losing containment of a live process rather than risking a stranger's kill.
-        runWithReuseSeams (fun current delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered ->
             let adoptedPid = 2_000_000_404
             current[adoptedPid] <- Some 4_040UL
+            // The kill itself would succeed throughout: the anchor alone is what stops the delivery.
+            outcomes[adoptedPid] <- Native.Common.SignalDelivery.Delivered
 
             let backend = ProcessGroupBackend() :> IContainmentBackend
-            backend.AdoptByPid adoptedPid |> ignore
+            adoptOrFail backend adoptedPid
 
             // The identity read now fails (a hidepid /proc, a denied read, or the process is gone).
             current[adoptedPid] <- None
@@ -581,12 +704,13 @@ type PosixIdentityReuseTests() =
         // The off-lock poll works from a snapshot of the adopted ledger (K-086) and re-reads the anchor in
         // every phase, so both the soft signal and the escalation must land — deterministically, because
         // the seams keep the process "alive" for the whole grace.
-        runWithReuseSeams (fun current delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered ->
             let adoptedPid = 2_000_000_405
             current[adoptedPid] <- Some 4_050UL
+            outcomes[adoptedPid] <- Native.Common.SignalDelivery.Delivered
 
             let backend = ProcessGroupBackend() :> IContainmentBackend
-            backend.AdoptByPid adoptedPid |> ignore
+            adoptOrFail backend adoptedPid
 
             let graceful =
                 backend.GracefulKillTree Signal.Term (TimeSpan.FromMilliseconds 150.0)
@@ -604,9 +728,11 @@ type PosixIdentityReuseTests() =
         if isWindows then
             Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
 
-        runWithReuseSeams (fun _current delivered ->
+        runWithAdoptionSeams (fun _current _outcomes delivered ->
             // The reader exists on this host (the seam is installed) but answers `None` for this pid: it
-            // is already gone, or its /proc entry is unreadable. A per-process refusal, not a platform one.
+            // is already gone, or its /proc entry is unreadable. A per-process refusal, not a platform one
+            // — and it is reached BEFORE the signalability probe, so an unreadable identity is reported as
+            // such rather than as whatever `kill(pid, 0)` would have said about the same number.
             let unreadable = 2_000_000_406
 
             let backend = ProcessGroupBackend() :> IContainmentBackend
@@ -623,6 +749,51 @@ type PosixIdentityReuseTests() =
 
             backend.HardRelease()
             Assert.That(delivered, Is.Empty, "and teardown has nothing to deliver to"))
+
+    [<Test>]
+    member _.``a pid this process may not signal is refused rather than adopted (permission denied)``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // Reading the anchor proves only that the process can be IDENTIFIED. On Linux `/proc/<pid>/stat`
+        // is world-readable, so another user's (or a system) process yields a perfectly good anchor while
+        // every `kill` to it fails EPERM — and the teardown kill is fire-and-forget, so accepting such a
+        // pid would report containment of a process this group can neither signal nor SIGKILL: a silent
+        // downgrade of the kill-on-dispose guarantee, and the one case where this mechanism used to differ
+        // from the Windows (denied `OpenProcess`) and cgroup v2 (denied `cgroup.procs` write) refusals.
+        // The verdict comes from the seam because no build host can be asked to point a test at a real
+        // process it must never actually signal.
+        runWithAdoptionSeams (fun current outcomes delivered ->
+            let foreign = 2_000_000_409
+            current[foreign] <- Some 4_090UL
+
+            outcomes[foreign] <-
+                Native.Common.SignalDelivery.DeliveryFailed(Native.Posix.EPERM, "Operation not permitted")
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+
+            match backend.AdoptByPid foreign with
+            | Error(ProcessError.Adopt(pid, detail)) ->
+                Assert.That(pid, Is.EqualTo foreign)
+                Assert.That(detail, Does.Contain "may not signal", $"the refusal must name the cause; got: {detail}")
+            | other -> Assert.Fail $"expected a typed Adopt refusal for a pid this process may not signal, got {other}"
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Is.Empty, "a refused adoption tracks nothing")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}"
+
+            // The neighbouring verdict is not collapsed into it: a readable identity whose number nothing
+            // lives at any more is refused too, and says something different about why.
+            let vanished = 2_000_000_410
+            current[vanished] <- Some 4_100UL
+
+            match backend.AdoptByPid vanished with
+            | Error(ProcessError.Adopt(_, detail)) ->
+                Assert.That(detail, Does.Contain "nothing is at this pid", $"got: {detail}")
+            | other -> Assert.Fail $"expected a typed Adopt refusal for a pid that names nothing, got {other}"
+
+            backend.HardRelease()
+            Assert.That(delivered, Is.Empty, "and neither refusal left anything in the group to deliver to"))
 
     [<Test>]
     member _.``a platform with no start-time reader refuses bare-pid adoption as Unsupported``() =

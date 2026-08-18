@@ -94,6 +94,15 @@ module internal Posix =
     [<Literal>]
     let private ESRCH = 3
 
+    // errno EPERM — "operation not permitted": the target EXISTS, but this process has no right to signal
+    // it (another user's process, a protected/system one). Same value on Linux and macOS. It is the errno
+    // that separates "nothing is at this number" from "something is, and we have no power over it" — the
+    // whole question the bare-pid adoption gate (`ensureAdoptedSignalable`) asks before this library
+    // promises to signal and SIGKILL a foreign process. Not private: the adoption tests drive that gate
+    // through its seam and classify by this value rather than by a magic 1.
+    [<Literal>]
+    let EPERM = 1
+
     // errno EINVAL — "invalid argument", the kernel's verdict on an out-of-range signal *number*. Used
     // for the synthetic classification of a non-deliverable number (signal 0 / a negative) that
     // `signalProcessGroup` refuses *before* the syscall, so a probe never masquerades as a delivered
@@ -379,6 +388,19 @@ module internal Posix =
     /// actually delivered to — proving a recycled number is pruned and NEVER signalled/killed, and a
     /// matching one still is. Production leaves it `None`.
     let mutable groupDeliveryObserverForTests: (int -> unit) option = None
+
+    /// Test seam (internal, not public API): replaces the EXACT-pid `kill` the bare-pid adoption path runs
+    /// — both its signalability gate (`kill(pid, 0)`, see `ensureAdoptedSignalable`) and every delivery to
+    /// an adopted foreign pid (`signalAdopted`) — with a deterministic classification per pid.
+    ///
+    /// It is what makes an adopted FOREIGN process simulable at all. The other seams here fake identity
+    /// and liveness, but a synthetic number's real `kill` still answers `ESRCH`, which both refuses the
+    /// adoption outright (the gate) and, for one that got in, prunes the ledger entry on its first
+    /// delivery — so without this seam a test can exercise nothing past that first call, and the real
+    /// permission verdict (`EPERM` for another user's process) cannot be produced on a build host at all
+    /// without pointing the test at a process it must never actually signal. The hook receives the pid and
+    /// the signal number (0 for the gate's probe). Production leaves it `None`.
+    let mutable adoptedPidKillForTests: (int -> int -> SignalDelivery) option = None
 
     /// Test seam (internal, not public API): fires with the target pid whenever a control operation is
     /// delivered by the EXACT-LEADER fallback (`kill(pid, …)`) instead of to the process group
@@ -1403,6 +1425,51 @@ module internal Posix =
         | Some current -> current = anchor
         | None -> false
 
+    // Every EXACT-pid `kill` this path makes — the signalability gate's probe below and each delivery in
+    // `signalAdopted` — funnels through this one call, so the seam that makes a foreign process simulable
+    // covers both and the two can never disagree about what the kernel would say for a given pid. It does
+    // NOT fire the delivery observer: a `kill(pid, 0)` probe delivers nothing, and recording it as a
+    // delivery is exactly the confusion `isDeliverableSignal` refuses elsewhere.
+    let private killAdoptedPid (pid: int) (signalNum: int) : SignalDelivery =
+        match adoptedPidKillForTests with
+        | Some hook -> hook pid signalNum
+        | None -> classifySignalDelivery (kill (pid, signalNum))
+
+    /// May this process actually SIGNAL `pid`? Asked once, at adoption, with `kill(pid, 0)` — the probe
+    /// that delivers nothing and answers with an errno — and the answer decides whether a bare pid is
+    /// adopted at all.
+    ///
+    /// Reading a start-time anchor proves only that we can IDENTIFY the process, never that we can control
+    /// it, and on Linux the two come apart routinely: `/proc/<pid>/stat` is world-readable, so another
+    /// user's (or a system) process yields a perfectly good anchor while every `kill` to it fails `EPERM`.
+    /// Tracking such a pid would enlist it as a member this group claims to signal and SIGKILL, and the
+    /// teardown kill is fire-and-forget — so the caller would be told the process is contained and would
+    /// never learn otherwise. That is the silent downgrade of the kill-on-dispose guarantee this gate
+    /// exists to prevent, and it is the same refusal the other two mechanisms already make by construction
+    /// (a denied `OpenProcess`, a denied `cgroup.procs` write).
+    ///
+    /// The verdict is about the moment it is taken, not a permanent property — a process can change
+    /// credentials afterwards, exactly as it can exit afterwards — and it is deliberately fail-CLOSED: an
+    /// errno that is neither success nor `ESRCH` nor `EPERM` is still not proof that a kill would land, so
+    /// it refuses and names the errno rather than adopting on a probe it could not interpret. `Error`
+    /// carries the caller-facing reason, which the backend wraps in `ProcessError.Adopt` (the shape
+    /// `Native.Cgroup.adoptIntoCgroup` already uses).
+    let ensureAdoptedSignalable (pid: int) : Result<unit, string> =
+        // `Delivered` here reads as "the call itself succeeded", not "a signal arrived": signal 0 delivers
+        // nothing, and the DU is classifying `kill`'s return, which is the same three-way answer either
+        // way — 0, `ESRCH`, or another errno.
+        match killAdoptedPid pid 0 with
+        | SignalDelivery.Delivered -> Ok()
+        | SignalDelivery.TargetGone ->
+            Error
+                "nothing is at this pid any more: the signalability probe (kill(pid, 0)) reported that no such process exists, so the number changed hands or the process exited during the adoption"
+        | SignalDelivery.DeliveryFailed(errno, message) when errno = EPERM ->
+            Error
+                $"this process may not signal pid {pid} ({message}): it belongs to another user or is otherwise protected, so the kill-on-dispose guarantee could not be kept for it — a pid is never adopted into a group that would be unable to signal or kill it"
+        | SignalDelivery.DeliveryFailed(errno, message) ->
+            Error
+                $"the signalability probe (kill(pid, 0)) for pid {pid} failed with errno {errno} ({message}), which is not proof that this group could signal or kill it; a bare pid is only adopted once its controllability is confirmed"
+
     /// Deliver `signalNum` to an adopted foreign pid, gated on its anchor. The EXACT pid only: its
     /// process group belongs to whoever started it, so `killpg` is not ours to use here. A non-matching
     /// anchor reports `TargetGone` and delivers nothing, exactly as a `TrackedTarget.Gone` verdict does.
@@ -1414,7 +1481,7 @@ module internal Posix =
             )
         elif adoptedStillOurs pid anchor then
             observeGroupDelivery pid
-            classifySignalDelivery (kill (pid, signalNum))
+            killAdoptedPid pid signalNum
         else
             SignalDelivery.TargetGone
 
