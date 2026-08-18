@@ -25,11 +25,15 @@ open ProcessKit
 /// any real pid, so the delivery primitives' own (still real) `kill`/`killpg`/`waitpid` calls are
 /// harmless `ESRCH`/`ECHILD` no-ops.
 ///
-/// That last point holds for a TRACKED pgid, whose sweep ignores a `TargetGone` verdict, and stops
-/// holding for a pid adopted by NUMBER, whose ledger treats the same verdict as proof the process is
-/// gone and prunes the entry on it. The bare-pid tests therefore add one more seam
-/// (`adoptedPidKillForTests`, through `runWithAdoptionSeams`) to pin what that exact-pid `kill` reports;
-/// see the comment on the T-371 section below.
+/// That last point is the fixture's own safety argument and it rests on the NUMBERS, not on any seam: it
+/// holds for every path here, the bare-pid adoption ones included. What a real `kill` costs THOSE is not
+/// safety but reach — an adopted entry is pruned by the very `ESRCH` a synthetic number honestly answers,
+/// so nothing past the first delivery is exercised, and a permission verdict cannot be produced by any pid
+/// a build host may signal. The bare-pid tests therefore add one more seam (`adoptedPidKillForTests`,
+/// through `runWithAdoptionSeams`) to pin what that exact-pid `kill` reports. Every exact-pid signal the
+/// process-group mechanism sends to a pid adopted by number goes through it — the adoption gate's probe,
+/// each delivery, and the teardown SIGKILL — so no signal those tests aim at an adopted number reaches the
+/// kernel; see the comment on the T-371 section below.
 [<TestFixture>]
 type PosixIdentityReuseTests() =
 
@@ -111,8 +115,8 @@ type PosixIdentityReuseTests() =
 
     // Drive the BARE-PID adoption paths (`AdoptByPid`) deterministically: the same identity/liveness/
     // delivery-observer seams as `runWithReuseSeams`, plus the one an adopted FOREIGN pid additionally
-    // needs — the exact-pid `kill` that path runs for its signalability gate (`kill(pid, 0)`) and for
-    // every delivery.
+    // needs — the exact-pid `kill` that path runs for its signalability gate (`kill(pid, 0)`), for every
+    // signal/suspend/resume delivery, and for every teardown SIGKILL.
     //
     // Without that last seam a synthetic number is not merely imprecise, it is untestable: its real
     // `kill` always answers `ESRCH`, which refuses the adoption outright at the gate and — for an entry
@@ -120,14 +124,21 @@ type PosixIdentityReuseTests() =
     // that first call is exercised at all. `EPERM` (another user's process) cannot be produced on a build
     // host by any pid the test is allowed to signal, either. `outcomes` maps a pid to what its exact-pid
     // `kill` reports; an unmapped pid answers `TargetGone`, the honest "nothing is at this number".
-    // Seams are always reset in the `finally`.
+    // `kills` records the (pid, signal) of every call that reached the seam, in order, so a test can pin
+    // WHICH exact-pid kills funnel through it rather than only what they answered — the difference between
+    // a simulated SIGKILL and one the kernel really delivers. Seams are always reset in the `finally`.
     let runWithAdoptionSeams
         (body:
-            Dictionary<int, uint64 option> -> Dictionary<int, Native.Common.SignalDelivery> -> ResizeArray<int> -> unit)
+            Dictionary<int, uint64 option>
+                -> Dictionary<int, Native.Common.SignalDelivery>
+                -> ResizeArray<int>
+                -> ResizeArray<int * int>
+                -> unit)
         =
         let current = Dictionary<int, uint64 option>()
         let outcomes = Dictionary<int, Native.Common.SignalDelivery>()
         let delivered = ResizeArray<int>()
+        let kills = ResizeArray<int * int>()
 
         Native.Posix.processGroupAliveForTests <- Some(fun _ -> true)
 
@@ -140,13 +151,15 @@ type PosixIdentityReuseTests() =
         Native.Posix.groupDeliveryObserverForTests <- Some(fun pid -> delivered.Add pid)
 
         Native.Posix.adoptedPidKillForTests <-
-            Some(fun pid _signalNum ->
+            Some(fun pid signalNum ->
+                kills.Add(pid, signalNum)
+
                 match outcomes.TryGetValue pid with
                 | true, outcome -> outcome
                 | false, _ -> Native.Common.SignalDelivery.TargetGone)
 
         try
-            body current outcomes delivered
+            body current outcomes delivered kills
         finally
             Native.Posix.processGroupAliveForTests <- None
             Native.Posix.readProcessIdentityForTests <- None
@@ -504,14 +517,16 @@ type PosixIdentityReuseTests() =
     // A synthetic number's real `kill` answers ESRCH, which is a legitimate "gone" here: it refuses the
     // adoption at the gate, and for an entry already in the ledger it prunes on the first delivery — so
     // with the real syscall in the loop nothing past that first call is exercised at all, and the
-    // permission verdict cannot be produced on a build host by any pid a test may signal.
+    // permission verdict cannot be produced on a build host by any pid a test may signal. Every exact-pid
+    // kill this path makes — gate probe, deliveries, teardown SIGKILL — runs through that one seam, which
+    // the last test in this section asserts rather than assumes.
 
     [<Test>]
     member _.``an adopted pid is listed, signalled and killed with the group while its anchor matches``() =
         if isWindows then
             Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
 
-        runWithAdoptionSeams (fun current outcomes delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered _kills ->
             let adoptedPid = 2_000_000_401
             current[adoptedPid] <- Some 4_010UL
             // A live, signalable target: its exact-pid kill passes the adoption gate AND reports a real
@@ -576,7 +591,7 @@ type PosixIdentityReuseTests() =
         // same verdict — no second probe to disagree with it — and no later operation revisits the number.
         // A tracked pgid deliberately does the opposite (its sweep ignores `TargetGone`), because a group
         // that answers ESRCH may still be a live pre-`setsid()` child of ours; nothing here can be.
-        runWithAdoptionSeams (fun current outcomes delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered _kills ->
             let adoptedPid = 2_000_000_408
             current[adoptedPid] <- Some 4_080UL
             outcomes[adoptedPid] <- Native.Common.SignalDelivery.Delivered
@@ -619,7 +634,7 @@ type PosixIdentityReuseTests() =
         // The regression this feature could most easily introduce: adopting by NUMBER and then acting on
         // the number. Here the adoption captures a real anchor and the number then changes hands — every
         // later path must treat it as gone, exactly as a recycled tracked pgid is treated.
-        runWithAdoptionSeams (fun current outcomes delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered _kills ->
             let kept = 2_000_000_402
             let recycled = 2_000_000_403
             current[kept] <- Some 4_020UL
@@ -671,7 +686,7 @@ type PosixIdentityReuseTests() =
         // unreaped child of ours holds its number. An adopted foreign process is not our child: nothing
         // holds its number, so with no readable identity there is no evidence left and nothing is
         // delivered — losing containment of a live process rather than risking a stranger's kill.
-        runWithAdoptionSeams (fun current outcomes delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered _kills ->
             let adoptedPid = 2_000_000_404
             current[adoptedPid] <- Some 4_040UL
             // The kill itself would succeed throughout: the anchor alone is what stops the delivery.
@@ -704,7 +719,7 @@ type PosixIdentityReuseTests() =
         // The off-lock poll works from a snapshot of the adopted ledger (K-086) and re-reads the anchor in
         // every phase, so both the soft signal and the escalation must land — deterministically, because
         // the seams keep the process "alive" for the whole grace.
-        runWithAdoptionSeams (fun current outcomes delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered _kills ->
             let adoptedPid = 2_000_000_405
             current[adoptedPid] <- Some 4_050UL
             outcomes[adoptedPid] <- Native.Common.SignalDelivery.Delivered
@@ -728,7 +743,7 @@ type PosixIdentityReuseTests() =
         if isWindows then
             Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
 
-        runWithAdoptionSeams (fun _current _outcomes delivered ->
+        runWithAdoptionSeams (fun _current _outcomes delivered _kills ->
             // The reader exists on this host (the seam is installed) but answers `None` for this pid: it
             // is already gone, or its /proc entry is unreadable. A per-process refusal, not a platform one
             // — and it is reached BEFORE the signalability probe, so an unreadable identity is reported as
@@ -763,7 +778,7 @@ type PosixIdentityReuseTests() =
         // from the Windows (denied `OpenProcess`) and cgroup v2 (denied `cgroup.procs` write) refusals.
         // The verdict comes from the seam because no build host can be asked to point a test at a real
         // process it must never actually signal.
-        runWithAdoptionSeams (fun current outcomes delivered ->
+        runWithAdoptionSeams (fun current outcomes delivered _kills ->
             let foreign = 2_000_000_409
             current[foreign] <- Some 4_090UL
 
@@ -817,6 +832,104 @@ type PosixIdentityReuseTests() =
             | Error e -> Assert.Fail $"Members failed: {e.Message}"
         finally
             Native.Posix.processIdentityReaderAvailableForTests <- None
+
+    [<Test>]
+    member _.``every exact-pid kill the adopted path makes funnels through the kill seam, teardown included``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // What the seam's documentation claims, asserted instead of trusted: the adoption gate's probe,
+        // every `signalAdopted` delivery (signal, suspend, resume, the graceful soft phase) AND every
+        // teardown SIGKILL (`KillTree`, the graceful escalation, `HardRelease`) go through
+        // `adoptedPidKillForTests`. That is every path this mechanism has to a pid adopted by number —
+        // `Members`/`Stats`/`MemberStats` only re-read the anchor and send nothing — so the walk below is
+        // the whole set, in call order.
+        //
+        // Teardown is why it is worth a test of its own. Left on the raw syscall it would be a REAL
+        // `kill(pid, SIGKILL)` at whatever holds the number, which is the wrong-target kill this feature
+        // exists to prevent (T-084); that the numbers used here are too large for any real pid is a
+        // property of the numbers, not of the code under test, and would not survive a later test picking
+        // a plausible one.
+        runWithAdoptionSeams (fun current outcomes delivered kills ->
+            let adoptedPid = 2_000_000_411
+            current[adoptedPid] <- Some 4_110UL
+            outcomes[adoptedPid] <- Native.Common.SignalDelivery.Delivered
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            adoptOrFail backend adoptedPid
+
+            Assert.That(
+                kills,
+                Is.EqualTo<int * int>([| (adoptedPid, 0) |]),
+                "the adoption's signalability gate is the seam's first call, and it probes with signal 0"
+            )
+
+            kills.Clear()
+
+            match backend.Signal Signal.Term with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Signal failed: {e.Message}"
+
+            Assert.That(
+                kills,
+                Is.EqualTo<int * int>([| (adoptedPid, Native.Posix.SIGTERM) |]),
+                "the group's signal reaches the adopted pid through the seam"
+            )
+
+            kills.Clear()
+
+            match backend.Suspend() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Suspend failed: {e.Message}"
+
+            match backend.Resume() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Resume failed: {e.Message}"
+
+            // SIGSTOP/SIGCONT are private constants whose numbers differ between Linux and macOS, so this
+            // step pins the pids: both halves went through the seam rather than a raw `kill`.
+            Assert.That(
+                kills |> Seq.map fst |> Array.ofSeq,
+                Is.EqualTo<int>([| adoptedPid; adoptedPid |]),
+                "so do suspend and resume"
+            )
+
+            kills.Clear()
+
+            let graceful =
+                backend.GracefulKillTree Signal.Term (TimeSpan.FromMilliseconds 150.0)
+
+            Assert.That(graceful.Wait(TimeSpan.FromSeconds 30.0), Is.True, "the graceful stop must finish")
+
+            Assert.That(
+                kills,
+                Is.EqualTo<int * int>([| (adoptedPid, Native.Posix.SIGTERM); (adoptedPid, Native.Posix.SIGKILL) |]),
+                "the soft signal and the SIGKILL that escalates it both go through the seam"
+            )
+
+            kills.Clear()
+            backend.KillTree() |> ignore
+
+            Assert.That(
+                kills,
+                Is.EqualTo<int * int>([| (adoptedPid, Native.Posix.SIGKILL) |]),
+                "the whole-tree hard kill sends its SIGKILL through the seam, not through the raw syscall"
+            )
+
+            kills.Clear()
+            backend.HardRelease()
+
+            Assert.That(
+                kills,
+                Is.EqualTo<int * int>([| (adoptedPid, Native.Posix.SIGKILL) |]),
+                "and so does teardown, the last exact-pid kill this path can make"
+            )
+
+            Assert.That(
+                deliveries delivered adoptedPid,
+                Is.EqualTo 7,
+                "every one of those seven was a delivery attempt — only the gate's probe, which delivers nothing, is uncounted"
+            ))
 
     // ---- T-359: the pre-`setsid()` pty window — a live leader whose process GROUP does not exist yet ----
     //

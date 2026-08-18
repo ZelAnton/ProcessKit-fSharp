@@ -1351,13 +1351,12 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                 else
                     Native.Posix.killTracked target pgid
 
-            // Adopted foreign pids: the EXACT pid, and only while its anchor still matches. No `killpg`
-            // behind it (that group is not ours), and no reap after it (it is not our child — its real
-            // parent, or `init`, reaps it).
+            // Adopted foreign pids: the EXACT pid, and only while its anchor still matches — `killAdopted`
+            // re-reads it and reports whether the SIGKILL went out, so the mismatch that skips the kill is
+            // the same verdict that prunes the entry. No `killpg` behind it (that group is not ours), and
+            // no reap after it (it is not our child — its real parent, or `init`, reaps it).
             for pid, anchor in adoptedSnapshot () do
-                if Native.Posix.adoptedStillOurs pid anchor then
-                    Native.Posix.killProcess pid
-                else
+                if not (Native.Posix.killAdopted pid anchor) then
                     untrackAdopted pid
 
             Ok()
@@ -1429,10 +1428,12 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                         if not (TrackedTargets.isGone target) then
                             Native.Posix.killTracked target pgid
 
-                    // The adopted half of the escalation: the exact pid, anchor re-read one last time.
+                    // The adopted half of the escalation: the exact pid, anchor re-read one last time
+                    // inside `killAdopted`. Nothing is pruned here — this snapshot is the poll's own copy
+                    // (the ledger it came from may have been drained by a concurrent `HardRelease`), so
+                    // the anchor verdict is used only to decide the delivery.
                     for pid, anchor in adoptedPids do
-                        if Native.Posix.adoptedStillOurs pid anchor then
-                            Native.Posix.killProcess pid)
+                        Native.Posix.killAdopted pid anchor |> ignore)
                 grace
 
         member _.SignalChild(spawned, signal) =
@@ -1598,7 +1599,5 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                 // the call that actually removes the entry delivers its SIGKILL, and a concurrent
                 // teardown that got there first owns that delivery instead of both of them repeating it.
                 match adopted.TryRemove pid with
-                | true, _ ->
-                    if Native.Posix.adoptedStillOurs pid anchor then
-                        Native.Posix.killProcess pid
+                | true, _ -> Native.Posix.killAdopted pid anchor |> ignore
                 | false, _ -> ()

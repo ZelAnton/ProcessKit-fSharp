@@ -383,15 +383,21 @@ module internal Posix =
 
     /// Test seam (internal, not public API): invoked with the target pgid/pid by every process-group
     /// delivery primitive (`killProcessGroup` / `signalProcessGroup` / `suspendProcessGroup` /
-    /// `resumeProcessGroup`) and the per-child raw kill (`killProcess`, the cgroup
-    /// backend's `KillChild`) just before its syscall, so a test can record which pgids/pids a path
-    /// actually delivered to — proving a recycled number is pruned and NEVER signalled/killed, and a
-    /// matching one still is. Production leaves it `None`.
+    /// `resumeProcessGroup`), the per-child raw kill (`killProcess`, the cgroup backend's `KillChild`) and
+    /// each anchor-gated delivery to an adopted foreign pid (`signalAdopted` / `killAdopted`) just before
+    /// its syscall, so a test can record which pgids/pids a path actually delivered to — proving a
+    /// recycled number is pruned and NEVER signalled/killed, and a matching one still is. It records that
+    /// a target was reached, not what the kernel answered; the gate's `kill(pid, 0)` probe, which delivers
+    /// nothing, deliberately does not fire it. Production leaves it `None`.
     let mutable groupDeliveryObserverForTests: (int -> unit) option = None
 
     /// Test seam (internal, not public API): replaces the EXACT-pid `kill` the bare-pid adoption path runs
-    /// — both its signalability gate (`kill(pid, 0)`, see `ensureAdoptedSignalable`) and every delivery to
-    /// an adopted foreign pid (`signalAdopted`) — with a deterministic classification per pid.
+    /// — its signalability gate (`kill(pid, 0)`, see `ensureAdoptedSignalable`), every signal/suspend/
+    /// resume delivery to an adopted foreign pid (`signalAdopted`) and every teardown SIGKILL of one
+    /// (`killAdopted`, used by `KillTree`, the graceful escalation and `HardRelease`) — with a
+    /// deterministic classification per pid. Those three are the whole set for a pid adopted into a POSIX
+    /// PROCESS GROUP; the cgroup mechanism adopts by writing `cgroup.procs` instead and sweeps its members
+    /// through `killCgroup`/`killProcess`, neither of which this seam replaces.
     ///
     /// It is what makes an adopted FOREIGN process simulable at all. The other seams here fake identity
     /// and liveness, but a synthetic number's real `kill` still answers `ESRCH`, which both refuses the
@@ -399,7 +405,10 @@ module internal Posix =
     /// delivery — so without this seam a test can exercise nothing past that first call, and the real
     /// permission verdict (`EPERM` for another user's process) cannot be produced on a build host at all
     /// without pointing the test at a process it must never actually signal. The hook receives the pid and
-    /// the signal number (0 for the gate's probe). Production leaves it `None`.
+    /// the signal number (0 for the gate's probe). Because that set is closed, an installed hook also means
+    /// no signal a test drives at a pid adopted into a process group reaches the kernel — the teardown
+    /// SIGKILL included, the one delivery whose wrong target could not be undone. Production leaves it
+    /// `None`.
     let mutable adoptedPidKillForTests: (int -> int -> SignalDelivery) option = None
 
     /// Test seam (internal, not public API): fires with the target pid whenever a control operation is
@@ -1425,11 +1434,14 @@ module internal Posix =
         | Some current -> current = anchor
         | None -> false
 
-    // Every EXACT-pid `kill` this path makes — the signalability gate's probe below and each delivery in
-    // `signalAdopted` — funnels through this one call, so the seam that makes a foreign process simulable
-    // covers both and the two can never disagree about what the kernel would say for a given pid. It does
-    // NOT fire the delivery observer: a `kill(pid, 0)` probe delivers nothing, and recording it as a
-    // delivery is exactly the confusion `isDeliverableSignal` refuses elsewhere.
+    // Every EXACT-pid `kill` sent to a pid adopted into a process group funnels through this one call —
+    // the signalability gate's probe below, each delivery in `signalAdopted`, and teardown's SIGKILL in
+    // `killAdopted` — so the seam that makes a foreign process simulable covers all three and they can
+    // never disagree about what the kernel would say for a given pid. Teardown is the one that matters most: it is where a SIGKILL is
+    // sent, so leaving it on the raw syscall would put a real kill of a real number in reach of any test
+    // that adopts a plausible pid. It does NOT fire the delivery observer: a `kill(pid, 0)` probe delivers
+    // nothing, and recording it as a delivery is exactly the confusion `isDeliverableSignal` refuses
+    // elsewhere — the two callers that do deliver fire the observer themselves.
     let private killAdoptedPid (pid: int) (signalNum: int) : SignalDelivery =
         match adoptedPidKillForTests with
         | Some hook -> hook pid signalNum
@@ -1490,6 +1502,30 @@ module internal Posix =
 
     /// Thaw one adopted foreign pid (SIGCONT), gated exactly like `signalAdopted`.
     let resumeAdopted (pid: int) (anchor: uint64) : SignalDelivery = signalAdopted pid anchor sigCont
+
+    /// Teardown's SIGKILL for ONE adopted foreign pid — `KillTree`, the graceful stop's escalation and
+    /// `HardRelease` — gated on its anchor and routed through the same `killAdoptedPid` choke as every
+    /// other exact-pid kill this path makes. The EXACT pid only, for the reason `signalAdopted` gives: a
+    /// `killpg` here would sweep a process group we did not create.
+    ///
+    /// Deliberately NOT `killProcess` (which the cgroup backend and the exact-leader route still use): a
+    /// teardown that reached the raw syscall directly would be the one delivery on this path the seam
+    /// could not intercept — and it is the delivery that sends SIGKILL, so it is the one where reaching
+    /// the wrong process is unrecoverable.
+    ///
+    /// Fire-and-forget, like the teardown kills around it: the delivery verdict is not reported, because
+    /// nothing can act on it (the process is going away either way, and it is not ours to reap). The
+    /// return value is the ANCHOR verdict, not the kill's — `true` when the pid was still the process
+    /// that was adopted and the SIGKILL therefore went out, `false` when the number has changed hands or
+    /// its identity can no longer be read and nothing was sent. The gate lives here rather than at the
+    /// three call sites so a fourth one cannot deliver an ungated SIGKILL to a bare number.
+    let killAdopted (pid: int) (anchor: uint64) : bool =
+        if adoptedStillOurs pid anchor then
+            observeGroupDelivery pid
+            killAdoptedPid pid SIGKILL |> ignore
+            true
+        else
+            false
 
     // A connected AF_UNIX SOCK_STREAM socket pair for one piped stdio channel, used instead of a bare
     // pipe: its parent-kept end can be wrapped in a .NET `Socket`/`NetworkStream`, whose async reads and
