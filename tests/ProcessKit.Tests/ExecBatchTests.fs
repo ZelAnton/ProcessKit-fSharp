@@ -196,6 +196,97 @@ type private AbandonedStreamRunner() =
         member _.SpawnAsync(_command, _cancellationToken) =
             raise (NotSupportedException "this test runner only supports text capture")
 
+/// Counts the captures a batch actually STARTS, and completes each one immediately — the probe for the
+/// bounded hand-off contract, where what matters is not what a command returns but whether it was ever
+/// allowed to begin. `bound` is the most commands the fan-out may have started once the consumer stops
+/// reading; the two signals let a test wait for that ceiling to be reached and fail the moment it is
+/// exceeded, instead of sleeping a guessed interval and hoping.
+type private HandOffProbeRunner(bound: int) =
+    let mutable started = 0
+
+    let saturated =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let overrun =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    member _.Started = Volatile.Read(&started)
+
+    /// Completes once the fan-out has started as many commands as the bound allows.
+    member _.Saturated: Task = saturated.Task :> Task
+
+    /// Completes the moment the fan-out starts one command MORE than the bound allows.
+    member _.Overrun: Task = overrun.Task :> Task
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(command, _cancellationToken) =
+            let count = Interlocked.Increment(&started)
+
+            if count >= bound then
+                saturated.TrySetResult() |> ignore
+
+            if count > bound then
+                overrun.TrySetResult() |> ignore
+
+            Task.FromResult(
+                Ok(
+                    ProcessResult<string>(
+                        command.Program,
+                        command.Program,
+                        "",
+                        Outcome.Exited 0,
+                        TimeSpan.Zero,
+                        false,
+                        [ 0 ]
+                    )
+                )
+            )
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "this test runner only supports text capture"
+
+        member _.SpawnAsync(_command, _cancellationToken) =
+            raise (NotSupportedException "this test runner only supports text capture")
+
+/// Driving a completion-ordered stream into the one state the bounded hand-off contract is about: the
+/// hand-off buffer full, every concurrency slot held by a command parked on the hand-off (finished, but
+/// with nobody to give its item to), and every remaining command still unstarted. Reaching that state is
+/// what the streaming tests below all need before they can assert anything about backpressure,
+/// cancellation, or abandonment — and none of the other streaming tests ever reach it, because they keep
+/// reading.
+module private HandOff =
+
+    /// The most commands a bounded hand-off may ever have started once the consumer has taken `consumed`
+    /// items and stopped reading: `concurrency` items sitting in the buffer + one command parked on the
+    /// hand-off per concurrency slot (each still holding its slot, so nothing else can start) + the ones
+    /// already handed to the consumer. It is a ceiling at every instant, not just at rest.
+    let allowedStarts (concurrency: int) (consumed: int) = (2 * concurrency) + consumed
+
+    /// Run `commandCount` commands through `Exec.outputStream`, pull exactly ONE item, and then stop
+    /// reading until the fan-out has filled both the buffer and every slot. Returns the probe and the
+    /// still-live (undisposed) enumerator — how the stream ends is each test's own subject.
+    let saturate (concurrency: int) (commandCount: int) (cancellationToken: CancellationToken) =
+        task {
+            let runner = HandOffProbeRunner(allowedStarts concurrency 1)
+            let commands = [ for i in 1..commandCount -> Command.create $"cmd{i}" ]
+
+            let stream =
+                Exec.outputStream concurrency (runner :> IProcessRunner) commands cancellationToken
+
+            let enumerator = stream.GetAsyncEnumerator()
+
+            // The one and only read: the fan-out starts on the first pull, and from here on nothing is
+            // ever taken out of the hand-off buffer again.
+            let! first = BatchStreaming.expect enumerator
+
+            // Positive proof the fan-out really did fill the buffer AND every slot: a fan-out that
+            // stalled earlier fails this bounded wait, instead of silently satisfying a "did not run
+            // ahead" assertion for the wrong reason.
+            do! runner.Saturated.WaitAsync(TimeSpan.FromSeconds 5.0)
+
+            return runner, enumerator, first
+        }
+
 /// "boom" errors, everything else succeeds — for proving a completion-ordered stream never
 /// short-circuits on one command's failure.
 type private MixedOutcomeRunner() =
@@ -1414,6 +1505,123 @@ type ExecBatchTests() =
             match first.Result with
             | Ok result -> Assert.That(result.Stdout, Is.EqualTo "fast")
             | Error error -> Assert.Fail $"an already-yielded item did not survive abandonment: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``outputStream stops starting commands once the hand-off buffer and every slot are full``() : Task =
+        task {
+            // The published backpressure contract — "once the buffer and the live commands are full,
+            // nothing further starts". A consumer that takes one item and then stops reading may see at
+            // most buffer (2) + one parked command per slot (2) + the item it took (1) = 5 of the 12
+            // commands started. An unbounded hand-off, or releasing the concurrency slot BEFORE handing
+            // the item over, would run the whole batch ahead into memory and start all 12.
+            let concurrency = 2
+            let bound = HandOff.allowedStarts concurrency 1
+            let! runner, enumerator, _first = HandOff.saturate concurrency 12 CancellationToken.None
+
+            // Proving the negative without a guessed sleep: a fan-out that ignores the bound trips
+            // `Overrun` as fast as it can start one more command, so this window ends early on a
+            // regression and only ever costs its full length on the green path.
+            let! _ = Task.WhenAny(runner.Overrun, Task.Delay(TimeSpan.FromMilliseconds 500.0))
+
+            Assert.That(
+                runner.Started,
+                Is.EqualTo bound,
+                "a consumer that stopped reading must stop the fan-out at buffer + live commands"
+            )
+
+            do! enumerator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds 5.0)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``outputStream disposal completes when commands are parked on a full hand-off``() : Task =
+        task {
+            // The dangerous half of abandonment (KB K-108): the consumer walks away while the buffer is
+            // full and finished commands are parked on the hand-off with nobody to give their items to.
+            // If disposal cancelled only the RUNS, those parked hand-offs would never wake, the fan-out
+            // it then awaits would never finish, and an ordinary `await foreach` + `break` would hang
+            // FOREVER in the consumer's own code. A finite deadline is the whole point of the test.
+            //
+            // The sibling abandonment test above cannot cover this: it reads every item it produces, so
+            // its channel is empty and no command is ever parked on the hand-off.
+            let concurrency = 2
+            let bound = HandOff.allowedStarts concurrency 1
+            let! runner, enumerator, _first = HandOff.saturate concurrency 12 CancellationToken.None
+
+            let disposal = enumerator.DisposeAsync().AsTask()
+            let! winner = Task.WhenAny(disposal, Task.Delay(TimeSpan.FromSeconds 10.0))
+
+            Assert.That(
+                obj.ReferenceEquals(winner, disposal),
+                Is.True,
+                "disposing an abandoned stream hung on the commands parked on its full hand-off"
+            )
+
+            do! disposal
+
+            // Teardown cancels the runs BEFORE it frees the parked hand-offs, so the slots those parked
+            // commands give up on their way out can never start a command the abandoned batch had
+            // already promised to leave unstarted.
+            Assert.That(
+                runner.Started,
+                Is.EqualTo bound,
+                "abandoning the stream started a command that was still waiting for a concurrency slot"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``outputStream still delivers every item when a full hand-off is cancelled mid-fan-out``() : Task =
+        task {
+            // Cancelling the batch is not abandoning it: every command still owes the consumer exactly
+            // one item, including the ones parked on a full hand-off and the ones that never started.
+            // That is why the hand-off has its own disposal-only token — cancelling the RUNS through the
+            // same token the hand-off waits on would silently drop precisely the items already computed.
+            let concurrency = 2
+            let bound = HandOff.allowedStarts concurrency 1
+            use cancellation = new CancellationTokenSource()
+            let! runner, enumerator, first = HandOff.saturate concurrency 12 cancellation.Token
+
+            cancellation.Cancel()
+
+            let! rest = BatchStreaming.drain enumerator
+            do! enumerator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds 5.0)
+
+            let items = ResizeArray<BatchItem<string>>()
+            items.Add first
+            items.AddRange rest
+
+            Assert.That(
+                items.Count,
+                Is.EqualTo 12,
+                "a cancelled batch dropped items that were already parked on the full hand-off"
+            )
+
+            Assert.That(items |> Seq.map (fun item -> item.Index) |> Seq.toArray, Is.EquivalentTo [| 0..11 |])
+            Assert.That(runner.Started, Is.EqualTo bound)
+
+            // The ones that had already run keep their own results; the ones the cancellation caught
+            // still waiting for a slot are `Cancelled` — never a truncated stream.
+            let succeeded =
+                items
+                |> Seq.filter (fun item ->
+                    match item.Result with
+                    | Ok _ -> true
+                    | Error _ -> false)
+                |> Seq.length
+
+            let cancelled =
+                items
+                |> Seq.filter (fun item ->
+                    match item.Result with
+                    | Error(ProcessError.Cancelled _) -> true
+                    | _ -> false)
+                |> Seq.length
+
+            Assert.That(succeeded, Is.EqualTo bound)
+            Assert.That(cancelled, Is.EqualTo(12 - bound))
         }
         :> Task
 
