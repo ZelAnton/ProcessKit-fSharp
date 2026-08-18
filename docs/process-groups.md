@@ -138,7 +138,8 @@ full per-OS matrix lives in [platform-support.md](platform-support.md).
 *before* the first spawn, `ProcessGroup.Capabilities()` (or
 `Capabilities(options)`) returns a `ContainmentCapabilities` snapshot: the
 mechanism `Create` would select for those options, plus, per axis — resource
-limits, signals, adoption, PTY and its resize, kill-on-parent-death, and the
+limits, signals, adoption (from a `Process` and, separately, from a bare pid),
+PTY and its resize, kill-on-parent-death, and the
 platform helper binaries — either a real availability or a typed
 `Capability.Unsupported` naming the precondition that is missing:
 
@@ -318,6 +319,9 @@ A few deliberate contract points:
   cannot race a recycle. On **Linux** there is no handle that pins a pid, so the residual
   (tiny) recycle window between the liveness check and the `cgroup.procs` write cannot be
   fully closed by number alone — an honest limitation, documented rather than hidden.
+  Holding no `Process` at all — a pid from a pidfile, a registry, an FFI or IPC boundary —
+  is what [`AdoptByPid`](#adopting-from-a-bare-pid) is for; where a live `Process` *is*
+  available, this overload stays the stronger of the two.
 - **The group keeps only containment; you keep the wait.** Adoption returns
   `Result<unit, _>` — not a `RunningProcess` — because the external process's stdio is not
   ours to stream. The adopted process is **not** ProcessKit's child, so ProcessKit never
@@ -336,6 +340,88 @@ A few deliberate contract points:
   uses the POSIX process-group mechanism, which cannot relocate a foreign process and
   refuses with `ProcessError.Unsupported`. See
   [platform-support.md](platform-support.md#capability-matrices).
+
+### Adopting from a bare pid
+
+Often the number is all you have: a pid read from a pidfile, one handed over by an
+outside supervisor, one that arrived over an IPC or FFI boundary. `AdoptByPid(pid)` is
+the door for that case — the same containment as `Adopt`, taken from an `int`.
+
+**F#**
+
+```fsharp
+// A pid from outside this process — a pidfile, a registry, an FFI caller.
+let pid = 4321
+use group = (ProcessGroup.Create() |> function Ok g -> g | Error e -> failwith e.Message)
+
+match group.AdoptByPid pid with
+| Ok() -> ()                       // contained from here on: disposing `group` kills it too
+| Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+// A pid from outside this process — a pidfile, a registry, an FFI caller.
+var pid = 4321;
+using var group = ProcessGroup.Create().GetValueOrThrow();
+
+if (group.AdoptByPid(pid) is { IsOk: false, ErrorValue: var err })
+    Console.Error.WriteLine(err.Message);
+```
+
+**A pid is an address, not a handle.** Once a process is reaped the OS may give its
+number to an unrelated one, so the number is used to *find* the process and the group is
+then bound to an **identity anchor of its own** for whatever that number currently names:
+
+| Mechanism | What the group holds afterwards |
+|---|---|
+| Windows Job Object | The process **object**. The number is used exactly once, by this call's `OpenProcess`; the assign puts that object in the Job and the kernel keeps membership per object. |
+| Linux cgroup v2 | Kernel-maintained **cgroup membership**. A `/proc/<pid>/stat` start-time read on either side of the `cgroup.procs` write *detects* a number that changed hands across it — detection, not prevention (see the failure list below). |
+| POSIX process group | The tracked pid **plus** the start-time token read here, **re-read before every probe, signal, suspend/resume and teardown kill**. |
+
+So a process that recycles the number *after* the call is rejected rather than signalled.
+What no library can close is the window *before* it — whether `pid` still named the
+process you meant when you passed it. Look the number up as late as you can. The token
+row carries one residual the other two do not: its resolution (a clock tick on Linux, a
+microsecond on macOS) cannot separate two processes that held the number within one tick.
+
+**What the group covers.** Processes the adopted one had *already* started keep their
+original containment. What happens to the ones it starts *afterwards* follows the
+mechanism: on the Job Object and cgroup v2 a later fork joins the container with its
+parent, so the subtree grown from here is contained; on the **POSIX process group** the
+process is tracked **individually** — signalled and killed with the group, but its future
+forks are not, because no POSIX primitive moves a foreign, already-`exec`ed process into
+another process group.
+
+**Ownership is unchanged from `Adopt`:** the group contains, signals, lists and kills it;
+it never `waitpid`s it, and no exit status for it is reported through this API. On the
+POSIX mechanism, note that a process which exits and is *not* reaped by its own parent
+becomes a zombie, and a zombie still answers the identity probe — a graceful
+`ShutdownAsync` then waits out its whole grace on it, and no kill can clear it; only its
+parent's `wait` can.
+
+**Refusals, each typed and specific:**
+
+- `pid <= 0` and this process's **own** pid are refused with `ProcessError.Adopt` before
+  any mechanism is consulted. Neither is adoptable and both are dangerous as numbers: `0`
+  means "the caller's own process group" to `kill`, a negative number addresses a process
+  group, and adopting ourselves would enlist this process in its own group's teardown.
+- A POSIX host with **no start-time identity reader** (the BSDs) returns
+  `ProcessError.Unsupported`: with no anchor to capture, tracking the bare number would
+  mean SIGKILLing whatever holds it at teardown. Never a silent downgrade.
+- A pid that names nothing, an identity that cannot be read (a `hidepid` `/proc` mount,
+  another user's process on macOS), a denied `OpenProcess` or `cgroup.procs` write, an
+  assign Windows refuses, or a number that changed hands *while the call ran* all return
+  `ProcessError.Adopt` with the cause. On cgroup v2 that last case has already written the
+  stranger into this group's cgroup, so the call moves it back out to the parent cgroup and
+  says so — and where even that is refused, says that the process stays a member of this
+  group and will be killed by its teardown.
+
+**Platform availability.** Windows and Linux cgroup v2 as for `Adopt`. The POSIX
+process-group mechanism — which cannot `Adopt` at all — *can* adopt by pid wherever this
+host has an identity reader (Linux, macOS), so the two axes deliberately differ; ask
+`ProcessGroup.Capabilities().AdoptionByPid` rather than assuming they match.
 
 ## Tearing down: dispose, terminate, shutdown
 
@@ -1032,7 +1118,8 @@ identity check must still confirm the same generation before the PID is retained
 with `None` metrics; same-Job PID reuse is omitted. Linux cgroup reads `/proc/<pid>`
 for every whole-tree member: tracked and adopted leaders use pinned identities,
 while descendants use a snapshot identity checked again after the read. The POSIX
-process-group fallback samples its tracked leaders. Metrics unavailable on a
+process-group fallback samples its tracked leaders, and any process adopted by bare
+pid against the anchor captured for it. Metrics unavailable on a
 platform or for a confirmed inaccessible member are `None`, never fabricated zeroes.
 `MemberStats()`
 holds the same lifecycle gate as `Members()` and `Stats()`, and returns the typed

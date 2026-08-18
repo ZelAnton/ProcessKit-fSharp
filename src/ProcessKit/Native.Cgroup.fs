@@ -491,6 +491,51 @@ module internal Cgroup =
             finally
                 closeFd fd |> ignore
 
+    /// Move `pid` back OUT of this cgroup, into the cgroup this group's own directory lives in (its
+    /// parent) — the rollback half of a bare-pid adoption (`ProcessGroup.AdoptByPid`) whose identity
+    /// re-read found the number had changed hands ACROSS the `cgroup.procs` write above. The write has
+    /// already happened by then, and cgroup v2 membership is exclusive, so the stranger is in this
+    /// group's cgroup and would be killed by its teardown; putting it in the parent takes it back out of
+    /// reach of `cgroup.kill` and of the caps this cgroup carries.
+    ///
+    /// What it deliberately does NOT claim: this is not a restore. The kernel does not report which
+    /// cgroup a task came from, so the process lands in the parent, not wherever it was before — and a
+    /// refused move-out (a delegated hierarchy that will not accept the write, a parent that may not
+    /// hold processes because its `cgroup.subtree_control` is populated) leaves it a member of this
+    /// group. The caller says which of the two happened in its typed error rather than reporting a clean
+    /// undo either way.
+    let releaseFromCgroup (cgroupPath: string) (pid: int) : Result<unit, string> =
+        match Path.GetDirectoryName cgroupPath with
+        | null -> Error $"could not determine the parent cgroup of {cgroupPath} to move pid {pid} back out"
+        | parent ->
+            let procs = Path.Combine(parent, "cgroup.procs")
+            let fd = openWrite (procs, O_WRONLY)
+
+            if fd < 0 then
+                let errno = Marshal.GetLastWin32Error()
+                Error $"could not open {procs} to move pid {pid} back out (errno {errno})"
+            else
+                try
+                    let payload = System.Text.Encoding.ASCII.GetBytes(string pid)
+                    let written = writeAll (fd, payload, nativeint payload.Length)
+
+                    if written >= 0n && written = nativeint payload.Length then
+                        Ok()
+                    elif written >= 0n then
+                        Error $"short write moving pid {pid} out to {procs} ({written} of {payload.Length} bytes)"
+                    else
+                        let errno = Marshal.GetLastWin32Error()
+
+                        if errno = ESRCH then
+                            // The process is gone, so it is no longer a member of anything: there is
+                            // nothing left in this cgroup for teardown to reach, which is what the
+                            // move-out was for.
+                            Ok()
+                        else
+                            Error $"writing pid {pid} to {procs} to move it back out failed (errno {errno})"
+                finally
+                    closeFd fd |> ignore
+
     /// The live member pids of a cgroup (`cgroup.procs`), distinguishing "read, and it's empty" from
     /// "the read itself failed" (EACCES/EIO, a race with teardown removing the directory, …). Folding
     /// both into `[]` (the previous behaviour) made a transient read failure indistinguishable from a

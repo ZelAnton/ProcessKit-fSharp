@@ -431,6 +431,222 @@ type PosixIdentityReuseTests() =
                 // best-effort temp cleanup; a leftover temp dir must not fail the test.
                 ()
 
+    // ---- T-371: bare-pid adoption (`ProcessGroup.AdoptByPid`) on the process-group mechanism ----
+    //
+    // A foreign process adopted by NUMBER is tracked against the start-time anchor captured when it was
+    // adopted, and that anchor is re-read before every probe, signal, suspend/resume and teardown kill —
+    // never once at adoption and then trusted. Two things separate it from a tracked child of ours: the
+    // delivery is always to the EXACT pid (its process group belongs to whoever started it, so `killpg`
+    // there would sweep strangers), and an unreadable identity is fail-CLOSED (an adopted number has no
+    // unreaped-child slot holding it, so a bare number is never evidence of anything).
+
+    [<Test>]
+    member _.``an adopted pid is listed, signalled and killed with the group while its anchor matches``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        runWithReuseSeams (fun current delivered ->
+            let adoptedPid = 2_000_000_401
+            current[adoptedPid] <- Some 4_010UL
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+
+            match backend.AdoptByPid adoptedPid with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"AdoptByPid failed: {e.Message}"
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Does.Contain adoptedPid, "an adopted pid is a member of the group")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}"
+
+            match backend.Stats() with
+            | Ok stats -> Assert.That(stats.ActiveProcessCount, Is.EqualTo 1, "and it counts as an active member")
+            | Error e -> Assert.Fail $"Stats failed: {e.Message}"
+
+            match backend.Signal Signal.Term with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Signal failed: {e.Message}"
+
+            Assert.That(delivered, Does.Contain adoptedPid, "the adopted process must receive the group's signal")
+
+            delivered.Clear()
+
+            match backend.Suspend() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Suspend failed: {e.Message}"
+
+            match backend.Resume() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Resume failed: {e.Message}"
+
+            Assert.That(deliveries delivered adoptedPid, Is.EqualTo 2, "suspend and resume both reach it")
+
+            delivered.Clear()
+            backend.KillTree() |> ignore
+            Assert.That(delivered, Does.Contain adoptedPid, "the whole-tree hard kill reaches it")
+
+            delivered.Clear()
+            backend.HardRelease()
+
+            Assert.That(delivered, Does.Contain adoptedPid, "and so does teardown")
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Is.Empty, "teardown drains the adopted ledger too")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}")
+
+    [<Test>]
+    member _.``a pid recycled after it was adopted by number is never signalled, suspended or killed``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // The regression this feature could most easily introduce: adopting by NUMBER and then acting on
+        // the number. Here the adoption captures a real anchor and the number then changes hands — every
+        // later path must treat it as gone, exactly as a recycled tracked pgid is treated.
+        runWithReuseSeams (fun current delivered ->
+            let kept = 2_000_000_402
+            let recycled = 2_000_000_403
+            current[kept] <- Some 4_020UL
+            current[recycled] <- Some 4_030UL
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.AdoptByPid kept |> ignore
+            backend.AdoptByPid recycled |> ignore
+
+            // A stranger now holds the second number (its start-time token differs from the captured one).
+            current[recycled] <- Some 9_999UL
+
+            match backend.Members() with
+            | Ok members ->
+                Assert.That(members, Does.Contain kept, "the matching-anchor pid is still a member")
+                Assert.That(members, Does.Not.Contain recycled, "a recycled number is not a member of this group")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}"
+
+            match backend.Signal Signal.Term with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Signal failed: {e.Message}"
+
+            match backend.Suspend() with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Suspend failed: {e.Message}"
+
+            backend.KillTree() |> ignore
+            backend.HardRelease()
+
+            Assert.That(delivered, Does.Contain kept, "the adopted process whose anchor still matches is reached")
+
+            Assert.That(
+                delivered,
+                Does.Not.Contain recycled,
+                "a number recycled since it was adopted must never be signalled, suspended or SIGKILLed"
+            ))
+
+    [<Test>]
+    member _.``an adopted pid whose identity becomes unreadable receives nothing (fail-closed)``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // Deliberately STRICTER than the tracked-pgid choke, and the asymmetry is the point. A tracked
+        // pgid whose token cannot be read falls back to the by-number liveness verdict, because an
+        // unreaped child of ours holds its number. An adopted foreign process is not our child: nothing
+        // holds its number, so with no readable identity there is no evidence left and nothing is
+        // delivered — losing containment of a live process rather than risking a stranger's kill.
+        runWithReuseSeams (fun current delivered ->
+            let adoptedPid = 2_000_000_404
+            current[adoptedPid] <- Some 4_040UL
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.AdoptByPid adoptedPid |> ignore
+
+            // The identity read now fails (a hidepid /proc, a denied read, or the process is gone).
+            current[adoptedPid] <- None
+
+            match backend.Signal Signal.Term with
+            | Ok() -> ()
+            | Error e -> Assert.Fail $"Signal failed: {e.Message}"
+
+            backend.KillTree() |> ignore
+            backend.HardRelease()
+
+            Assert.That(delivered, Is.Empty, "with no readable identity there is no evidence, so nothing is delivered")
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Is.Empty, "and it is no longer reported as a member")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}")
+
+    [<Test>]
+    member _.``a graceful stop reaches an adopted pid with both its soft signal and its escalation``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // The off-lock poll works from a snapshot of the adopted ledger (K-086) and re-reads the anchor in
+        // every phase, so both the soft signal and the escalation must land — deterministically, because
+        // the seams keep the process "alive" for the whole grace.
+        runWithReuseSeams (fun current delivered ->
+            let adoptedPid = 2_000_000_405
+            current[adoptedPid] <- Some 4_050UL
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+            backend.AdoptByPid adoptedPid |> ignore
+
+            let graceful =
+                backend.GracefulKillTree Signal.Term (TimeSpan.FromMilliseconds 150.0)
+
+            Assert.That(graceful.Wait(TimeSpan.FromSeconds 30.0), Is.True, "the graceful stop must finish")
+
+            Assert.That(
+                deliveries delivered adoptedPid,
+                Is.EqualTo 2,
+                "an adopted process gets the soft signal and then the SIGKILL escalation"
+            ))
+
+    [<Test>]
+    member _.``a pid with no readable identity is refused rather than adopted by number``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        runWithReuseSeams (fun _current delivered ->
+            // The reader exists on this host (the seam is installed) but answers `None` for this pid: it
+            // is already gone, or its /proc entry is unreadable. A per-process refusal, not a platform one.
+            let unreadable = 2_000_000_406
+
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+
+            match backend.AdoptByPid unreadable with
+            | Error(ProcessError.Adopt(pid, detail)) ->
+                Assert.That(pid, Is.EqualTo unreadable)
+                Assert.That(detail, Does.Contain "identity")
+            | other -> Assert.Fail $"expected a typed Adopt failure for an unreadable identity, got {other}"
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Is.Empty, "a refused adoption tracks nothing")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}"
+
+            backend.HardRelease()
+            Assert.That(delivered, Is.Empty, "and teardown has nothing to deliver to"))
+
+    [<Test>]
+    member _.``a platform with no start-time reader refuses bare-pid adoption as Unsupported``() =
+        if isWindows then
+            Assert.Ignore "the POSIX process-group backend and its identity gate are POSIX-only"
+
+        // The BSD branch, driven from any POSIX build host: with no reader there is no anchor to take for
+        // ANY pid, so the refusal is the whole-platform `Unsupported` rather than a per-process `Adopt`
+        // failure — and never a downgrade to tracking the bare number.
+        Native.Posix.processIdentityReaderAvailableForTests <- Some(fun () -> false)
+
+        try
+            let backend = ProcessGroupBackend() :> IContainmentBackend
+
+            match backend.AdoptByPid 2_000_000_407 with
+            | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Does.Contain "start-time identity anchor")
+            | other -> Assert.Fail $"expected Unsupported on a host with no identity reader, got {other}"
+
+            match backend.Members() with
+            | Ok members -> Assert.That(members, Is.Empty, "a refused adoption must track nothing")
+            | Error e -> Assert.Fail $"Members failed: {e.Message}"
+        finally
+            Native.Posix.processIdentityReaderAvailableForTests <- None
+
     // ---- T-359: the pre-`setsid()` pty window — a live leader whose process GROUP does not exist yet ----
     //
     // A `Command.Pty` child is spawned with neither `POSIX_SPAWN_SETPGROUP` nor `POSIX_SPAWN_SETSID`,

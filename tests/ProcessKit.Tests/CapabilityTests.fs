@@ -28,6 +28,7 @@ module private CapabilityFacts =
           ControllingTerminalHelperAvailable = false
           SystemShellAvailable = false
           TrustedHelperDirectories = ""
+          ProcessIdentityReaderAvailable = false
           AffinityMaskWidth = 64 }
 
     /// A mainstream Linux host: a usable cgroup v2 hierarchy carrying every controller, util-linux present.
@@ -45,6 +46,7 @@ module private CapabilityFacts =
           ControllingTerminalHelperAvailable = true
           SystemShellAvailable = true
           TrustedHelperDirectories = "/usr/bin, /bin, /usr/sbin, /sbin"
+          ProcessIdentityReaderAvailable = true
           AffinityMaskWidth = 64 }
 
     /// The same Linux host with no usable cgroup v2 hierarchy — a container, or a v1-only kernel.
@@ -74,7 +76,15 @@ module private CapabilityFacts =
           ControllingTerminalHelperAvailable = false
           SystemShellAvailable = true
           TrustedHelperDirectories = "/usr/bin, /bin, /usr/sbin, /sbin"
+          ProcessIdentityReaderAvailable = true
           AffinityMaskWidth = 64 }
+
+    /// FreeBSD and the other BSDs: the same absent whole-tree primitive as macOS, plus the one fact that
+    /// separates them for bare-pid adoption — no start-time identity reader this library can verify, so
+    /// there is no anchor to take for a foreign number.
+    let bsd =
+        { macOs with
+            ProcessIdentityReaderAvailable = false }
 
     let noLimits () = ProcessGroupOptions()
 
@@ -141,8 +151,10 @@ type CapabilityTests() =
         Assert.That(caps.Mechanism, Is.EqualTo(Some Mechanism.JobObject))
         available "Creation" caps.Creation
 
-        // `AssignProcessToJobObject` adopts with or without limits.
+        // `AssignProcessToJobObject` adopts with or without limits — from a `Process` or from a bare pid
+        // alike, because the anchor here is the process OBJECT the adopt's own `OpenProcess` returns.
         available "Adoption" caps.Adoption
+        available "AdoptionByPid" caps.AdoptionByPid
 
         // The narrow Windows signal mapping, reported as three distinct answers rather than one bool.
         available "Signals.Kill" caps.Signals.Kill
@@ -193,6 +205,7 @@ type CapabilityTests() =
         // delegable from the REAL cgroup root, which no side-effect-free probe can settle.
         qualified "Creation" "REAL cgroup v2 hierarchy root" caps.Creation
         available "Adoption" caps.Adoption
+        available "AdoptionByPid" caps.AdoptionByPid
 
         available "Signals.Kill" caps.Signals.Kill
         available "Signals.SoftStop" caps.Signals.SoftStop
@@ -233,6 +246,11 @@ type CapabilityTests() =
         available "Creation" caps.Creation
         unsupported "Adoption" "whole-tree resource limits" caps.Adoption
 
+        // ...yet the BARE-PID door is open here, and that divergence is the point of the second axis:
+        // this mechanism cannot RELOCATE a foreign process, but it can TRACK one against the start-time
+        // anchor this host can read — with the narrower containment stated in the qualification.
+        qualified "AdoptionByPid" "tracked INDIVIDUALLY" caps.AdoptionByPid
+
         // ...but the limit dimensions answer for the HOST. Reporting them Unsupported here — merely
         // because THESE options asked for no cap — would understate a host that can enforce every one of
         // them the moment a cap is requested (which is exactly what selects the cgroup mechanism).
@@ -249,6 +267,7 @@ type CapabilityTests() =
         Assert.That(caps.Mechanism, Is.EqualTo(None: Mechanism option))
         unsupported "Creation" "cgroup v2 is not mounted" caps.Creation
         unsupported "Adoption" "cgroup v2 is not mounted" caps.Adoption
+        unsupported "AdoptionByPid" "cgroup v2 is not mounted" caps.AdoptionByPid
         unsupported "Signals.Kill" "cgroup v2 is not mounted" caps.Signals.Kill
 
         // Host-level axes are unaffected: they are facts about the host, not about a group never created.
@@ -264,6 +283,8 @@ type CapabilityTests() =
 
         Assert.That(caps.Mechanism, Is.EqualTo(Some Mechanism.ProcessGroup))
         unsupported "Adoption" "Windows Job Object or a Linux cgroup v2" caps.Adoption
+        // macOS has `proc_pidinfo`, so a bare pid CAN be anchored and tracked here.
+        qualified "AdoptionByPid" "tracked INDIVIDUALLY" caps.AdoptionByPid
         unsupported "MemoryMax" "whole-tree container" caps.ResourceLimits.MemoryMax
         unsupported "CpuAffinity" "whole-tree container" caps.ResourceLimits.CpuAffinity
         unsupported "LiveUpdate" "whole-tree container" caps.ResourceLimits.LiveUpdate
@@ -279,6 +300,26 @@ type CapabilityTests() =
         unsupported "setpriv" "trusted system directory" (helperEntry "setpriv" caps).Availability
         unsupported "setsid" "trusted system directory" (helperEntry "setsid" caps).Availability
         available "/bin/sh" (helperEntry "/bin/sh" caps).Availability
+
+    [<Test>]
+    member _.``a POSIX host with no start-time reader refuses bare-pid adoption instead of tracking a number``() =
+        // The BSD row. Everything macOS reports stays the same except the one axis that depends on an
+        // identity anchor: with no reader there is nothing to bind the group to, and the honest answer is
+        // a typed refusal naming the missing reader — never a downgrade to tracking the bare number,
+        // which would let teardown SIGKILL whatever holds it by then.
+        let caps =
+            CapabilityProbe.snapshot CapabilityFacts.bsd (CapabilityFacts.noLimits ())
+
+        Assert.That(caps.Mechanism, Is.EqualTo(Some Mechanism.ProcessGroup))
+        unsupported "AdoptionByPid" "start-time identity reader" caps.AdoptionByPid
+
+        // The two adoption axes agree that this host cannot adopt, for two DIFFERENT reasons, and each
+        // says its own.
+        unsupported "Adoption" "no POSIX primitive can move a foreign process" caps.Adoption
+
+        // Nothing else moves with it: the reader is not a helper binary and not a container.
+        available "CpuTimeMax" caps.ResourceLimits.CpuTimeMax
+        available "Signals.Arbitrary" caps.Signals.Arbitrary
 
     [<Test>]
     member _.``a missing POSIX helper degrades exactly the axes that need it``() =
@@ -318,7 +359,8 @@ type CapabilityTests() =
                   PrivilegeDropHelperAvailable = false
                   ControllingTerminalHelperAvailable = false
                   SystemShellAvailable = false }
-              "macos", CapabilityFacts.macOs ]
+              "macos", CapabilityFacts.macOs
+              "bsd", CapabilityFacts.bsd ]
 
         let optionSets =
             [ "no limits", CapabilityFacts.noLimits ()
@@ -332,6 +374,7 @@ type CapabilityTests() =
                 let namedAxes =
                     [ "Creation", caps.Creation
                       "Adoption", caps.Adoption
+                      "AdoptionByPid", caps.AdoptionByPid
                       "Pty", caps.Pty
                       "PtyResize", caps.PtyResize
                       "KillOnParentDeath", caps.KillOnParentDeath
@@ -453,6 +496,7 @@ type CapabilityTests() =
         if isWindows then
             Assert.That(caps.Mechanism, Is.EqualTo(Some Mechanism.JobObject))
             available "Adoption" caps.Adoption
+            available "AdoptionByPid" caps.AdoptionByPid
             available "KillOnParentDeath" caps.KillOnParentDeath
             available "Signals.Kill" caps.Signals.Kill
             qualified "Signals.SoftStop" "CTRL+BREAK" caps.Signals.SoftStop
@@ -467,6 +511,16 @@ type CapabilityTests() =
             // Both POSIX mechanisms deliver the whole signal vocabulary.
             available "Signals.Arbitrary" caps.Signals.Arbitrary
             refused "UiRestrictions" caps.ResourceLimits.UiRestrictions
+
+            // A limit-free POSIX group cannot `Adopt` a `Process` on any host, while `AdoptByPid` depends
+            // on whether THIS host can read a start-time anchor — so the pair is cross-checked against the
+            // very reader the adoption path consults, rather than assumed per platform.
+            refused "Adoption" caps.Adoption
+
+            if Native.Posix.processIdentityReaderAvailable () then
+                qualified "AdoptionByPid" "tracked INDIVIDUALLY" caps.AdoptionByPid
+            else
+                unsupported "AdoptionByPid" "start-time identity reader" caps.AdoptionByPid
 
             // The helper list is the POSIX one; whether each is present depends on the host.
             for name in [ "setpriv"; "setsid"; "/bin/sh" ] do

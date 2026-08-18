@@ -359,6 +359,15 @@ module internal Posix =
     /// real process whose start time it cannot control. Production leaves it `None`.
     let mutable readProcessIdentityForTests: (int -> uint64 option) option = None
 
+    /// Test seam (internal, not public API): overrides whether this host has a start-time identity reader
+    /// AT ALL, so the readerless-platform branch of bare-pid adoption (the BSDs, which refuse with
+    /// `ProcessError.Unsupported` rather than tracking a bare number) can be exercised from a Linux or
+    /// macOS build host — the same shape as `ptyCttyHelperAvailableForTests`, which forces the "no ctty
+    /// helper" host on a machine that does carry it. Deliberately separate from
+    /// `readProcessIdentityForTests`: "this platform ships no reader" and "this pid's identity could not
+    /// be read" are different facts with different typed refusals. Production leaves it `None`.
+    let mutable processIdentityReaderAvailableForTests: (unit -> bool) option = None
+
     /// Test seam (internal, not public API): replaces the native member-resource read so backend identity
     /// gates can be tested without racing a real process exit or pid recycle. Production leaves it `None`.
     let mutable readMemberStatsForTests: (int -> MemberStats option) option = None
@@ -796,6 +805,25 @@ module internal Posix =
                 readMacStartTime pid
             else
                 None
+
+    /// Whether this host has a start-time identity reader AT ALL — the platform question, asked before
+    /// any particular pid is looked at, and answered from exactly the same platform switch
+    /// `readProcessIdentity` dispatches on (so the two can never disagree).
+    ///
+    /// It is what separates the two honest refusals a **bare-pid** adoption has to tell apart. On a host
+    /// with no reader (the BSDs) there is no anchor to capture for any pid, so adopting by number could
+    /// only ever mean tracking — and later signalling — a bare number: a whole-platform
+    /// `ProcessError.Unsupported`, never a silent downgrade. On a host WITH a reader, a `None` from
+    /// `readProcessIdentity` is about that one pid (already gone, a `hidepid` `/proc` mount, another
+    /// user's process on macOS) and is a per-process `ProcessError.Adopt`. A read-time failure and a
+    /// missing mechanism are neighbouring facts, and a caller can act on them differently.
+    let processIdentityReaderAvailable () : bool =
+        match processIdentityReaderAvailableForTests with
+        | Some hook -> hook ()
+        | None ->
+            match readProcessIdentityForTests with
+            | Some _ -> true
+            | None -> RuntimeInformation.IsOSPlatform OSPlatform.Linux || isMacOs
 
     // ----------------------------------------------------------------------------------
     // Enriched member snapshot (ProcessGroup.MembersInfo): parent pid + image name, per pid
@@ -1341,6 +1369,60 @@ module internal Posix =
             killProcess id
             killProcessGroup id
         | TrackedTarget.Gone -> ()
+
+    // ----------------------------------------------------------------------------------
+    // The BARE-PID adoption gate (`ProcessGroup.AdoptByPid`): a foreign process this library did not
+    // start, tracked on the POSIX process-group mechanism by its pid PLUS the start-time anchor captured
+    // when it was adopted.
+    //
+    // Deliberately a SEPARATE choke from `trackedTarget`, not a reuse of it, because the two answer
+    // different questions about different targets:
+    //
+    //  * `trackedTarget` is about OUR OWN spawned leader, whose pgid we own. It may therefore route a
+    //    delivery to the whole process GROUP (`killpg`), and it may fall back to the by-number liveness
+    //    verdict when no token is known, because an unreaped child's number cannot be recycled.
+    //  * an adopted foreign pid is neither. We do not own its process group — a `killpg` there would
+    //    sweep processes nobody adopted (a wrong-target kill of a stranger's whole tree) — and it is not
+    //    our child, so nothing holds its number against recycling once it exits. The bare NUMBER is
+    //    therefore never evidence of anything here: delivery is to the EXACT pid, and only while the
+    //    anchor still matches.
+    //
+    // Fail-closed by construction: the anchor is a `uint64` (not an option), because `AdoptByPid` refuses
+    // an adoption whose identity could not be read in the first place, and an identity that cannot be
+    // read NOW is not a match — so a live process behind a suddenly-unreadable `/proc` stops being
+    // signalled rather than being signalled on the strength of its number. That is the same trade
+    // `leaderPidStillTracked` documents: losing containment of a live process is the lesser harm next to
+    // a wrong-target kill.
+
+    /// Is `pid` still the exact process whose start-time `anchor` was captured when it was adopted by
+    /// number? Re-read on EVERY probe, signal, suspend/resume and teardown kill — never once at adoption
+    /// and then trusted. `false` for a recycled number, a vanished process, and an unreadable identity
+    /// alike (see the section comment: no read, no delivery).
+    let adoptedStillOurs (pid: int) (anchor: uint64) : bool =
+        match readProcessIdentity pid with
+        | Some current -> current = anchor
+        | None -> false
+
+    /// Deliver `signalNum` to an adopted foreign pid, gated on its anchor. The EXACT pid only: its
+    /// process group belongs to whoever started it, so `killpg` is not ours to use here. A non-matching
+    /// anchor reports `TargetGone` and delivers nothing, exactly as a `TrackedTarget.Gone` verdict does.
+    let signalAdopted (pid: int) (anchor: uint64) (signalNum: int) : SignalDelivery =
+        if not (isDeliverableSignal signalNum) then
+            SignalDelivery.DeliveryFailed(
+                EINVAL,
+                $"signal {signalNum} is a liveness probe / non-signal, not a deliverable signal — refused before kill"
+            )
+        elif adoptedStillOurs pid anchor then
+            observeGroupDelivery pid
+            classifySignalDelivery (kill (pid, signalNum))
+        else
+            SignalDelivery.TargetGone
+
+    /// Freeze one adopted foreign pid (SIGSTOP), gated exactly like `signalAdopted`.
+    let suspendAdopted (pid: int) (anchor: uint64) : SignalDelivery = signalAdopted pid anchor sigStop
+
+    /// Thaw one adopted foreign pid (SIGCONT), gated exactly like `signalAdopted`.
+    let resumeAdopted (pid: int) (anchor: uint64) : SignalDelivery = signalAdopted pid anchor sigCont
 
     // A connected AF_UNIX SOCK_STREAM socket pair for one piped stdio channel, used instead of a bare
     // pipe: its parent-kept end can be wrapped in a .NET `Socket`/`NetworkStream`, whose async reads and

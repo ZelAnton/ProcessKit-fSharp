@@ -238,6 +238,7 @@ module ProcessKit.ConsoleEncoding
 
 class ProcessKit.ContainmentCapabilities
   property Adoption : ProcessKit.Capability { get }
+  property AdoptionByPid : ProcessKit.Capability { get }
   property Creation : ProcessKit.Capability { get }
   property Helpers : System.Collections.Generic.IReadOnlyList<ProcessKit.PlatformHelper> { get }
   property KillOnParentDeath : ProcessKit.Capability { get }
@@ -946,6 +947,7 @@ class ProcessKit.ProcessGroup
   :> System.IAsyncDisposable
   :> System.IDisposable
   member Adopt(System.Diagnostics.Process) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member AdoptByPid(System.Int32) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member Finalize() : System.Void
   member KillAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member MemberStats() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<ProcessKit.MemberStats>, ProcessKit.ProcessError>

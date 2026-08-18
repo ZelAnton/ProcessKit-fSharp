@@ -917,6 +917,14 @@ module internal Windows =
     /// exit-after-pre-read and same-Job identity checks can be driven without a real PID-reuse race.
     let mutable isProcessInJobForTests: (nativeint -> nativeint -> bool) option = None
 
+    /// Test seam (internal, not public API): replaces the `OpenProcess` call `adoptIntoJob` makes for the
+    /// foreign process it is about to assign. The result carries a Win32 error code on failure, so the two
+    /// refusals a real adopt must classify apart — `ERROR_ACCESS_DENIED` (another user, a higher integrity
+    /// level, a protected process) and `ERROR_INVALID_PARAMETER` (the pid names nothing) — can be driven
+    /// deterministically, instead of pointing a test at a real protected process it must never actually
+    /// place in a kill-on-close Job. Mirrors `openMemberProcessForTests`. Production leaves it `None`.
+    let mutable adoptOpenProcessForTests: (int -> Result<nativeint, int>) option = None
+
     /// Test seam (internal, not public API): replaces the `OpenProcess` call the suspend/resume walk makes
     /// for each Job member. The result carries a Win32 error code on failure, so a test can drive the
     /// "proven gone" (`ERROR_INVALID_PARAMETER`) and "refused for some other reason" classifications apart
@@ -1676,16 +1684,24 @@ module internal Windows =
     ///    is a generic assign failure (e.g. the target exited between open and assign). Either way
     ///    `ProcessError.Adopt` with the specific detail.
     let adoptIntoJob (job: nativeint) (pid: int) : Result<unit, ProcessError> =
-        let handle =
-            OpenProcess(
-                PROCESS_SET_QUOTA ||| PROCESS_TERMINATE ||| PROCESS_QUERY_LIMITED_INFORMATION,
-                false,
-                uint32 pid
-            )
+        let opened =
+            match adoptOpenProcessForTests with
+            | Some hook -> hook pid
+            | None ->
+                let handle =
+                    OpenProcess(
+                        PROCESS_SET_QUOTA ||| PROCESS_TERMINATE ||| PROCESS_QUERY_LIMITED_INFORMATION,
+                        false,
+                        uint32 pid
+                    )
 
-        if handle = IntPtr.Zero then
-            let errno = Marshal.GetLastWin32Error()
+                if handle = IntPtr.Zero then
+                    Error(Marshal.GetLastWin32Error())
+                else
+                    Ok handle
 
+        match opened with
+        | Error errno ->
             let detail =
                 if errno = ERROR_INVALID_PARAMETER then
                     "the process does not exist (it exited before it could be adopted, or its pid was never valid)"
@@ -1695,7 +1711,7 @@ module internal Windows =
                     $"OpenProcess failed: {Win32Exception(errno).Message}"
 
             Error(ProcessError.Adopt(pid, detail))
-        else
+        | Ok handle ->
             try
                 if AssignProcessToJobObject(job, handle) then
                     Ok()
