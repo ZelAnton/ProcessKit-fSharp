@@ -14,6 +14,7 @@ open System.Threading.Tasks
 open NUnit.Framework
 open NUnit.Framework.Legacy
 open ProcessKit
+open ProcessKit.Testing
 
 /// A small F# record deserialized through STJ's constructor-based deserialization — the
 /// `StdoutJsonLinesAsync<'T>` analogue of `JsonVerbTests.fs`'s `Widget` (not reused directly: that
@@ -825,6 +826,561 @@ type StreamingTests() =
             | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
 
             CollectionAssert.AreEqual(payload, underlying.ToArray())
+        }
+        :> Task
+
+    // --- T-366: byte-exact stderr streaming (`StderrChunksAsync`) ---------------------------------
+    //
+    // The stderr twin of the `StdoutChunks` regressions above, deliberately in the same shapes — byte
+    // preservation across read boundaries, the exclusive one-shot claim, backpressure, the fail-loud
+    // bounded totals, a genuine read fault, the raw tee's flush, and teardown of an abandoned bounded
+    // stream. The three things that are NOT mirror images get their own tests: the honest typed refusal
+    // on a run with no separate stderr, the retain-nothing stdout this session drains, and the terminal
+    // claim/discard race a second consumer must lose loudly.
+
+    [<Test>]
+    member _.``StderrChunks preserves binary bytes and read boundaries, then Finish reaps``() : Task =
+        task {
+            // Deliberately not valid UTF-8 (a bare 0xFF, a truncated 0xC3 sequence) and split at
+            // arbitrary read boundaries: every decoded stderr path would turn these into U+FFFD.
+            let chunks =
+                [ [| 0uy; 0xFFuy; 0uy |]; [| 0xC3uy; 0x28uy |]; [| 0uy; 1uy; 2uy; 255uy |] ]
+
+            use stderr = new ChunkedByteStream(chunks)
+            let config = (Command.create "test").Config
+            use running = syntheticProcessOverStreams config None (Some(stderr :> Stream))
+
+            let! actualChunks = collect (running.StderrChunksAsync())
+
+            CollectionAssert.AreEqual([| 3; 2; 4 |], actualChunks |> Seq.map (fun chunk -> chunk.Length))
+
+            let actual =
+                actualChunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+
+            CollectionAssert.AreEqual(chunks |> Seq.collect id |> Seq.toArray, actual)
+
+            match! running.FinishAsync() with
+            | Ok finished ->
+                Assert.That(finished.Truncated, Is.False)
+
+                // The stderr BYTES went to this caller, so there is no text capture left to hand back.
+                Assert.That(finished.Stderr, Is.Empty)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StderrChunks is exclusive with every other consumer and is one-shot``() : Task =
+        task {
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes "diagnostics\n")
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes "payload\n")
+
+            use running =
+                syntheticProcessOverStreams
+                    (Command.create "test").Config
+                    (Some(stdout :> Stream))
+                    (Some(stderr :> Stream))
+
+            running.StderrChunksAsync() |> ignore
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StderrChunksAsync() |> ignore))
+            |> ignore
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutChunksAsync() |> ignore))
+            |> ignore
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutLinesAsync() |> ignore))
+            |> ignore
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.OutputEventsAsync() |> ignore))
+            |> ignore
+
+            match! running.OutputBytesAsync() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected an explicit consuming-verb refusal, got {other}"
+
+            match! running.WaitForLineAsync((fun _ -> true), TimeSpan.FromSeconds 1.0) with
+            | Error(ProcessError.Unsupported _) -> ()
+            | other -> Assert.Fail $"expected an explicit consuming-verb refusal, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StderrChunks is refused once another consumer owns the pipes``() : Task =
+        task {
+            // The other direction of the exclusivity above: this handle is claimed by the stdout chunk
+            // session, whose stderr is a capture for `FinishAsync` — so the byte stream can no longer be
+            // produced, and the claim gate says so instead of handing out a channel nothing fills.
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes "payload\n")
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes "diagnostics\n")
+
+            use running =
+                syntheticProcessOverStreams
+                    (Command.create "test").Config
+                    (Some(stdout :> Stream))
+                    (Some(stderr :> Stream))
+
+            running.StdoutChunksAsync() |> ignore
+
+            match Assert.Throws<InvalidOperationException>(Action(fun () -> running.StderrChunksAsync() |> ignore)) with
+            | null -> Assert.Fail "expected StderrChunksAsync to be refused once stdout chunks own the pipes"
+            | refused -> Assert.That(refused.Message, Does.Contain "already been consumed")
+        }
+        :> Task
+
+    // A run whose stderr never reaches the parent as its own pipe cannot have a byte-exact stderr
+    // stream at all. Each such wiring must answer with the typed `Unsupported` refusal — never an empty
+    // enumerable, which would read as "the child wrote nothing to stderr" — and must leave the handle
+    // unclaimed, because the refusal is decided before the pipes are claimed.
+    [<Test>]
+    member _.``StderrChunks refuses a MergeStderr run instead of handing out an empty stream``() : Task =
+        task {
+            let merged = (Command.create "test" |> Command.mergeStderr).Config
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes "merged output\n")
+            use running = syntheticProcessOverStreams merged (Some(stdout :> Stream)) None
+
+            let refusal =
+                Assert.Throws<ProcessException>(Action(fun () -> running.StderrChunksAsync() |> ignore))
+
+            match refusal with
+            | null -> Assert.Fail "a merged run must refuse StderrChunksAsync, not hand out a stream"
+            | refusal ->
+                match refusal.Error with
+                | ProcessError.Unsupported detail -> Assert.That(detail, Does.Contain "MergeStderr")
+                | other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+
+            // Refused before the claim: every other verb is still available on this handle.
+            match! running.OutputStringAsync() with
+            | Ok result -> Assert.That(result.Stdout, Does.Contain "merged output")
+            | Error error -> Assert.Fail $"a refused StderrChunksAsync must leave the handle claimable: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StderrChunks refuses a PTY run, whose one terminal device has no separate stderr``() : Task =
+        task {
+            use running =
+                FakeProcess.Create("tui").WithStdout("prompt> ").WithStderr("warn").WithPty().Build()
+
+            let refusal =
+                Assert.Throws<ProcessException>(Action(fun () -> running.StderrChunksAsync() |> ignore))
+
+            match refusal with
+            | null -> Assert.Fail "a PTY run must refuse StderrChunksAsync, not hand out a stream"
+            | refusal ->
+                match refusal.Error with
+                | ProcessError.Unsupported detail -> Assert.That(detail, Does.Contain "PTY")
+                | other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StderrChunks refuses a run that does not pipe stderr``() : Task =
+        task {
+            let config = (Command.create "test" |> Command.stderr StdioMode.Null).Config
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes "payload\n")
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            let refusal =
+                Assert.Throws<ProcessException>(Action(fun () -> running.StderrChunksAsync() |> ignore))
+
+            match refusal with
+            | null -> Assert.Fail "an unpiped stderr must refuse StderrChunksAsync, not hand out a stream"
+            | refusal ->
+                match refusal.Error with
+                | ProcessError.Unsupported detail -> Assert.That(detail, Does.Contain "does not pipe stderr")
+                | other -> Assert.Fail $"expected ProcessError.Unsupported, got {other}"
+        }
+        :> Task
+
+    // The stdout half of the session: read, framed, teed and handed to `OnStdoutLine` exactly as on
+    // every other session — so the child never blocks on a full stdout pipe — but retained nowhere,
+    // and refused loudly afterwards rather than answered with an empty stream (T-357 / KB K-163).
+    [<Test>]
+    member _.``StderrChunks drains stdout without retaining it, and refuses a later stdout consumer``() : Task =
+        task {
+            let seen = ResizeArray<string>()
+            let seenGate = obj ()
+            use teeSink = new MemoryStream()
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes "out-1\nout-2\n")
+            use stderr = new ChunkedByteStream([ [| 1uy; 2uy |] ])
+
+            let config =
+                (Command.create "test"
+                 |> Command.stdoutTee teeSink
+                 |> Command.onStdoutLine (fun line -> lock seenGate (fun () -> seen.Add line)))
+                    .Config
+
+            use running =
+                syntheticProcessOverStreams config (Some(stdout :> Stream)) (Some(stderr :> Stream))
+
+            let! chunks = collect (running.StderrChunksAsync())
+
+            CollectionAssert.AreEqual(
+                [| 1uy; 2uy |],
+                chunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+            )
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+
+            CollectionAssert.AreEqual([| "out-1"; "out-2" |], lock seenGate (fun () -> seen.ToArray()))
+            CollectionAssert.AreEqual(Encoding.UTF8.GetBytes "out-1\nout-2\n", teeSink.ToArray())
+            Assert.That(running.StdoutLineCount, Is.EqualTo 2)
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StdoutLinesAsync() |> ignore))
+            |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a StderrChunks session keeps a large unread stdout bounded in memory``() : Task =
+        task {
+            // The stderr twin of T-357's own measurement: this session hands stderr to the caller and
+            // has nowhere to return stdout, so ~48 MB of stdout must flow through the pump and be
+            // dropped rather than pinned for a reader that cannot exist. The budget sits far above the
+            // pump's own fixed buffers and far below the volume that flowed.
+            let lineCount = 12_000
+            use stdout = new GeneratedLinesStream(String('x', 4000), lineCount)
+            use stderr = new ChunkedByteStream([ [| 1uy; 2uy; 3uy |] ])
+            let budget = stdout.TotalBytes / 2L
+
+            use running =
+                syntheticProcessOverStreams
+                    (Command.create "test").Config
+                    (Some(stdout :> Stream))
+                    (Some(stderr :> Stream))
+
+            let before = GC.GetTotalMemory true
+            let! chunks = collect (running.StderrChunksAsync())
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+
+            let retainedBytes = GC.GetTotalMemory true - before
+            // Read through the handle only AFTER the measurement, so whatever it retained is provably
+            // still reachable when the heap is measured — and prove the volume really flowed.
+            Assert.That(chunks.Count, Is.EqualTo 1)
+            Assert.That(running.StdoutLineCount, Is.EqualTo lineCount)
+
+            Assert.That(
+                retainedBytes,
+                Is.LessThan budget,
+                "a StderrChunks session retained the child's stdout instead of discarding it"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StderrChunks Backpressure bounds unread chunks without losing bytes``() : Task =
+        task {
+            let capacity = 3
+            let chunks = [ for i in 0..29 -> [| byte i |] ]
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded capacity))
+                    .Config
+
+            use stderr = new ChunkedByteStream(chunks)
+            use running = syntheticProcessOverStreams config None (Some(stderr :> Stream))
+            let enumerable = running.StderrChunksAsync()
+
+            do! Task.Delay 200
+            Assert.That(stderr.ReadCount, Is.LessThanOrEqualTo(capacity + 2))
+
+            let! actualChunks = collect enumerable
+
+            let actual =
+                actualChunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+
+            CollectionAssert.AreEqual(chunks |> Seq.collect id |> Seq.toArray, actual)
+
+            match! running.FinishAsync() with
+            | Ok finished -> Assert.That(finished.Truncated, Is.False)
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // T-297's rule, on the stderr chunk channel: a raw chunk has no line structure, so the fail-loud
+    // overflow must not claim a `LineLimit`/`TotalLines` it never had, and must carry the real
+    // cumulative chunk bytes instead of a hardcoded `0`.
+    [<Test>]
+    member _.``StreamBuffer Error on StderrChunksAsync reports byte totals, not a false LineLimit``() : Task =
+        task {
+            let capacity = 2
+            let chunks = [ for i in 0..19 -> [| byte i |] ]
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.Error)))
+                    .Config
+
+            use stderr = new ChunkedByteStream(chunks)
+            use running = syntheticProcessOverStreams config None (Some(stderr :> Stream))
+
+            let! drain = drainWithDeadline (running.StderrChunksAsync()) 5000
+            let! error = processError drain
+
+            match error with
+            | Some(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes)) ->
+                Assert.That(lineLimit, Is.EqualTo None, "a raw stderr byte chunk is not a line")
+                Assert.That(byteLimit, Is.EqualTo None, "the channel's capacity bounds queued chunks, not bytes")
+                Assert.That(totalLines, Is.EqualTo 0)
+
+                Assert.That(
+                    totalBytes,
+                    Is.GreaterThan 0,
+                    "TotalBytes must report the real cumulative chunk bytes, not the hardcoded 0"
+                )
+            | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StderrChunks surfaces a genuine read fault as ProcessError.Io``() : Task =
+        task {
+            let fault = IOException "disk read error"
+            use stderr = new ErroringStream([ [| 0uy; 255uy; 0uy |] ], fault)
+
+            use running =
+                syntheticProcessOverStreams (Command.create "test").Config None (Some(stderr :> Stream))
+
+            let! drain = drainWithDeadline (running.StderrChunksAsync()) 5000
+            let! error = processError drain
+
+            match error with
+            | Some(ProcessError.Io _) -> ()
+            | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+
+            try
+                let! _ = running.FinishAsync()
+                Assert.Fail "expected FinishAsync to surface the same genuine read fault"
+            with :? ProcessException as pe ->
+                match pe.Error with
+                | ProcessError.Io _ -> ()
+                | other -> Assert.Fail $"expected ProcessError.Io from FinishAsync, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StderrChunks flushes a buffered StderrTee at clean EOF``() : Task =
+        task {
+            let payload = [| 0uy; 0xFFuy; 0uy; 1uy |]
+            use underlying = new MemoryStream()
+            use tee = new BufferedStream(underlying, 65536)
+            use stderr = new ChunkedByteStream([ payload ])
+
+            let config = (Command.create "test" |> Command.stderrTee tee).Config
+            use running = syntheticProcessOverStreams config None (Some(stderr :> Stream))
+
+            let! chunks = collect (running.StderrChunksAsync())
+            let actual = chunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+            CollectionAssert.AreEqual(payload, actual)
+            CollectionAssert.AreEqual(payload, underlying.ToArray())
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StopAsync completes after an unread bounded stderr chunk stream is abandoned``() : Task =
+        task {
+            let capacity = 1
+            let chunks = [ for i in 0..31 -> [| byte i |] ]
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded capacity))
+                    .Config
+
+            use stderr = new ChunkedByteStream(chunks)
+            use running = syntheticProcessOverStreams config None (Some(stderr :> Stream))
+            running.StderrChunksAsync() |> ignore
+
+            do! Task.Delay 100
+            Assert.That(stderr.ReadCount, Is.GreaterThanOrEqualTo(capacity + 1))
+
+            let stop = running.StopAsync(TimeSpan.Zero)
+            let! winner = Task.WhenAny(stop :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, stop), Is.True, "StopAsync hung on abandoned backpressure")
+            let! _ = stop
+            return ()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``FinishAsync releases an unread bounded stderr chunk stream and preserves the exit outcome``() : Task =
+        task {
+            let capacity = 1
+            let chunks = [ for i in 0..31 -> [| byte i |] ]
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded capacity))
+                    .Config
+
+            use stderr = new ChunkedByteStream(chunks)
+            use running = syntheticProcessOverStreams config None (Some(stderr :> Stream))
+            running.StderrChunksAsync() |> ignore
+
+            do! Task.Delay 100
+            Assert.That(stderr.ReadCount, Is.GreaterThanOrEqualTo(capacity + 1))
+
+            // The terminal verb must wake the pump parked on a full channel nobody is reading before it
+            // awaits the session outcome, or it would wait for the writer that is waiting for a reader.
+            let finish = running.FinishAsync()
+            let! winner = Task.WhenAny(finish :> Task, Task.Delay 5000)
+            Assert.That(obj.ReferenceEquals(winner, finish), Is.True, "FinishAsync hung on abandoned backpressure")
+
+            match! finish with
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+            | Error error -> Assert.Fail $"expected FinishAsync to preserve the process outcome, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``StderrChunks enumeration honours the enumerator's cancellation token``() : Task =
+        task {
+            use stderr = new ChunkedByteStream([ [| 1uy |]; [| 2uy |] ])
+
+            use running =
+                syntheticProcessOverStreams (Command.create "test").Config None (Some(stderr :> Stream))
+
+            use cts = new CancellationTokenSource()
+            let enumerator = running.StderrChunksAsync().GetAsyncEnumerator(cts.Token)
+            cts.Cancel()
+
+            try
+                let! _ = enumerator.MoveNextAsync()
+                Assert.Fail "a cancelled enumerator token must end the chunk stream, not keep yielding"
+            with :? OperationCanceledException ->
+                // The cancelled token wins over anything already queued — the documented contract of
+                // every streaming enumerator on this handle.
+                ()
+
+            do! enumerator.DisposeAsync()
+        }
+        :> Task
+
+    // The claim/discard race a second terminal consumer must lose LOUDLY, in both directions: a
+    // terminal `FinishAsync` that took no stderr stream has already drained those bytes away, and a
+    // session whose stream WAS taken hands out no second enumerator afterwards (KB K-163).
+    [<Test>]
+    member _.``a terminal FinishAsync refuses a later StderrChunks consumer``() : Task =
+        task {
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes "diagnostics\n")
+
+            use running =
+                syntheticProcessOverStreams (Command.create "test").Config None (Some(stderr :> Stream))
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StderrChunksAsync() |> ignore))
+            |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a second StderrChunks consumer after the terminal FinishAsync is refused``() : Task =
+        task {
+            use stderr = new ChunkedByteStream([ [| 7uy; 8uy |] ])
+
+            use running =
+                syntheticProcessOverStreams (Command.create "test").Config None (Some(stderr :> Stream))
+
+            let! chunks = collect (running.StderrChunksAsync())
+            Assert.That(chunks.Count, Is.EqualTo 1)
+
+            match! running.FinishAsync() with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"{error}"
+
+            Assert.Throws<InvalidOperationException>(Action(fun () -> running.StderrChunksAsync() |> ignore))
+            |> ignore
+        }
+        :> Task
+
+    // Test-double parity: the doubles must replay the SAME chunks a real run would hand out, including
+    // stderr bytes that are not valid in the command's stderr encoding (`FakeProcess.WithStderrBytes`,
+    // the stderr twin of `WithStdoutBytes`). Cassette replay reconstructs its handle through this very
+    // `FakeProcess` path, and `CassetteTests` covers that end of it.
+    [<Test>]
+    member _.``FakeProcess replays scripted stderr bytes verbatim through StderrChunks``() : Task =
+        task {
+            let payload = [| 0uy; 0xFFuy; 0xC3uy; 0x28uy |]
+            use running = FakeProcess.Create("fake").WithStderrBytes(payload).Build()
+
+            let! chunks = collect (running.StderrChunksAsync())
+
+            CollectionAssert.AreEqual(payload, chunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray)
+
+            match! running.FinishAsync() with
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ScriptedRunner replays scripted stderr through StderrChunks``() : Task =
+        task {
+            let scripted = ScriptedRunner().Fallback(Reply.Fail(2, "boom-1\nboom-2\n"))
+
+            match! (scripted :> IProcessRunner).SpawnAsync(Command.create "tool", CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use _ = running
+                let! chunks = collect (running.StderrChunksAsync())
+
+                CollectionAssert.AreEqual(
+                    Encoding.UTF8.GetBytes "boom-1\nboom-2\n",
+                    chunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+                )
+
+                match! running.FinishAsync() with
+                | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 2))
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    // The consumer-facing claim `docs/streaming.md` makes about byte-exact stderr in a test double:
+    // the doubles script stderr as TEXT and encode it on the way out with the stderr encoding of the
+    // command they stand in for — UTF-8 for a bare `FakeProcess.Create` double, the caller's own
+    // `Command.StderrEncoding` for a `ScriptedRunner` reply — so choosing that encoding is how a
+    // consumer (who has no byte-level scripting API on the doubles) decides the exact bytes the chunk
+    // stream hands out. Latin-1 is the total 0x00-0xFF mapping that makes every byte reachable.
+    [<Test>]
+    member _.``Scripted stderr text reaches StderrChunks as the command's encoding produced it``() : Task =
+        task {
+            let bare = "aé"
+            use running = FakeProcess.Create("fake").WithStderr(bare).Build()
+            let! bareChunks = collect (running.StderrChunksAsync())
+
+            CollectionAssert.AreEqual(
+                Encoding.UTF8.GetBytes bare,
+                bareChunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+            )
+
+            let payload = Array.init 256 byte
+
+            let scripted =
+                ScriptedRunner().Fallback(Reply.Fail(2, String(payload |> Array.map char)))
+
+            let command = Command.create "tool" |> Command.stderrEncoding Encoding.Latin1
+
+            match! (scripted :> IProcessRunner).SpawnAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok replayed ->
+                use _ = replayed
+                let! chunks = collect (replayed.StderrChunksAsync())
+
+                CollectionAssert.AreEqual(payload, chunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray)
+
+                match! replayed.FinishAsync() with
+                | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 2))
+                | Error error -> Assert.Fail $"{error}"
         }
         :> Task
 
