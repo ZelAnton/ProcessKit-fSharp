@@ -1345,6 +1345,45 @@ type StreamingTests() =
         }
         :> Task
 
+    // The consumer-facing claim `docs/streaming.md` makes about byte-exact stderr in a test double:
+    // the doubles script stderr as TEXT and encode it on the way out with the stderr encoding of the
+    // command they stand in for — UTF-8 for a bare `FakeProcess.Create` double, the caller's own
+    // `Command.StderrEncoding` for a `ScriptedRunner` reply — so choosing that encoding is how a
+    // consumer (who has no byte-level scripting API on the doubles) decides the exact bytes the chunk
+    // stream hands out. Latin-1 is the total 0x00-0xFF mapping that makes every byte reachable.
+    [<Test>]
+    member _.``Scripted stderr text reaches StderrChunks as the command's encoding produced it``() : Task =
+        task {
+            let bare = "aé"
+            use running = FakeProcess.Create("fake").WithStderr(bare).Build()
+            let! bareChunks = collect (running.StderrChunksAsync())
+
+            CollectionAssert.AreEqual(
+                Encoding.UTF8.GetBytes bare,
+                bareChunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray
+            )
+
+            let payload = Array.init 256 byte
+
+            let scripted =
+                ScriptedRunner().Fallback(Reply.Fail(2, String(payload |> Array.map char)))
+
+            let command = Command.create "tool" |> Command.stderrEncoding Encoding.Latin1
+
+            match! (scripted :> IProcessRunner).SpawnAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok replayed ->
+                use _ = replayed
+                let! chunks = collect (replayed.StderrChunksAsync())
+
+                CollectionAssert.AreEqual(payload, chunks |> Seq.collect (fun chunk -> chunk.ToArray()) |> Seq.toArray)
+
+                match! replayed.FinishAsync() with
+                | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 2))
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
     [<Test>]
     member _.``StopAsync completes after an unread bounded chunk stream is abandoned``() : Task =
         task {

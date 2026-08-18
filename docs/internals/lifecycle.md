@@ -3,9 +3,9 @@
 This page is the authoritative contributor reference for `RunningProcess` output ownership,
 exit observation, and teardown. The states below are conceptual names for the public modes. In
 the implementation, `Consumption` has `Fresh`, `Buffered`, `StdoutStreaming`,
-`StdoutChunkStreaming`, `EventStreaming`, and `Interactive`; the three session states below are
-mutually exclusive specializations of `Interactive`, and closing is tracked by the host and
-teardown guards rather than by another `Consumption` case.
+`StdoutChunkStreaming`, `StderrChunkStreaming`, `EventStreaming`, and `Interactive`; the three
+session states below are mutually exclusive specializations of `Interactive`, and closing is
+tracked by the host and teardown guards rather than by another `Consumption` case.
 
 For the consumer-facing contracts, see [Streaming](../streaming.md). This page concentrates on
 the transitions and ownership rules that code extending `RunningProcess` must preserve.
@@ -35,6 +35,8 @@ Buffered -> Closing/Disposed
 StdoutStreaming -> Closing/Disposed
   via FinishAsync, StopAsync, or disposal
 ChunkStreaming -> Closing/Disposed
+  via FinishAsync, StopAsync, or disposal
+StderrChunkStreaming -> Closing/Disposed
   via FinishAsync, StopAsync, or disposal
 EventStreaming -> Closing/Disposed
   via StopAsync or disposal

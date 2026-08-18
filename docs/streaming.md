@@ -333,9 +333,14 @@ decided before the pipes are claimed, so the handle is left untouched and every 
 available on it.
 
 `FakeProcess`, `ScriptedRunner`, and cassette replay hand out the same chunks a real run would, so a
-consumer of this verb is testable without a subprocess. A cassette records stderr as text, so a
-replayed stream is that recorded text in the command's stderr encoding; script arbitrary bytes into
-a double when a test needs stderr that no encoding round-trip survives.
+consumer of this verb is testable without a subprocess. A double scripts stderr as *text* and encodes
+it on the way out with the stderr encoding of the command it stands in for — UTF-8 for a
+`FakeProcess.Create` double, which templates a bare command, and your own `Command.StderrEncoding`
+for a `ScriptedRunner` reply or a cassette replay, whose recording is text a live run had already
+decoded. Choose that encoding when the exact bytes matter: under
+`Command.StderrEncoding(Encoding.Latin1)` a scripted reply reaches the chunk stream as the
+`0x00`–`0xFF` bytes its text maps to, verbatim. The doubles offer no byte-level stderr scripting, so
+stderr that no encoding round-trip reproduces belongs in a test against a real child process.
 
 ## Streaming NDJSON / JSON Lines
 
