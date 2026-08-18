@@ -440,6 +440,51 @@ type CommandTests() =
         Assert.Throws<ArgumentException>(Action(fun () -> Command.create "git" |> Command.okCodes [] |> ignore))
         |> ignore
 
+    // ---- Arg0 (POSIX argv[0] override) ---------------------------------------------------------
+
+    [<Test>]
+    member _.``Arg0 is unset by default``() =
+        Assert.That(Command.create("git").Config.Arg0, Is.EqualTo(None: string option))
+
+    [<Test>]
+    member _.``Arg0 records the value and the instance method matches the module function``() =
+        let viaModule = Command.create "busybox" |> Command.arg0 "ls"
+        let viaInstance = Command("busybox").Arg0 "ls"
+        Assert.That(viaModule.Config.Arg0, Is.EqualTo(Some "ls"))
+        Assert.That(viaInstance.Config.Arg0, Is.EqualTo(Some "ls"))
+
+    [<Test>]
+    member _.``Arg0 is immutable - setting it returns a new command``() =
+        let baseCommand = Command.create "busybox"
+        let withArg0 = baseCommand |> Command.arg0 "ls"
+        Assert.That(baseCommand.Config.Arg0, Is.EqualTo(None: string option))
+        Assert.That(withArg0.Config.Arg0, Is.EqualTo(Some "ls"))
+
+    [<Test>]
+    member _.``Arg0 is last-write-wins``() =
+        let command = Command.create "busybox" |> Command.arg0 "ls" |> Command.arg0 "-bash"
+
+        Assert.That(command.Config.Arg0, Is.EqualTo(Some "-bash"))
+
+    [<Test>]
+    member _.``Arg0 rejects an empty value``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> Command.create "busybox" |> Command.arg0 "" |> ignore))
+        |> ignore
+
+    [<Test>]
+    member _.``Arg0 rejects a null value``() =
+        let nullArg0 = Unchecked.defaultof<string>
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> Command.create "busybox" |> Command.arg0 nullArg0 |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``Arg0 rejects an embedded NUL``() =
+        Assert.Throws<ArgumentException>(Action(fun () -> Command.create "busybox" |> Command.arg0 "ls\000" |> ignore))
+        |> ignore
+
     // ---- Uid / Gid / User / Setsid (Unix privilege drop & session detach) ---------------------
 
     [<Test>]

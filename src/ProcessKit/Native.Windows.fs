@@ -917,6 +917,14 @@ module internal Windows =
     /// exit-after-pre-read and same-Job identity checks can be driven without a real PID-reuse race.
     let mutable isProcessInJobForTests: (nativeint -> nativeint -> bool) option = None
 
+    /// Test seam (internal, not public API): replaces the `OpenProcess` call `adoptIntoJob` makes for the
+    /// foreign process it is about to assign. The result carries a Win32 error code on failure, so the two
+    /// refusals a real adopt must classify apart — `ERROR_ACCESS_DENIED` (another user, a higher integrity
+    /// level, a protected process) and `ERROR_INVALID_PARAMETER` (the pid names nothing) — can be driven
+    /// deterministically, instead of pointing a test at a real protected process it must never actually
+    /// place in a kill-on-close Job. Mirrors `openMemberProcessForTests`. Production leaves it `None`.
+    let mutable adoptOpenProcessForTests: (int -> Result<nativeint, int>) option = None
+
     /// Test seam (internal, not public API): replaces the `OpenProcess` call the suspend/resume walk makes
     /// for each Job member. The result carries a Win32 error code on failure, so a test can drive the
     /// "proven gone" (`ERROR_INVALID_PARAMETER`) and "refused for some other reason" classifications apart
@@ -1676,16 +1684,24 @@ module internal Windows =
     ///    is a generic assign failure (e.g. the target exited between open and assign). Either way
     ///    `ProcessError.Adopt` with the specific detail.
     let adoptIntoJob (job: nativeint) (pid: int) : Result<unit, ProcessError> =
-        let handle =
-            OpenProcess(
-                PROCESS_SET_QUOTA ||| PROCESS_TERMINATE ||| PROCESS_QUERY_LIMITED_INFORMATION,
-                false,
-                uint32 pid
-            )
+        let opened =
+            match adoptOpenProcessForTests with
+            | Some hook -> hook pid
+            | None ->
+                let handle =
+                    OpenProcess(
+                        PROCESS_SET_QUOTA ||| PROCESS_TERMINATE ||| PROCESS_QUERY_LIMITED_INFORMATION,
+                        false,
+                        uint32 pid
+                    )
 
-        if handle = IntPtr.Zero then
-            let errno = Marshal.GetLastWin32Error()
+                if handle = IntPtr.Zero then
+                    Error(Marshal.GetLastWin32Error())
+                else
+                    Ok handle
 
+        match opened with
+        | Error errno ->
             let detail =
                 if errno = ERROR_INVALID_PARAMETER then
                     "the process does not exist (it exited before it could be adopted, or its pid was never valid)"
@@ -1695,7 +1711,7 @@ module internal Windows =
                     $"OpenProcess failed: {Win32Exception(errno).Message}"
 
             Error(ProcessError.Adopt(pid, detail))
-        else
+        | Ok handle ->
             try
                 if AssignProcessToJobObject(job, handle) then
                     Ok()
@@ -4376,12 +4392,14 @@ module internal Windows =
                 Error(ProcessError.Spawn(command.Program, ex.Message))
 
     let spawnWindows (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
-        // `Command.Umask`/`Uid`/`Gid`/`Groups`/`Setsid` are Unix-only primitives with no Windows
-        // equivalent (a file-mode creation mask, `setuid`/`setgid`/supplementary-group privilege drop,
-        // and a `setsid()` session detach). Honour each request honestly as `ProcessError.Unsupported`
-        // BEFORE any spawn work, rather than silently ignoring it — symmetric to the port's other
-        // Unix-only gates (e.g. every non-`Kill` `Signal` on Windows → `Unsupported` in `Backend.fs`).
-        // Reported one at a time; the first requested-but-unsupported knob names the failure.
+        // `Command.Umask`/`Uid`/`Gid`/`Groups`/`Setsid`/`Arg0` are Unix-only primitives with no Windows
+        // equivalent (a file-mode creation mask, `setuid`/`setgid`/supplementary-group privilege drop, a
+        // `setsid()` session detach, and a distinct `argv[0]` — `CreateProcessW` takes one raw command
+        // line, not an argv array with an independent first element). Honour each request honestly as
+        // `ProcessError.Unsupported` BEFORE any spawn work, rather than silently ignoring it — symmetric
+        // to the port's other Unix-only gates (e.g. every non-`Kill` `Signal` on Windows → `Unsupported`
+        // in `Backend.fs`). Reported one at a time; the first requested-but-unsupported knob names the
+        // failure.
         let config = command.Config
 
         if config.ExtraFds.Count > 0 then
@@ -4394,13 +4412,14 @@ module internal Windows =
                     $"Command.StopSignal({config.StopSignal}) on Windows; graceful stop uses the existing WM_CLOSE/CTRL+BREAK mechanisms and only the default Signal.Term contract is representable"
             )
         else
-            match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups with
-            | Some _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
-            | _, Some _, _, _, _ -> Error(ProcessError.Unsupported "uid")
-            | _, _, Some _, _, _ -> Error(ProcessError.Unsupported "gid")
-            | _, _, _, true, _ -> Error(ProcessError.Unsupported "setsid")
-            | _, _, _, _, Some _ -> Error(ProcessError.Unsupported "groups")
-            | None, None, None, false, None ->
+            match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups, config.Arg0 with
+            | Some _, _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
+            | _, Some _, _, _, _, _ -> Error(ProcessError.Unsupported "uid")
+            | _, _, Some _, _, _, _ -> Error(ProcessError.Unsupported "gid")
+            | _, _, _, true, _, _ -> Error(ProcessError.Unsupported "setsid")
+            | _, _, _, _, Some _, _ -> Error(ProcessError.Unsupported "groups")
+            | _, _, _, _, _, Some _ -> Error(ProcessError.Unsupported "arg0")
+            | None, None, None, false, None, None ->
                 match config.Pty with
                 | Some pty ->
                     // ConPTY needs Windows 10 1809+; probe the export rather than blind-calling so a pre-1809
@@ -4481,18 +4500,19 @@ module internal Windows =
     /// Launch `command` as a detached child — running, contained by nothing, unowned (see the section
     /// comment above). Returns its pid and the OS-reported start time, read while our own process handle
     /// is still open so the pid cannot have been recycled underneath the identity pair. The `Umask`/
-    /// `Uid`/`Gid`/`Groups`/`Setsid` Unix-only knobs are refused exactly as `spawnWindows` refuses them,
-    /// so the detached path diverges from the ordinary one only where detachment itself requires it.
+    /// `Uid`/`Gid`/`Groups`/`Setsid`/`Arg0` Unix-only knobs are refused exactly as `spawnWindows` refuses
+    /// them, so the detached path diverges from the ordinary one only where detachment itself requires it.
     let spawnDetachedWindows (command: Command) : Result<DetachedSpawn, ProcessError> =
         let config = command.Config
 
-        match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups with
-        | Some _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
-        | _, Some _, _, _, _ -> Error(ProcessError.Unsupported "uid")
-        | _, _, Some _, _, _ -> Error(ProcessError.Unsupported "gid")
-        | _, _, _, true, _ -> Error(ProcessError.Unsupported "setsid")
-        | _, _, _, _, Some _ -> Error(ProcessError.Unsupported "groups")
-        | None, None, None, false, None ->
+        match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups, config.Arg0 with
+        | Some _, _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
+        | _, Some _, _, _, _, _ -> Error(ProcessError.Unsupported "uid")
+        | _, _, Some _, _, _, _ -> Error(ProcessError.Unsupported "gid")
+        | _, _, _, true, _, _ -> Error(ProcessError.Unsupported "setsid")
+        | _, _, _, _, Some _, _ -> Error(ProcessError.Unsupported "groups")
+        | _, _, _, _, _, Some _ -> Error(ProcessError.Unsupported "arg0")
+        | None, None, None, false, None, None ->
             // Decide the launch (PATHEXT / effective-child-`PATH` substitution / cmd.exe batch wrapper)
             // BEFORE any handle is allocated, exactly as `spawnWindowsCore` does — an unsafe batch
             // argument, or a program the command's own overridden child `PATH` does not hold, is refused

@@ -90,6 +90,7 @@ module ProcessKit.CliClientModule
 
 class ProcessKit.Command
   member Arg(System.String) : ProcessKit.Command
+  member Arg0(System.String) : ProcessKit.Command
   member Args(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
   member CancelOn(System.Threading.CancellationToken) : ProcessKit.Command
   member CreateNoWindow() : ProcessKit.Command
@@ -157,6 +158,7 @@ class ProcessKit.Command
 
 module ProcessKit.CommandModule
   static member arg(System.String, ProcessKit.Command) : ProcessKit.Command
+  static member arg0(System.String, ProcessKit.Command) : ProcessKit.Command
   static member args(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Command) : ProcessKit.Command
   static member cancelOn(System.Threading.CancellationToken, ProcessKit.Command) : ProcessKit.Command
   static member create(System.String) : ProcessKit.Command
@@ -238,6 +240,7 @@ module ProcessKit.ConsoleEncoding
 
 class ProcessKit.ContainmentCapabilities
   property Adoption : ProcessKit.Capability { get }
+  property AdoptionByPid : ProcessKit.Capability { get }
   property Creation : ProcessKit.Capability { get }
   property Helpers : System.Collections.Generic.IReadOnlyList<ProcessKit.PlatformHelper> { get }
   property KillOnParentDeath : ProcessKit.Capability { get }
@@ -946,6 +949,7 @@ class ProcessKit.ProcessGroup
   :> System.IAsyncDisposable
   :> System.IDisposable
   member Adopt(System.Diagnostics.Process) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member AdoptByPid(System.Int32) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member Finalize() : System.Void
   member KillAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member MemberStats() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<ProcessKit.MemberStats>, ProcessKit.ProcessError>
@@ -1305,6 +1309,7 @@ class ProcessKit.RunningProcess
   member ProfileAsync(System.TimeSpan) : System.Threading.Tasks.Task<ProcessKit.RunProfile>
   member ResizeAsync(System.Int32, System.Int32) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member Signal(ProcessKit.Signal) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member StderrChunksAsync() : System.Collections.Generic.IAsyncEnumerable<System.ReadOnlyMemory<System.Byte>>
   member StdoutChunksAsync() : System.Collections.Generic.IAsyncEnumerable<System.ReadOnlyMemory<System.Byte>>
   member StdoutJsonLinesAsync<T>(System.Text.Json.JsonSerializerOptions) : System.Collections.Generic.IAsyncEnumerable<T>
   member StdoutJsonLinesAsync<T>(System.Text.Json.Serialization.Metadata.JsonTypeInfo<T>) : System.Collections.Generic.IAsyncEnumerable<T>

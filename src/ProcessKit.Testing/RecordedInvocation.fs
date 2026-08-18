@@ -28,6 +28,7 @@ type RecordedInvocation
     (
         program: string,
         args: IReadOnlyList<string>,
+        arg0: string option,
         cwd: string option,
         envNames: IReadOnlyList<string>,
         hasStdin: bool,
@@ -35,11 +36,15 @@ type RecordedInvocation
         verb: RunnerVerb
     ) =
 
-    /// The command's program (argv[0]).
+    /// The command's program — the executable that is launched and drives PATH/`PreferLocal` resolution.
     member _.Program = program
 
     /// The command's arguments, in order (never including the program itself).
     member _.Args = args
+
+    /// The `Command.Arg0` override of the child's `argv[0]`, when set — `None` for the ordinary case
+    /// where the child observes `Program` itself as `argv[0]`.
+    member _.Arg0 = arg0
 
     /// The command's working directory, or `None` when it inherited the parent's.
     member _.Cwd = cwd
@@ -80,6 +85,7 @@ type RecordedInvocation
         RecordedInvocation(
             command.Program,
             command.Arguments,
+            command.Config.Arg0,
             command.WorkingDirectory,
             envNames,
             command.Config.StdinSource.IsSome,

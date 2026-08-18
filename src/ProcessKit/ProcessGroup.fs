@@ -612,6 +612,14 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// recycled in the residual window cannot be fully ruled out by number alone — the honest limitation
     /// is documented, not hidden.
     ///
+    /// A caller who has only a number — from a pidfile, a registry, an FFI or IPC boundary — cannot use
+    /// this overload at all, and `AdoptByPid` is the door for that case: it takes an identity anchor of
+    /// its own for whatever the number currently names (the process object on Windows, cgroup membership
+    /// on cgroup v2, a re-verified start-time token on the POSIX process group) rather than trusting the
+    /// number. It is a strictly weaker guarantee than the pinning handle THIS overload gets on Windows,
+    /// because nothing can close the window before the call — so where a live `Process` is available, this
+    /// one stays the better choice.
+    ///
     /// **Per-platform behaviour** (honest and typed, never a silent no-op):
     ///  * **Windows (Job Object)** — `AssignProcessToJobObject`; supported with or without limits.
     ///  * **Linux cgroup v2** — writes the pid to the group's `cgroup.procs`; available only on a group
@@ -682,6 +690,115 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             GC.KeepAlive externalProcess
             result
 
+    /// Adopt an already-running **external** process into the container from a **bare pid** — the door for
+    /// a process this library did not start and for which the caller holds no `System.Diagnostics.Process`
+    /// at all: one an outside supervisor launched, one whose id came from a pidfile, a registry or an
+    /// FFI/IPC caller. `Adopt(Process)` covers only the case where a live `Process` object is in hand; this
+    /// takes the one identifier every such caller does have. Both are unchanged in what containment means:
+    /// kill-on-dispose, and participation in `Signal`/`Suspend`/`Resume`/`Members`/`MembersInfo`/`Stats`
+    /// and any resource limits.
+    ///
+    /// ### A pid is an address, not a handle
+    ///
+    /// The number is used to *find* the process; it is not what the group keeps afterwards. Once a process
+    /// is reaped the OS may give its number to an unrelated one, so this call captures an **identity
+    /// anchor of its own** for whatever the number names at the moment it runs, and binds the group to
+    /// that:
+    ///
+    ///  * **Windows (Job Object)** — the process **object**. The number is used exactly once, by this
+    ///    call's `OpenProcess`; `AssignProcessToJobObject` then puts that object into the Job, and the
+    ///    kernel keeps membership per object. Nothing later resolves the number again.
+    ///  * **Linux cgroup v2** — kernel-maintained **cgroup membership**, per task. A `/proc/<pid>/stat`
+    ///    start-time read on either side of the `cgroup.procs` write *detects* a number that changed hands
+    ///    across it (see the failure list below for what the call then does about it) — detection, not
+    ///    prevention.
+    ///  * **POSIX process group (macOS, or Linux without limits)** — the tracked pid **plus** the
+    ///    start-time token read here, **re-read before every later probe, signal, suspend/resume and
+    ///    teardown kill**, never once at adoption and then trusted. A number whose token no longer matches
+    ///    is dropped from the group and receives nothing.
+    ///
+    /// So a process that recycles the number *after* this call is rejected rather than signalled. What no
+    /// library can check for you is the window *before* it — whether `pid` still named the process you
+    /// meant by the time you passed it here. Look the number up as late as you can; where you can hold a
+    /// `Process`, `Adopt(Process)` closes even that window on Windows, because the caller's own open handle
+    /// pins the pid. The start-time token also carries one residual the other two anchors do not: its
+    /// resolution (a clock tick on Linux, a microsecond on macOS) cannot tell apart two processes that
+    /// occupied the number within the same tick.
+    ///
+    /// ### What the group covers
+    ///
+    /// Processes the adopted one had **already** spawned keep their original containment. What happens to
+    /// the ones it spawns *afterwards* follows the mechanism (`Mechanism`): on the **Job Object** and
+    /// **cgroup v2** a later fork joins the container with its parent, so the subtree grown from here is
+    /// contained; on the **POSIX process group** the process is tracked **individually** — signalled and
+    /// killed with the group, but its future forks are not, because POSIX has no primitive that moves a
+    /// foreign, already-`exec`ed process into another process group.
+    ///
+    /// ### Refusals — each typed, never a silent success
+    ///
+    ///  * `pid <= 0` and this process's **own** pid are refused with `ProcessError.Adopt` before any
+    ///    mechanism is consulted. Neither is an adoptable target and both are actively dangerous as a
+    ///    number: `0` means "the caller's own process group" to `kill`, a negative number addresses a
+    ///    process group rather than a process, and adopting this very process would enlist the caller in
+    ///    its own group's teardown.
+    ///  * a platform with **no start-time identity reader** on the POSIX process-group mechanism (the
+    ///    BSDs) returns `ProcessError.Unsupported`: there is no anchor to capture, and tracking a bare
+    ///    number would mean SIGKILLing whatever holds it at teardown. Never a silent downgrade to raw
+    ///    by-number containment.
+    ///  * a process this caller may **not signal** — another user's, or a protected/system one — is
+    ///    refused with `ProcessError.Adopt` on the POSIX process-group mechanism, which checks it with a
+    ///    `kill(pid, 0)` probe at adoption. Reading a start-time anchor proves only that the process can be
+    ///    *identified* (on Linux `/proc/<pid>/stat` is world-readable), never that it can be controlled,
+    ///    and a member this group could not signal or SIGKILL would be containment reported but not held.
+    ///    The Job Object and cgroup v2 mechanisms refuse the same case by construction, through the denied
+    ///    `OpenProcess`/`cgroup.procs` write below. The check is about the moment of adoption: a process
+    ///    that changes credentials afterwards is no more foreseeable here than one that exits afterwards.
+    ///  * a pid that names nothing, an identity that cannot be read (a `hidepid` `/proc` mount, another
+    ///    user's process on macOS), a denied `OpenProcess`/`cgroup.procs` write, a Windows assign the
+    ///    kernel refuses, or a number that changed hands *while this call ran*, all return
+    ///    `ProcessError.Adopt` with the specific cause. On cgroup v2 that last case has already written the
+    ///    stranger into this group's cgroup, so the call moves it back out into the parent cgroup and says
+    ///    so; where even that is refused, the message says the process stays a member of this group and
+    ///    will be killed by its teardown.
+    ///
+    /// ### Ownership: this group never reaps it
+    ///
+    /// Exactly as with `Adopt(Process)`, an adopted process is **not** this library's child: nothing here
+    /// `waitpid`s it, and no exit status for it is ever reported through this API — there is no
+    /// `RunningProcess` and no result to await, which is why this returns `Result<unit, _>`. The group can
+    /// *contain*, *signal*, *list* and *kill* it; its exit belongs to its real parent (an outside
+    /// supervisor, or `init` once it is reparented), and observing that exit is the caller's own business
+    /// — `Process.WaitForExitAsync()`/`HasExited` where a `Process` is available. One consequence to plan
+    /// for on the POSIX mechanism: a process that exits and is not reaped by its own parent becomes a
+    /// zombie, and a zombie still answers the identity probe, so a graceful `ShutdownAsync` waits out its
+    /// full grace on it and no kill can clear it — only its parent's `wait` can.
+    ///
+    /// Routed through the same lifecycle gate as the other control verbs: adopting into a released group
+    /// returns a non-transient `ProcessError.Unsupported` before touching the closed/removed native
+    /// container, never a use-after-teardown.
+    member this.AdoptByPid(pid: int) : Result<unit, ProcessError> =
+        // The two numbers that are never adoptable are refused HERE, before any backend sees them, so the
+        // guarantee is one rule for every mechanism rather than three implementations of it. Typed, not
+        // thrown: unlike a `null` argument (a programming error `Adopt` surfaces eagerly), a pid usually
+        // arrives from outside the program — a pidfile, a registry, an IPC message — so a bad one is data
+        // to report, not a contract violation to raise on.
+        if pid <= 0 then
+            Error(
+                ProcessError.Adopt(
+                    pid,
+                    "pid 0 and negative pids are not adoptable targets: 0 means 'the caller's own process group' to kill and 'self' to setpgid, and a negative number addresses a process group rather than a process — either would point this group's teardown somewhere it was never asked to reach"
+                )
+            )
+        elif pid = Environment.ProcessId then
+            Error(
+                ProcessError.Adopt(
+                    pid,
+                    "this process's own pid is not an adoptable target: it would enlist the caller in its own group's teardown, so disposing the group would kill the process that owns it"
+                )
+            )
+        else
+            this.WhenLive(fun () -> backend.AdoptByPid pid)
+
     /// Immediately hard-kill every process currently in the group (the honest name for the tree kill —
     /// no graceful signal). Idempotent; the group stays usable for further spawns. Returns `Result` for
     /// parity with the other tree-control verbs.
@@ -707,14 +824,15 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         this.WhenLive(fun () -> backend.KillTree())
 
     /// The pids of the processes currently in the group — a point-in-time snapshot. On Windows the
-    /// whole Job tree, on cgroup v2 the whole cgroup, on the POSIX fallback the tracked group leaders.
+    /// whole Job tree, on cgroup v2 the whole cgroup, on the POSIX fallback the tracked group leaders plus
+    /// any process adopted by pid (`AdoptByPid`) whose identity anchor still matches.
     member this.Members() : Result<IReadOnlyList<int>, ProcessError> =
         this.WhenLive(fun () -> backend.Members())
         |> Result.map (fun pids -> List.toArray pids :> IReadOnlyList<int>)
 
     /// An enriched, point-in-time snapshot of the group's members: the same pids `Members` reports, in
     /// the same platform matrix (the whole Job tree on Windows, the whole cgroup on cgroup v2, the tracked
-    /// group leaders on the POSIX fallback), each carrying its parent pid, executable image name, and
+    /// group leaders and any anchor-matching `AdoptByPid` member on the POSIX fallback), each carrying its parent pid, executable image name, and
     /// OS-reported start time **where the platform can honestly report them** — every enriching field is
     /// `option` and is `None` otherwise, never a fabricated value. A member that exits between the
     /// enumeration and its metadata read is **omitted** rather than filled with invented fields. The
@@ -835,7 +953,8 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
 
     /// A snapshot of the group's resource usage. On Windows this reads the Job Object's accounting
     /// (CPU + peak committed memory + I/O + active count); on cgroup v2 it reads the cgroup accounting;
-    /// on the POSIX fallback only the live group count is available. Errors once the group is released.
+    /// on the POSIX fallback only the live count (its tracked groups plus any anchor-matching `AdoptByPid`
+    /// member) is available. Errors once the group is released.
     member this.Stats() : Result<ProcessGroupStats, ProcessError> =
         this.WhenLive(fun () -> backend.Stats())
 

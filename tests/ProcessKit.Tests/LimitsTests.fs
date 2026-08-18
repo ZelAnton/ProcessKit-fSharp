@@ -82,6 +82,9 @@ type internal LimitContractBackend(initial: ResourceLimits, shouldFail: Resource
         member _.Adopt(_pid) =
             Error(ProcessError.Unsupported "LimitContractBackend does not adopt")
 
+        member _.AdoptByPid(_pid) =
+            Error(ProcessError.Unsupported "LimitContractBackend does not adopt by pid")
+
         member _.Release(_spawned) = ()
         member _.Wait(_handle) = task { return Outcome.Exited 0 }
         member _.PidOf(_spawned) = None
@@ -545,6 +548,41 @@ type LimitsTests() =
                         | Ok result -> Assert.That(result.Stdout, Is.EqualTo "local")
                 finally
                     Directory.Delete(root, true)
+        }
+        :> Task
+
+    // `WithCpuTimeMax` alone is NOT `WholeTreeAny` (see `Capabilities.chooseUsing`), so a group asking for
+    // only it always selects `Mechanism.ProcessGroup` — never the cgroup backend, even on Linux with
+    // cgroup v2 available — and spawns through `Native.Posix.withCpuTimeLimit`'s `/bin/sh` `RLIMIT_CPU`
+    // shim (T-376/R-01). `Command.Arg0` must be refused there rather than silently applied to the shim's
+    // own `argv[0]` while the real program (reached only through the shim's `exec "$@"`) keeps its
+    // unmodified name.
+    [<Test>]
+    member _.``Arg0 combined with a POSIX CpuTimeMax run is a typed Unsupported, not a silent misapplication to the RLIMIT_CPU shim``
+        ()
+        : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "Arg0/CpuTimeMax are both POSIX-only here"
+
+            let options = ProcessGroupOptions().WithCpuTimeMax(TimeSpan.FromSeconds 5.0)
+
+            match ProcessGroup.Create options with
+            | Error error -> Assert.Fail $"CPU-time limited group creation failed: {error}"
+            | Ok group ->
+                use group = group
+
+                let command =
+                    Command.create "/bin/sh"
+                    |> Command.arg0 "override"
+                    |> Command.args [ "-c"; "printf %s \"$0\"" ]
+
+                match! group.StartAsync command with
+                | Error(ProcessError.Unsupported _) -> ()
+                | Error error -> Assert.Fail $"expected ProcessError.Unsupported, got {error}"
+                | Ok running ->
+                    use _running = running
+                    Assert.Fail "Arg0 combined with CpuTimeMax should be Unsupported, not silently accepted"
         }
         :> Task
 
