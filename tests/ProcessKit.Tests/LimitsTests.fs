@@ -82,6 +82,9 @@ type internal LimitContractBackend(initial: ResourceLimits, shouldFail: Resource
         member _.Adopt(_pid) =
             Error(ProcessError.Unsupported "LimitContractBackend does not adopt")
 
+        member _.AdoptByPid(_pid) =
+            Error(ProcessError.Unsupported "LimitContractBackend does not adopt by pid")
+
         member _.Release(_spawned) = ()
         member _.Wait(_handle) = task { return Outcome.Exited 0 }
         member _.PidOf(_spawned) = None

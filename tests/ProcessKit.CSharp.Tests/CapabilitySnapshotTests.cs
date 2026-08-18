@@ -37,6 +37,7 @@ public class CapabilitySnapshotTests
         [
             capabilities.Creation,
             capabilities.Adoption,
+            capabilities.AdoptionByPid,
             capabilities.Pty,
             capabilities.PtyResize,
             capabilities.KillOnParentDeath,

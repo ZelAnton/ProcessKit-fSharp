@@ -1596,6 +1596,58 @@ type CassetteTests() =
                         | Error error -> Assert.Fail $"finish: {error}"
             })
 
+    // T-366: the byte-exact stderr stream must hold on a REPLAYED handle too — a replay reconstructs
+    // its handle through the same `FakeProcess` path a scripted double uses, so `StderrChunksAsync`
+    // hands back exactly the recorded stderr rather than diverging from a live run's contract. (A
+    // cassette records stderr as text, so what replays byte-for-byte is that recorded text in the
+    // command's stderr encoding; `StreamingTests` covers scripting arbitrary bytes into a double.)
+    [<Test>]
+    member _.``SpawnAsync replay streams the recorded stderr as byte chunks``() : Task =
+        withCassette (fun path ->
+            task {
+                let command = Command.create "server" |> Command.arg "start"
+                let recordedStderr = "warn-1\nwarn-2\n"
+
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(
+                                path,
+                                FixedBytesRunner(Encoding.UTF8.GetBytes "out\n", recordedStderr, 0)
+                            )
+
+                        let! _ = (runner recorder).OutputStringAsync(command, CancellationToken.None)
+                        recorder.Complete()
+                    }
+
+                match RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok replayer ->
+                    match! (runner replayer).SpawnAsync(command, CancellationToken.None) with
+                    | Error error -> Assert.Fail $"streaming replay failed: {error}"
+                    | Ok running ->
+                        use _ = running
+                        let received = ResizeArray<byte>()
+                        let enumerator = running.StderrChunksAsync().GetAsyncEnumerator()
+                        let mutable more = true
+
+                        while more do
+                            let! has = enumerator.MoveNextAsync()
+
+                            if has then
+                                received.AddRange(enumerator.Current.ToArray())
+                            else
+                                more <- false
+
+                        do! enumerator.DisposeAsync()
+
+                        CollectionAssert.AreEqual(Encoding.UTF8.GetBytes recordedStderr, received.ToArray())
+
+                        match! running.FinishAsync() with
+                        | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+                        | Error error -> Assert.Fail $"finish: {error}"
+            })
+
     [<Test>]
     member _.``record-mode SpawnAsync is unsupported``() : Task =
         withCassette (fun path ->

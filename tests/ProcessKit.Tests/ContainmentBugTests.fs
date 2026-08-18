@@ -30,6 +30,7 @@ type internal SyntheticBackend() =
     let mutable gracefulKillTreeCount = 0
     let mutable updateLimitsCount = 0
     let mutable adoptCount = 0
+    let mutable adoptByPidCount = 0
 
     let note (message: string) =
         lock gate (fun () -> violations.Add message)
@@ -80,6 +81,10 @@ type internal SyntheticBackend() =
     /// before touching native never increments this).
     member _.AdoptCount = lock gate (fun () -> adoptCount)
 
+    /// How many times a BARE-PID adopt actually reached the backend (a released group, or a pid the
+    /// public guard refuses up front, never increments this).
+    member _.AdoptByPidCount = lock gate (fun () -> adoptByPidCount)
+
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.ProcessGroup
 
@@ -108,6 +113,14 @@ type internal SyntheticBackend() =
             // our children, so — like the real backends — nothing is added to `tracked`/`reaped`.
             requireLive "Adopt"
             lock gate (fun () -> adoptCount <- adoptCount + 1)
+            Ok()
+
+        member _.AdoptByPid(_pid) =
+            // The bare-pid door runs the same lifecycle gate, so it is policed the same way and counted
+            // separately: a test can then tell which verb reached the backend, and the pid guards
+            // (`pid <= 0`, this process's own pid) are provable by this counter staying at zero.
+            requireLive "AdoptByPid"
+            lock gate (fun () -> adoptByPidCount <- adoptByPidCount + 1)
             Ok()
 
         member _.Release(spawned) =
@@ -230,6 +243,7 @@ type internal CtrlSignalRaceBackend() =
             Ok()
 
         member _.Adopt(_pid) = Ok()
+        member _.AdoptByPid(_pid) = Ok()
 
         member _.Release(spawned) =
             // The shared-run teardown detach: stop tracking this child (drops its ctrlGroups entry and
@@ -341,6 +355,7 @@ type internal InheritedPipeBackend() =
             Ok()
 
         member _.Adopt(_pid) = Ok()
+        member _.AdoptByPid(_pid) = Ok()
 
         member _.Release(spawned) =
             lock gate (fun () -> tracked.Remove spawned.Handle |> ignore)
@@ -759,6 +774,60 @@ type ContainmentBugTests() =
 
         Assert.Throws<ArgumentNullException>(Action(fun () -> group.Adopt(Unchecked.defaultof<Process>) |> ignore))
         |> ignore
+
+    [<Test>]
+    member _.``AdoptByPid refuses pid 0, a negative pid and this process's own pid before any backend``() =
+        // The two numbers that are never adoptable, refused at the public boundary so the guarantee holds
+        // on EVERY mechanism rather than three times over. Typed, not thrown: a pid usually arrives from
+        // outside the program (a pidfile, a registry, an IPC message), so a bad one is data to report.
+        // The backend counter staying at zero is what proves the refusal happens BEFORE any native adopt —
+        // a `kill(0, ...)`/`setpgid(0, ...)` would address the caller's own process group, and adopting
+        // our own pid would enlist this process in the teardown of the group it owns.
+        let backend = SyntheticBackend()
+        use group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+        for rejected in [ 0; -1; Environment.ProcessId ] do
+            match group.AdoptByPid rejected with
+            | Error(ProcessError.Adopt(pid, detail)) ->
+                Assert.That(pid, Is.EqualTo rejected)
+                Assert.That(String.IsNullOrWhiteSpace detail, Is.False, "a refusal must say why")
+            | other -> Assert.Fail $"expected a typed Adopt refusal for pid {rejected}, got {other}"
+
+        Assert.That(backend.AdoptByPidCount, Is.EqualTo 0, "a refused pid must never reach the backend")
+        Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+
+    [<Test>]
+    member _.``AdoptByPid after the group is released is non-transient and never touches the backend``() =
+        // The same lifecycle gate every other control verb runs: refused BEFORE the backend, so no
+        // AssignProcessToJobObject / cgroup.procs write / ledger entry can land on a torn-down container.
+        let backend = SyntheticBackend()
+        let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+        (group :> IDisposable).Dispose()
+
+        // A pid that is neither zero nor ours, so it passes the argument guards and is stopped only by
+        // the lifecycle gate. Nothing native is attempted, so the number itself is inert here.
+        match group.AdoptByPid 2_000_000_501 with
+        | Error err -> Assert.That(ProcessError.isTransient err, Is.False)
+        | Ok() -> Assert.Fail "AdoptByPid into a released group must fail, not silently succeed"
+
+        Assert.That(backend.AdoptByPidCount, Is.EqualTo 0, "a bare-pid adopt reached the backend after release")
+        Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
+
+    [<Test>]
+    member _.``AdoptByPid of a live pid on a live group reaches the backend exactly once``() =
+        // The happy path through the gate, and the proof that `Adopt` and `AdoptByPid` are two distinct
+        // doors rather than one dispatching to the other: only the bare-pid counter moves.
+        let backend = SyntheticBackend()
+        use group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+        match group.AdoptByPid 2_000_000_502 with
+        | Ok() ->
+            Assert.That(backend.AdoptByPidCount, Is.EqualTo 1)
+            Assert.That(backend.AdoptCount, Is.EqualTo 0, "the Process overload must not be involved")
+        | Error err -> Assert.Fail $"a live bare-pid adopt on the synthetic backend should succeed, got {err}"
+
+        Assert.That(backend.Violations, Is.Empty, String.Join("; ", backend.Violations))
 
     [<Test>]
     member _.``concurrent Dispose, DisposeAsync, and ShutdownAsync tear down exactly once``() : Task =

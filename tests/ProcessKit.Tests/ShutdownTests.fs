@@ -36,6 +36,7 @@ type private GracefulFaultBackend() =
 
         member _.Track(_spawned) = Ok()
         member _.Adopt(_pid) = Ok()
+        member _.AdoptByPid(_pid) = Ok()
         member _.Release(_spawned) = ()
         member _.Wait(_handle) = task { return Outcome.Exited 0 }
         member _.PidOf(_spawned) = None

@@ -1144,6 +1144,172 @@ type ProcessControlTests() =
         }
         :> Task
 
+    // --- ProcessGroup.AdoptByPid: the same, from a bare pid — no Process in hand at all (T-371) ---
+
+    [<Test>]
+    member _.``AdoptByPid places an external process into the group and kill-on-dispose reaps it``() : Task =
+        task {
+            // End to end on a REAL external process, from nothing but its number — the pidfile/registry/FFI
+            // case. This holds on every mechanism that can anchor the number: the Job Object (the process
+            // object behind one OpenProcess) and the POSIX process group (the start-time token, re-verified
+            // before the teardown kill). A host with no identity reader says so and is skipped.
+            let external = startExternalSleeper ()
+
+            try
+                use group = create ()
+
+                match group.AdoptByPid external.Id with
+                | Error(ProcessError.Unsupported message) ->
+                    Assert.Ignore $"this host cannot anchor a bare pid: {message}"
+                | Error error -> Assert.Fail $"AdoptByPid should succeed on this mechanism, got {error}"
+                | Ok() ->
+                    // It is a member of the group now, listed exactly like a process started into it.
+                    match group.Members() with
+                    | Ok pids -> Assert.That(pids, Does.Contain external.Id)
+                    | Error error -> Assert.Fail $"Members failed: {error}"
+
+                    // ...and kill-on-dispose reaps it, though we never started it and never reaped it —
+                    // the whole point of adoption, now reachable without a `Process` object.
+                    (group :> IDisposable).Dispose()
+
+                    let! _ = Task.WhenAny(external.WaitForExitAsync(), Task.Delay 5000)
+
+                    Assert.That(
+                        external.HasExited,
+                        Is.True,
+                        "kill-on-dispose should have reaped the pid-adopted process"
+                    )
+            finally
+                try
+                    if not external.HasExited then
+                        external.Kill true
+                with _ ->
+                    // Best-effort test cleanup: it was likely already killed by the group teardown, or the
+                    // handle is racing that teardown — nothing to recover here.
+                    ()
+
+                external.Dispose()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``AdoptByPid refuses pid 0 and this process's own pid with a typed error``() =
+        // The guards that hold on every platform, checked against a real group rather than a synthetic
+        // backend: neither number is adoptable, and neither is quietly accepted. (`0` addresses the
+        // caller's own process group to `kill`; our own pid would put this process under the teardown of
+        // the group it owns.)
+        use group = create ()
+
+        for rejected in [ 0; Environment.ProcessId ] do
+            match group.AdoptByPid rejected with
+            | Error(ProcessError.Adopt(pid, detail)) ->
+                Assert.That(pid, Is.EqualTo rejected)
+                Assert.That(String.IsNullOrWhiteSpace detail, Is.False)
+            | other -> Assert.Fail $"expected a typed Adopt refusal for pid {rejected}, got {other}"
+
+    [<Test>]
+    member _.``AdoptByPid of a pid that names nothing is an honest typed error``() =
+        // The lost adopt-vs-exit race, from the number alone: there is no `Process` to ask `HasExited`, so
+        // the mechanism's own probe is what answers — an OpenProcess that reports the pid does not exist,
+        // or a start-time identity that cannot be read. Either way a typed refusal, never a silent
+        // success that would leave the caller believing something is contained.
+        use group = create ()
+
+        // Far above any live pid on both platforms (Linux's pid_max ceiling and the Windows pid space),
+        // so it names nothing on a healthy host.
+        match group.AdoptByPid 2_000_000_601 with
+        | Error(ProcessError.Adopt _) -> ()
+        | Error(ProcessError.Unsupported message) -> Assert.Ignore $"this host cannot anchor a bare pid: {message}"
+        | other -> Assert.Fail $"expected ProcessError.Adopt for a pid that names nothing, got {other}"
+
+    [<Test>]
+    member _.``AdoptByPid reports a denied open as a typed refusal, never as containment (Windows)``() =
+        // The permission-denied case: another user's process, a higher integrity level, a protected
+        // process. Driven through the adopt's own OpenProcess seam rather than by pointing the test at a
+        // real protected process — which it must never actually place in a kill-on-close Job — so the
+        // classification is deterministic and the assertion is about what the caller is told.
+        if not isWindows then
+            Assert.Ignore "the OpenProcess rights this classifies are Windows-only"
+        else
+            use group = create ()
+
+            Windows.adoptOpenProcessForTests <- Some(fun _pid -> Error WindowsMemberControlInterop.ERROR_ACCESS_DENIED)
+
+            try
+                match group.AdoptByPid 2_000_000_602 with
+                | Error(ProcessError.Adopt(_, detail)) ->
+                    Assert.That(
+                        detail.Contains("access denied", StringComparison.OrdinalIgnoreCase),
+                        Is.True,
+                        $"a denied open must say so; got: {detail}"
+                    )
+                | other -> Assert.Fail $"expected ProcessError.Adopt for a denied open, got {other}"
+
+                // The same seam proves the neighbouring classification is not collapsed into it: a pid
+                // that names nothing is reported as gone, not as denied.
+                Windows.adoptOpenProcessForTests <-
+                    Some(fun _pid -> Error WindowsMemberControlInterop.ERROR_INVALID_PARAMETER)
+
+                match group.AdoptByPid 2_000_000_603 with
+                | Error(ProcessError.Adopt(_, detail)) ->
+                    Assert.That(
+                        detail.Contains("does not exist", StringComparison.Ordinal),
+                        Is.True,
+                        $"a missing pid must be reported as missing; got: {detail}"
+                    )
+                | other -> Assert.Fail $"expected ProcessError.Adopt for a pid that names nothing, got {other}"
+            finally
+                Windows.adoptOpenProcessForTests <- None
+
+    [<Test>]
+    member _.``AdoptByPid tracks a real external process on the POSIX process group (non-Windows)``() : Task =
+        task {
+            // The mechanism that cannot `Adopt` a `Process` at all CAN take a bare pid: it contains by
+            // tracking, and the start-time anchor makes tracking a foreign number safe. This is the real
+            // end-to-end proof on Linux/macOS — a real process, its real `/proc`/`proc_pidinfo` identity,
+            // and a real SIGKILL at teardown.
+            if isWindows then
+                Assert.Ignore "the POSIX process-group mechanism only; Windows adopts through the Job Object"
+            else
+                let external = startExternalSleeper ()
+
+                try
+                    use group = create ()
+
+                    if group.Mechanism <> Mechanism.ProcessGroup then
+                        Assert.Ignore $"this test is about the pgid mechanism, not {group.Mechanism}"
+
+                    match group.AdoptByPid external.Id with
+                    | Error(ProcessError.Unsupported message) ->
+                        // A POSIX host with no start-time reader (the BSDs) refuses honestly rather than
+                        // tracking the bare number — the contract this branch exists to keep.
+                        Assert.Ignore $"this host ships no identity reader: {message}"
+                    | Error error -> Assert.Fail $"AdoptByPid should succeed where an anchor is readable, got {error}"
+                    | Ok() ->
+                        match group.Members() with
+                        | Ok pids -> Assert.That(pids, Does.Contain external.Id, "an adopted pid is a group member")
+                        | Error error -> Assert.Fail $"Members failed: {error}"
+
+                        // The group's own signal reaches it, though we never started it.
+                        match group.Signal Signal.Term with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"Signal failed: {error}"
+
+                        let! _ = Task.WhenAny(external.WaitForExitAsync(), Task.Delay 5000)
+
+                        Assert.That(external.HasExited, Is.True, "the adopted process must receive the group's signal")
+                finally
+                    try
+                        if not external.HasExited then
+                            external.Kill true
+                    with _ ->
+                        // Best-effort cleanup; the sleeper exits on its own if the test outlives it.
+                        ()
+
+                    external.Dispose()
+        }
+        :> Task
+
     [<Test>]
     member _.``Adopt on the POSIX process-group mechanism is an honest Unsupported (non-Windows)``() : Task =
         task {

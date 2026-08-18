@@ -59,4 +59,23 @@ public class StreamingAndProcessGroupTests
         Assert.That(members.IsOk, Is.False);
         Assert.That(members.ErrorValue.IsUnsupported, Is.True);
     }
+
+    [Test]
+    public void AdoptByPid_is_usable_from_CSharp_and_refuses_this_process_by_its_own_pid()
+    {
+        // The bare-pid door exists mainly for callers who hold nothing but a number — a pidfile, a
+        // registry, an FFI/IPC boundary — which is exactly the shape a C# orchestrator arrives in. Read
+        // here the way such a caller reads it: an `int` in, a `Result` out, no F# pattern matching.
+        using var group = ProcessGroup.Create().GetValueOrThrow();
+
+        var refused = group.AdoptByPid(Environment.ProcessId);
+
+        Assert.That(refused.IsOk, Is.False, "adopting our own pid would enlist us in our own group's teardown");
+        Assert.That(refused.ErrorValue.IsAdopt, Is.True);
+        Assert.That(refused.ErrorValue.Message, Is.Not.Empty);
+
+        // The capability snapshot answers the same question up front, and its own axis for it.
+        var adoption = ProcessGroup.Capabilities().AdoptionByPid;
+        Assert.That(adoption.IsAvailable || adoption.IsQualified || adoption.IsUnsupported, Is.True);
+    }
 }
