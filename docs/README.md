@@ -66,7 +66,9 @@ bookkeeping or best-effort signals to individual PIDs:
 - **Windows:** a Job Object.
 - **Linux:** cgroup v2 when resource limits are requested and available; otherwise a POSIX process
   group.
-- **macOS / BSD:** a POSIX process group.
+- **FreeBSD:** the `procctl(2)` process reaper, falling back to a POSIX process group if reaper
+  status cannot be acquired.
+- **macOS and the other BSDs:** a POSIX process group.
 
 `ProcessGroup.Mechanism` reports which primitive was selected, so code can verify its containment
 environment instead of assuming one. See [Process groups](process-groups.md) and
