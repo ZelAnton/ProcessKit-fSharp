@@ -41,6 +41,18 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // under the lifecycle lock alongside the backend call it reflects.
     let mutable currentOptions = options
 
+    // The STICKY record of which resource-limit axes this group has ever configured — recorded here at
+    // construction and again at every `UpdateLimits` call (see that member: an axis it NAMES joins this
+    // record whether the apply then succeeds or fails), so `LimitEvidence` stays honest even after a cap
+    // is later lifted. Read only under `sync`, alongside the backend call it feeds.
+    let mutable cappedAxes = CappedAxes.None.Record options.Limits
+
+    // The evidence captured exactly once, from the still-live backend, in `hardRelease` — the instant
+    // before its counters (and, for a Linux cgroup v2 group, the cgroup directory itself) are torn down.
+    // `None` until teardown has run; `Some` forever after, so any number of later `LimitEvidence()` reads
+    // return this same immutable snapshot rather than a stale or re-derived one.
+    let mutable capturedLimitEvidence: LimitEvidence option = None
+
     let waitOutcome (handle: nativeint) : Task<Outcome> = backend.Wait handle
 
     // Spawn + track as one transaction. The caller runs this under `sync` (via `WhenLive`) so the whole
@@ -73,7 +85,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // work (SIGKILL + waitpid + close), so holding the monitor across it is fine — unlike ShutdownAsync's
     // unbounded graceful wait, which is deliberately kept OFF the lock.
     let hardRelease () =
-        lock sync (fun () -> backend.HardRelease())
+        lock sync (fun () ->
+            // Capture the limit evidence from the STILL-LIVE backend before it tears the container down —
+            // the cgroup v2 counters this reads (and the directory itself) do not survive `HardRelease`.
+            // Runs inside the same critical section as every other backend call here, so it can never
+            // interleave with a concurrent `LimitEvidence()` read (which also takes `sync`).
+            capturedLimitEvidence <- Some(backend.LimitEvidence cappedAxes)
+            backend.HardRelease())
 
     let releaseContainer () =
         if claimRelease () then
@@ -939,6 +957,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// as authoritative there — never a silent divergence.
     member this.UpdateLimits(limits: ResourceLimits) : Result<unit, ProcessError> =
         this.WhenLive(fun () ->
+            // Record every axis THIS request names on the sticky evidence record BEFORE attempting the
+            // apply, whether it then succeeds or fails (see `LimitEvidence()`'s own doc comment): neither
+            // backend applies its caps atomically, so a failure part-way through can still have reached
+            // the OS for one axis of this request, and recording only on success would let a later
+            // `LimitEvidence()` answer `NotTripped` for it without ever reading a counter.
+            cappedAxes <- cappedAxes.Record limits
+
             match backend.UpdateLimits limits with
             | Ok() ->
                 // Reflect the new caps only after the backend confirms they fully applied.
@@ -957,6 +982,49 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// member) is available. Errors once the group is released.
     member this.Stats() : Result<ProcessGroupStats, ProcessError> =
         this.WhenLive(fun () -> backend.Stats())
+
+    /// Post-run, per-axis evidence of whether a resource cap this group ever configured actually **fired**
+    /// — the question a plain exit code or signal cannot answer, and the other side of
+    /// `ProcessError.ResourceLimit` (which answers "could the cap be applied at all", never "did it
+    /// fire"). One `LimitVerdict` (`Tripped`/`NotTripped`/`Unknown`) per axis — `Memory`/`Processes`/`Cpu`
+    /// — read from the container's own authoritative post-mortem counters, never re-derived from the
+    /// `ResourceLimits` that requested the cap and never inferred from the run's exit code or signal (a
+    /// cap-driven kill and a self-inflicted crash can look identical from the outside — see
+    /// `LimitVerdict`'s own doc comment).
+    ///
+    /// **Available only after the group has been torn down** — `ShutdownAsync`/`Dispose`/`DisposeAsync`,
+    /// or the finalizer — deliberately the OPPOSITE lifetime rule `Stats()` follows. The evidence is
+    /// captured exactly once, from the still-live container, in the instant immediately before its
+    /// counters (and, for a Linux cgroup v2 group, the cgroup directory itself) are torn down, and is then
+    /// cached: any number of later reads — including well after teardown, on any thread — return that
+    /// same immutable snapshot rather than a re-derived or stale one. Calling this **before** teardown has
+    /// completed returns a non-transient `ProcessError.Unsupported`: an honest "not yet available", never
+    /// a fabricated verdict read off counters that are still changing.
+    ///
+    /// Per axis, deliberately never folded into one whole-group verdict — see `LimitVerdict` for what each
+    /// value means, and `LimitEvidence` for why folding would misrepresent "no evidence" as "no" (and for
+    /// why `IoMax`/`CpuAffinity` have no axis here at all). Only the Linux cgroup v2 mechanism can ever
+    /// answer `Tripped`/`NotTripped` from real evidence (see `Native.Cgroup.limitEvidence` for exactly
+    /// which kernel counters back each axis, and `LimitEvidence.Cpu` for the further `CpuTimeMax`
+    /// refinement that applies on every mechanism). The two mechanisms differ in what they say about an
+    /// axis this group never capped: a Windows Job Object keeps no post-mortem record that any of these
+    /// caps fired, so every axis it ever capped reads `Unknown` — not an oversight, a measured conclusion
+    /// about what it actually preserves after the fact — but an axis it never capped still reads
+    /// `NotTripped` (nothing was capped, so nothing could fire) without touching native at all. The POSIX
+    /// process-group fallback has no whole-tree resource-accounting apparatus whatsoever — the same reason
+    /// `Create`/`UpdateLimits` refuse any whole-tree cap on it — so it answers `Unknown` on every axis
+    /// UNCONDITIONALLY, including one this group never capped: there is no "nothing was capped" case that
+    /// lets it read `NotTripped` the way a Job Object can, because it never had any evidence apparatus to
+    /// begin with.
+    member this.LimitEvidence() : Result<LimitEvidence, ProcessError> =
+        lock sync (fun () ->
+            match capturedLimitEvidence with
+            | Some evidence -> Ok evidence
+            | None ->
+                Error(
+                    ProcessError.Unsupported
+                        "limit evidence is captured from the container's own post-mortem counters at teardown; call ShutdownAsync/Dispose/DisposeAsync first, then read LimitEvidence() — it is not available on a still-live group"
+                ))
 
     /// A periodic `ProcessGroupStats` series: the first sample immediately, then one per `interval`.
     /// **Pull-based** — it samples only as the enumeration is pulled and runs no background task, so
@@ -978,7 +1046,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// build a `RunningProcess` over the shared group and run it to completion via the `RunningProcess`
     /// verb, so encoding, line-ending/BOM/trailing-newline normalization, `OkCodes`, and
     /// `OutputBufferPolicy` all match every other runner. If the (CancelOn-linked) token fires, just this
-    /// child is killed and the run resolves to `ProcessError.Cancelled`. The child's I/O is detached on
+    /// child is torn down and the run resolves to `ProcessError.Cancelled` — an immediate hard kill unless
+    /// the command sets `CancelGrace`, which soft-signals this child first and escalates to the same kill
+    /// after the grace (a shared group has no per-child graceful path beyond that soft signal, the
+    /// documented shared-group scope). The child's I/O is detached on
     /// completion (via the run's teardown); the group keeps owning the child until `ShutdownAsync`/`Dispose`.
     member private this.CaptureShared
         (command: Command)

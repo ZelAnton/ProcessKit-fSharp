@@ -117,7 +117,11 @@ the chain has one broadcast soft-stop phase.
 A command's [`Timeout`](timeouts-and-cancellation.md) and `CancelOn` token **bound
 the stream**: at the deadline (or on cancellation) the tree is killed, the pipes
 close, and the stream ends — a streamed run can't hang past its deadline. After a
-cancelled run, `FinishAsync()` reports `ProcessError.Cancelled`.
+cancelled run, `FinishAsync()` reports `ProcessError.Cancelled`. A cancellation kills
+immediately unless the command sets
+[`CancelGrace`](timeouts-and-cancellation.md#graceful-cancellation), which gives the
+tree its own soft signal → grace → hard-kill ladder first; the reported error is the
+same either way.
 
 ## Streaming stdout line by line
 

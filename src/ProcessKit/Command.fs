@@ -179,6 +179,18 @@ type internal CommandConfig =
       // idle deadline. A pipeline stage cannot honour it (rejected by `PipelineStageGuard`).
       IdleTimeout: TimeSpan option
       CancelOn: CancellationToken option
+      // Opt-in graceful teardown for a run torn down by a fired CANCELLATION token (the verb's own,
+      // `CancelOn`, `Pipeline.CancelOn`, or a `Supervisor` incarnation's): send `CancelSignal`, give the
+      // tree up to this long to leave on its own, then escalate to the ordinary hard kill. `None` (the
+      // default) is the historical immediate hard kill, byte for byte. Deliberately INDEPENDENT of
+      // `TimeoutGrace`/`StopSignal` — "the caller changed its mind" and "the deadline expired" are
+      // different events, and neither knob gap-fills the other.
+      CancelGrace: TimeSpan option
+      // The soft signal that opens a `CancelGrace` window. `None` (the default) means `Signal.Term`,
+      // matching `StopSignal`'s default. Inert without `CancelGrace` (there is no soft tier to send it
+      // on), and — exactly like `StopSignal` — a non-default value is refused at spawn on Windows, which
+      // cannot represent an arbitrary POSIX signal.
+      CancelSignal: Signal option
       Retry: (int * RetryDelayPolicy * Func<ProcessError, bool>) option
       // Production jitter uses Random.Shared. Tests replace this immutable seam so exponential retry
       // delays can be asserted exactly while still exercising the command's TimeProvider timers.
@@ -333,6 +345,8 @@ module internal CommandConfig =
           StopSignal = Signal.Term
           IdleTimeout = None
           CancelOn = None
+          CancelGrace = None
+          CancelSignal = None
           Retry = None
           RetryJitterSource = fun () -> Random.Shared.NextDouble()
           RetryDisabled = false
@@ -354,6 +368,14 @@ module internal CommandConfig =
           Pty = None
           Logger = None
           RunId = None }
+
+    /// The soft signal a graceful CANCELLATION teardown opens with: `Command.CancelSignal` when set,
+    /// otherwise `Signal.Term` — the same default `StopSignal` carries. One resolver, so every path that
+    /// drives the cancellation ladder (the completion verbs, a pipeline chain, a supervised incarnation)
+    /// sends the same signal and the Windows spawn refusal can screen exactly the value that would be
+    /// sent. Deliberately does NOT fall back to `StopSignal`: the two knobs are independent by contract.
+    let cancelSignal (config: CommandConfig) =
+        config.CancelSignal |> Option.defaultValue Signal.Term
 
     /// Reject a string carrying an embedded NUL (`'\000'`) at the `Command`/`CommandConfig` builder
     /// boundary. POSIX argv/environment marshalling treats a NUL byte as the end of a string (or, for
@@ -1258,10 +1280,65 @@ type Command internal (config: CommandConfig) =
     /// token nor the token passed to `StartAsync` is tracked. A live handle is caller-driven — cancel or
     /// reap it yourself: dispose it, call its `Kill`, or register your own callback on the token that calls
     /// `Kill`.
+    ///
+    /// The teardown is an **immediate hard kill** by default; add `CancelGrace` (and optionally
+    /// `CancelSignal`) to route it through a soft signal → grace → hard kill ladder instead. The outcome
+    /// is unchanged either way — a cancelled run is always `ProcessError.Cancelled`.
     member _.CancelOn(cancellationToken: CancellationToken) =
         Command(
             { config with
                 CancelOn = Some cancellationToken }
+        )
+
+    /// Make a **cancellation** graceful: when the token that cancels this run fires, its tree is sent
+    /// `CancelSignal` (default `Signal.Term`), given up to `grace` to leave on its own, and only then
+    /// hard-killed — the cancellation mirror of `TimeoutGrace`, for the "one shared token, cancelled on
+    /// Ctrl-C" shutdown pattern where every child would otherwise be killed outright.
+    ///
+    /// **Opt-in, and off by default.** Without it a cancellation hard-kills the tree at once, exactly as
+    /// before. It applies to every cancellation source a run has — the verb's own `CancellationToken`,
+    /// this command's `CancelOn` (including one inherited from `CliClient.WithDefaults`),
+    /// `Pipeline.CancelOn` (set it on stage 0, which owns the pipeline-wide control configuration), and a
+    /// `Supervisor` incarnation's cancellation — and to buffered and streamed completion verbs alike. The
+    /// streamed one, `FirstLineAsync`, therefore waits for the ladder to conclude before it answers
+    /// `Cancelled` — returning is what reaps its tree, so answering sooner would collapse the very window
+    /// this knob opens. The wait is bounded by `grace`; without this knob it answers immediately, as before.
+    ///
+    /// **The outcome does not change: a cancelled run is still always an error.** Every consuming path
+    /// still reports `ProcessError.Cancelled`, whether the child left on the soft signal or was killed
+    /// after the grace; only the manner of the goodbye becomes gentler, so a child that must flush state,
+    /// remove a pidfile, or finish a transaction gets the chance to.
+    ///
+    /// **Independent of `Timeout`/`TimeoutGrace`/`StopSignal`,** whose behaviour is untouched: a deadline
+    /// that expires still uses `TimeoutGrace`/`StopSignal` (or hard-kills when unset), and neither pair
+    /// gap-fills the other. It needs no `Timeout` of its own.
+    ///
+    /// **Scope, like the rest of cancellation:** a run that owns its group tears down the whole tree; a
+    /// run sharing a `ProcessGroup` reaches only its own direct child (the documented shared-group
+    /// teardown gap). On **Windows** the soft tier is the documented best-effort one — a `WM_CLOSE` to a
+    /// windowed child plus a CTRL+BREAK to a child started with `WindowsCtrlSignals()` — and the hard kill
+    /// still lands when the grace elapses; a non-default `CancelSignal` is refused at spawn rather than
+    /// silently downgraded. A negative `grace` is rejected (`ArgumentOutOfRangeException`), matching
+    /// `TimeoutGrace`; `TimeSpan.Zero` escalates immediately.
+    member _.CancelGrace(grace: TimeSpan) =
+        ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero)
+
+        Command({ config with CancelGrace = Some grace })
+
+    /// Choose the soft signal that opens a `CancelGrace` window. The default is `Signal.Term`, exactly
+    /// like `StopSignal`'s. Deliberately independent of `StopSignal`: a command may want a different
+    /// farewell for "the caller changed its mind" than for "the deadline expired", and neither knob
+    /// gap-fills the other.
+    ///
+    /// Inert without `CancelGrace` — there is no soft tier to send it on. Windows refuses a non-default
+    /// value at spawn with `ProcessError.Unsupported` (it cannot faithfully represent an arbitrary POSIX
+    /// signal), exactly as `StopSignal` does, never a silent downgrade to the hard kill.
+    member _.CancelSignal(signal: Signal) =
+        SignalValidation.gracefulStop (nameof signal) signal
+
+        Command(
+            { config with
+                CancelSignal = Some signal }
         )
 
     /// Run the command up to `maxAttempts` times **in total** (the initial run plus up to
@@ -1839,6 +1916,14 @@ module Command =
 
     /// Also cancel the run when `cancellationToken` fires.
     let cancelOn (cancellationToken: CancellationToken) (command: Command) = command.CancelOn cancellationToken
+
+    /// Tear a CANCELLED run down gracefully: soft signal, up to `grace` to leave, then the hard kill.
+    /// Independent of `timeoutGrace`; the outcome stays `ProcessError.Cancelled` either way.
+    let cancelGrace (grace: TimeSpan) (command: Command) = command.CancelGrace grace
+
+    /// Choose the soft signal that opens a `cancelGrace` window (default `Signal.Term`). Inert without
+    /// `cancelGrace`, and independent of `stopSignal`.
+    let cancelSignal (signal: Signal) (command: Command) = command.CancelSignal signal
 
     /// Run the command up to `maxAttempts` times in total (initial run plus retries), waiting `delay`
     /// between attempts (`0`/`1` both mean a single run). A negative `delay` is rejected; delays

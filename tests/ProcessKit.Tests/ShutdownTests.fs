@@ -61,6 +61,9 @@ type private GracefulFaultBackend() =
 
         member _.UpdateLimits(_limits) = Ok()
 
+        member _.LimitEvidence(_capped) =
+            LimitEvidence(LimitVerdict.Unknown, LimitVerdict.Unknown, LimitVerdict.Unknown)
+
         member _.HardRelease() =
             hardReleaseCount <- hardReleaseCount + 1
 

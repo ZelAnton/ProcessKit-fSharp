@@ -142,6 +142,10 @@ independent knobs on `Command`, fully covered in
   hard kill is the safer default, and either way there is no signal tier on
   Windows (a deadline there kills the Job Object atomically; `TimeoutGrace` is
   accepted but has no effect).
+- **`CancelGrace(grace)`** is the same trade for a **cancellation** rather than a
+  deadline, with its own soft signal (`CancelSignal`) and no `Timeout` required. The
+  same caution applies: leave it unset for a child you do not trust to honor the soft
+  signal, since the default cancellation is still the plain immediate hard kill.
 
 A timed-out run reports `Outcome.TimedOut` (captured verbs) or
 `ProcessError.Timeout` (success-checking verbs) — never a silent partial result —

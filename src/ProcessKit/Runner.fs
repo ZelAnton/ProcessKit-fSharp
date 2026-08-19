@@ -221,7 +221,11 @@ module internal CaptureVerbs =
                     // no child rolls its reservation back and leaves the payload intact.
                     OneShotStdin.commitLaunch command.Config.StdinSource
 
-                    use _registration = effectiveToken.Register(fun () -> running.Kill())
+                    // The cancellation teardown, through the run's own single seam: the unchanged
+                    // immediate hard kill by default, or the `CancelSignal` -> `CancelGrace` -> hard-kill
+                    // ladder when the command opted in. The RESULT is unaffected either way — the
+                    // post-consume check below still turns a fired token into `ProcessError.Cancelled`.
+                    use _registration = effectiveToken.Register(fun () -> running.BeginCancelTeardown())
                     let! result = consume running
 
                     if effectiveToken.IsCancellationRequested then
@@ -611,7 +615,59 @@ module Runner =
                 // predicate / cancellation), so a streaming verb never downgrades the kill-on-drop
                 // guarantee to GC finalization.
                 use _ = running
-                use _registration = effectiveToken.Register(fun () -> running.Kill())
+                // Same single cancellation seam as `runToCompletion`: `Command.CancelGrace` softens the
+                // teardown here too, so a completion verb cannot silently keep the old immediate hard
+                // kill just because it streams its way to the answer.
+                use _registration = effectiveToken.Register(fun () -> running.BeginCancelTeardown())
+
+                // True exactly when a FIRED token has handed this run's teardown to the `CancelGrace`
+                // ladder the registration above starts — the condition under which this verb owes the
+                // child a wait.
+                //
+                // Why a streaming verb needs one at all: `runToCompletion` reaches its result by awaiting
+                // the child's real exit, so the ladder's grace window elapses inside the verb for free.
+                // Here every exit path is free to answer the moment the enumeration ends — and answering
+                // leaves the scope, which disposes the handle (`use _ = running`) and hard-kills the tree.
+                // The soft signal and that hard kill would then land microseconds apart, collapsing the
+                // grace to nothing: the very immediate hard kill the opt-in exists to replace, in the one
+                // verb whose doc names it (T-373 R-01).
+                //
+                // Both halves of the condition are load-bearing:
+                //  - Without `CancelGrace` there is no window to wait for — the registration delivered its
+                //    hard kill inline — so the verb answers exactly as promptly as it always has, and the
+                //    default cancellation path is unchanged.
+                //  - A token that did NOT fire must never make this verb wait. An
+                //    `OperationCanceledException` thrown by the caller's own predicate reaches the same
+                //    handler with no teardown in flight at all, and waiting there would park on a child
+                //    nothing has asked to stop.
+                let cancelLadderOwnsTeardown () =
+                    effectiveToken.IsCancellationRequested && command.Config.CancelGrace.IsSome
+
+                // Wait out the ladder a fired token started, so the child really gets its grace before
+                // this verb returns and the handle's disposal reaps the tree. `FinishAsync` is the same
+                // terminal hand-off the success path below uses: it first releases any bounded writer
+                // parked on the stdout channel this verb stopped reading (KB K-108), then awaits the run's
+                // own outcome — which the ladder concludes either way, by the child leaving on the soft
+                // signal or by the escalation hard-killing it once the grace elapses (with the bounded
+                // post-kill reap window covering even a tree that cannot be reaped). So the wait is
+                // bounded by the grace the caller configured, never open-ended.
+                //
+                // Its result is deliberately discarded: the answer to a cancelled run is `Cancelled`,
+                // exactly as before.
+                let awaitCancelLadder () : Task<unit> =
+                    task {
+                        try
+                            let! _ = running.FinishAsync()
+                            return ()
+                        with ex ->
+                            // A cancelled run's own failures are no longer the caller's answer, and this
+                            // wait must not invent one the previous behaviour never produced: a pump fault
+                            // `FinishAsync` re-raises (a throwing `OnStdoutLine`/`StdoutTee` handler) was
+                            // never even reached on this path before, which returned `Cancelled` without
+                            // finishing. The tree is still reaped by the `use _ = running` above.
+                            ignore ex
+                            return ()
+                    }
 
                 try
                     // End the child's input BEFORE streaming its stdout. This verb never hands the
@@ -635,7 +691,13 @@ module Runner =
                             found <- Some enumerator.Current
                             more <- false
 
-                    running.Kill()
+                    // The verb has its answer, so the run ends here — with ONE exception: a cancellation
+                    // that fired while the last line was being read already owns the teardown, and a hard
+                    // kill from here would cut its grace window short, the same downgrade the handler
+                    // below avoids. The ladder's own escalation still guarantees the kill, so nothing is
+                    // left running either way.
+                    if not (cancelLadderOwnsTeardown ()) then
+                        running.Kill()
 
                     // `FinishAsync` is still awaited to reap the tree. Cancellation is checked only
                     // after that await so a cancellation in the match-to-finish window cannot be lost;
@@ -650,7 +712,12 @@ module Runner =
                 with
                 | :? System.OperationCanceledException ->
                     // Faithful to the contract: a cancelled run is always an error, not a raised
-                    // OperationCanceledException.
+                    // OperationCanceledException. The enumeration is over (the token cancelled it), but
+                    // the run is not: when a `CancelGrace` ladder owns this teardown, the answer waits
+                    // for it — see `cancelLadderOwnsTeardown`.
+                    if cancelLadderOwnsTeardown () then
+                        do! awaitCancelLadder ()
+
                     return Error(ProcessError.Cancelled command.Program)
                 | :? System.Threading.Channels.ChannelClosedException as ex ->
                     // A stdout-pump fault (a throwing `OnStdoutLine`/`StdoutTee` handler, or a decode/IO

@@ -729,8 +729,9 @@ so a request fails the spawn with `ProcessError.Unsupported` rather than pretend
 
 **Windows has a narrow signal mapping.** `Signal.Kill` terminates the Job/run; `Signal.Int` and
 `Signal.Term` use best-effort CTRL+BREAK for opted-in console children and/or WM_CLOSE for windowed
-children. Other values return `ProcessError.Unsupported`. A custom `Command.StopSignal` is likewise
-refused at spawn on Windows instead of being silently replaced.
+children. Other values return `ProcessError.Unsupported`. A custom `Command.StopSignal` — and, on the
+same terms, a custom `Command.CancelSignal` — is likewise refused at spawn on Windows instead of being
+silently replaced.
 
 **No whole-tree resource limits on macOS/BSD or the Linux process-group fallback.** Limits require
 a Windows Job Object or a Linux cgroup v2; the POSIX process-group mechanism has no primitive to

@@ -204,6 +204,46 @@ module internal PipelineRunner =
     /// the zero-based upstream stage index.
     let mutable relaySourceTestHook: (int -> Stream -> Stream) option = None
 
+    /// Mark a fire-and-forget teardown `Task` observed, so a fault it may carry can never resurface as an
+    /// unobserved task exception at finalization. Purely observational (it never reads a result or
+    /// replaces an exception), the `Task`-shaped twin of `RunTerminal.ObserveFault`.
+    let private observeTeardownFault (teardown: Task) =
+        teardown.ContinueWith(Action<Task>(fun completed -> completed.Exception |> ignore))
+        |> ignore
+
+    /// The chain-wide teardown a fired cancellation/deadline token drives, and the ONE place the two are
+    /// told apart.
+    ///
+    /// A pipeline's linked token carries the verb's own token, the chain-level `Pipeline.CancelOn`, AND
+    /// the chain deadline, so the callback has to know which of them fired: `Pipeline.Timeout` keeps its
+    /// documented immediate hard kill (untouched by the cancellation ladder — the two are independent
+    /// knobs), and only an external CANCELLATION walks the ladder.
+    ///
+    /// Stage 0 owns the pipeline-wide cancellation configuration, exactly as it owns `StopSignal`: a
+    /// graceful teardown broadcasts ONE soft signal to the whole chain, so a per-stage window/signal
+    /// could not be honoured (`PipelineStageGuard` rejects both on a later stage rather than ignoring
+    /// them). With `CancelGrace` set the teardown is handed to `ProcessGroup.GracefulKillTree` — the
+    /// library's single soft-signal → grace → hard-kill escalation driver, the same one `TimeoutGrace`
+    /// and `ShutdownAsync` use — instead of a second, pipeline-local copy of that ladder. Without it, the
+    /// unchanged immediate `KillTree`.
+    ///
+    /// Returns the (possibly still-running) teardown so a caller that would otherwise hard-kill the chain
+    /// moments later can await exactly the ladder that was started; `Task.CompletedTask` for the
+    /// hard-kill branch, which has already finished. The escalation driver is explicitly safe to run past
+    /// a concurrent group release (it snapshots identities / duplicates the Job handle up front, [[K-086]]),
+    /// so nothing here has to hold the group open for it.
+    let internal beginChainTeardown (stages: Command[]) (group: ProcessGroup) (timeoutFired: unit -> bool) : Task =
+        match stages[0].Config.CancelGrace with
+        | Some grace when not (timeoutFired ()) ->
+            let teardown =
+                group.GracefulKillTree(CommandConfig.cancelSignal stages[0].Config, grace)
+
+            observeTeardownFault teardown
+            teardown
+        | _ ->
+            group.KillTree()
+            Task.CompletedTask
+
     /// The terminal observation of a whole pipeline chain — every stage's exit AND every inter-stage
     /// relay — as seen once the chain has finished: each stage's final `Outcome` (left-to-right), whether
     /// the chain's own proactive teardown caught it (`TornDown` victim — de-prioritized by the pipefail
@@ -577,11 +617,24 @@ module internal PipelineRunner =
                     let stagingGate = obj ()
                     let mutable cancellationFired = false
 
+                    // The chain teardown that callback started, kept so the mid-staging abort below can
+                    // await it instead of hard-killing over a grace window that is still legitimately
+                    // running (`Task.CompletedTask` for the immediate-hard-kill branch, and for a run that
+                    // was never cancelled at all). Written and read under `stagingGate`, the same gate that
+                    // fences staging, so the abort path can never observe the flag without the teardown it
+                    // belongs to.
+                    let mutable cancelTeardown: Task = Task.CompletedTask
+
                     use _registration =
                         linkedCts.Token.Register(fun () ->
-                            lock stagingGate (fun () -> cancellationFired <- true)
-                            teardownCts.Cancel()
-                            group.KillTree())
+                            lock stagingGate (fun () ->
+                                cancellationFired <- true
+                                // Quiet the relays BEFORE anything is torn down, exactly as before: the
+                                // broken pipes this teardown causes are routine, not genuine read faults.
+                                teardownCts.Cancel()
+
+                                cancelTeardown <-
+                                    beginChainTeardown stages group (fun () -> timeoutCts.IsCancellationRequested)))
 
                     let spawned = ResizeArray<Native.Common.Spawned>()
                     let copyTasks = ResizeArray<Task<ProcessError option>>()
@@ -802,6 +855,17 @@ module internal PipelineRunner =
                         // happen-before the waits, so the reap can never block on a raced stage the callback
                         // had not reached yet; this path keeps the reap outcomes and stderr captures to build
                         // its stage list.
+                        //
+                        // With a `CancelGrace` configured, the callback started the ladder instead of a
+                        // hard kill, so let that ladder finish FIRST: `drainChain`'s own `KillTree` is
+                        // otherwise an immediate escalation that would silently cut a grace window the
+                        // chain was granted — the one place a cancelled pipeline could have fallen back to
+                        // the old behaviour. Bounded by the grace itself (the escalation driver force-kills
+                        // at the end of it), and `Task.CompletedTask` — an instant no-op — on every other
+                        // path, including a timeout-halted or never-cancelled one.
+                        let pendingCancelTeardown = lock stagingGate (fun () -> cancelTeardown)
+                        do! pendingCancelTeardown
+
                         let! killedOutcomes, stderrCaptures = drainChain true
 
                         let duration = Stopwatch.GetElapsedTime startedAt
@@ -1115,7 +1179,9 @@ module internal PipelineRunner =
                     let teardownCts = new CancellationTokenSource()
 
                     // Link the verb token, the chain-level `CancelOn`, and the deadline into one token whose
-                    // firing hard-kills the whole tree. The session owns (and disposes) all three CTS /
+                    // firing tears the whole tree down — immediately by default, or through stage 0's
+                    // `CancelGrace` ladder for a cancellation that opted in (see `beginChainTeardown`). The
+                    // session owns (and disposes) all three CTS /
                     // registration on teardown, since — unlike `run` — they must outlive this call.
                     let linkTokens = ResizeArray<CancellationToken>()
                     linkTokens.Add cancellationToken
@@ -1135,11 +1201,19 @@ module internal PipelineRunner =
                     let stagingGate = obj ()
                     let mutable cancellationFired = false
 
+                    // The started chain teardown, exactly as in the buffered `run`: kept so the
+                    // mid-staging abort below awaits a still-running `CancelGrace` ladder rather than
+                    // hard-killing over it. `Task.CompletedTask` on every other path.
+                    let mutable cancelTeardown: Task = Task.CompletedTask
+
                     let registration =
                         linkedCts.Token.Register(fun () ->
-                            lock stagingGate (fun () -> cancellationFired <- true)
-                            teardownCts.Cancel()
-                            group.KillTree())
+                            lock stagingGate (fun () ->
+                                cancellationFired <- true
+                                teardownCts.Cancel()
+
+                                cancelTeardown <-
+                                    beginChainTeardown stages group (fun () -> timeoutCts.IsCancellationRequested)))
 
                     let spawned = ResizeArray<Native.Common.Spawned>()
                     let copyTasks = ResizeArray<Task<ProcessError option>>()
@@ -1234,6 +1308,14 @@ module internal PipelineRunner =
                         // stages are already live, later ones never started) so no stage is orphaned, then
                         // return an error — no session is handed back. Reap goes through `group.WaitHandle`,
                         // the reap-once choke point, exactly like `run`'s abort branch.
+                        //
+                        // A `CancelGrace` ladder the callback started is awaited first, for the same reason
+                        // as in `run`: the hard kill below would otherwise cut short a grace window the
+                        // chain was legitimately granted. A no-op (`Task.CompletedTask`) for a spawn
+                        // failure, a timeout, or a chain that never opted in.
+                        let pendingCancelTeardown = lock stagingGate (fun () -> cancelTeardown)
+                        do! pendingCancelTeardown
+
                         teardownCts.Cancel()
                         group.KillTree()
                         stopStage0Feed ()
@@ -1469,6 +1551,14 @@ module internal PipelineRunner =
                                 Timeout = None
                                 IdleTimeout = None
                                 CancelOn = None
+                                // The chain-level cancellation ladder is driven by the staging registration
+                                // above, over the whole group; clearing it here — like `CancelOn` — keeps
+                                // the inner handle from carrying a second, per-handle copy of the same
+                                // policy (it would be inert, since a live session is caller-driven, but a
+                                // knob that reads as configured and never runs is exactly the silent
+                                // no-op this library refuses).
+                                CancelGrace = None
+                                CancelSignal = None
                                 Retry = None
                                 RetryDisabled = false
                                 StdinSource = None

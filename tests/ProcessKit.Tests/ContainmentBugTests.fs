@@ -178,6 +178,13 @@ type internal SyntheticBackend() =
             lock gate (fun () -> updateLimitsCount <- updateLimitsCount + 1)
             Ok()
 
+        member _.LimitEvidence(_capped) =
+            // Called by `ProcessGroup.hardRelease` itself, while the backend is still live — the SAME
+            // critical section that then flips `released`, so this must observe `false` exactly like every
+            // other verb here.
+            requireLive "LimitEvidence"
+            LimitEvidence(LimitVerdict.Unknown, LimitVerdict.Unknown, LimitVerdict.Unknown)
+
         member _.HardRelease() =
             // Drain (reap) every tracked child exactly once and mark released, all under one lock — the
             // atomic teardown the guard must serialize every backend op against.
@@ -292,6 +299,10 @@ type internal CtrlSignalRaceBackend() =
         member _.MemberStats() = Ok []
 
         member _.UpdateLimits(_limits) = Ok()
+
+        member _.LimitEvidence(_capped) =
+            LimitEvidence(LimitVerdict.Unknown, LimitVerdict.Unknown, LimitVerdict.Unknown)
+
         member _.HardRelease() = lock gate (fun () -> tracked.Clear())
 
 /// A synthetic backend whose spawned "children" hand back a parent-side stdout that a DESCENDANT is
@@ -390,6 +401,9 @@ type internal InheritedPipeBackend() =
 
         member _.MemberStats() = Ok []
         member _.UpdateLimits(_limits) = Ok()
+
+        member _.LimitEvidence(_capped) =
+            LimitEvidence(LimitVerdict.Unknown, LimitVerdict.Unknown, LimitVerdict.Unknown)
 
         member _.HardRelease() =
             lock gate (fun () ->

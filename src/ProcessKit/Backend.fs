@@ -340,6 +340,15 @@ type internal IContainmentBackend =
     /// message states explicitly.
     abstract UpdateLimits: ResourceLimits -> Result<unit, ProcessError>
 
+    /// Post-run, per-axis evidence of whether a resource cap this group ever carried actually fired —
+    /// read from this backend's own authoritative post-mortem counters, honoring `capped` (the axes
+    /// `ProcessGroup` has ever configured on this group) so an axis never capped answers `NotTripped`
+    /// without any native read. Called by `ProcessGroup`'s teardown while the container is still live,
+    /// immediately before `HardRelease` — the counters (and, for cgroup v2, the directory itself) do not
+    /// survive past that point. Never fails: a counter that cannot be read degrades to `Unknown`, never
+    /// an exception or a fabricated verdict.
+    abstract LimitEvidence: CappedAxes -> LimitEvidence
+
     /// The hard teardown, run exactly once by the owning `ProcessGroup`: reap the tree and free the
     /// container (close the Job handle / `cgroup.kill` + rmdir / SIGKILL the pgids).
     abstract HardRelease: unit -> unit
@@ -628,6 +637,24 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
                     ->
                     Error(ProcessError.Unsupported message)
                 | Error message -> Error(ProcessError.ResourceLimit message)
+
+        member _.LimitEvidence(capped: CappedAxes) : LimitEvidence =
+            // A Windows Job Object keeps no post-mortem record that any whole-tree cap fired (no
+            // `memory.events`/`pids.events`/`cpu.stat` analogue — see `ProcessGroup.LimitEvidence`'s own
+            // doc comment for the full per-axis reasoning), so a capped axis is always `Unknown`: real
+            // evidence may or may not exist, but this backend cannot read it. An axis this group never
+            // capped needs no query at all — nothing was capped, so nothing could have fired.
+            let verdict (isCapped: bool) =
+                if isCapped then
+                    LimitVerdict.Unknown
+                else
+                    LimitVerdict.NotTripped
+
+            // `Cpu` passes through `GuardCpuVerdict`: this Job's raw verdict is derived from `CpuQuota`
+            // alone (`capped.Cpu`), so a `NotTripped` it reports must still be downgraded to `Unknown` when
+            // this group also carries a `CpuTimeMax` — a Job-time kill has no accounting a Job Object keeps
+            // (R-01).
+            LimitEvidence(verdict capped.Memory, verdict capped.Processes, capped.GuardCpuVerdict(verdict capped.Cpu))
 
         member _.HardRelease() =
             ctrlGroups.Clear()
@@ -1056,6 +1083,12 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
                         currentLimits <- limits
                         Ok()
                     | Error message -> Error(ProcessError.ResourceLimit message)
+
+        member _.LimitEvidence(capped: CappedAxes) : LimitEvidence =
+            // The only backend with real evidence to read — see `Native.Cgroup.limitEvidence` for the
+            // exact counters (`memory.events`'s `oom`, `pids.events`'s `max`, `cpu.stat`'s
+            // `nr_throttled`) and the honest-Unknown fallback when a file/key is missing.
+            Native.Cgroup.limitEvidence cgroupPath capped
 
         member _.HardRelease() =
             // Final disposal must remain bounded and best-effort: it removes the cgroup even when the
@@ -1559,6 +1592,20 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                         ProcessError.ResourceLimit
                             "the POSIX process-group mechanism has no whole-tree resource-limit primitive to update (needs a Windows Job Object or Linux cgroup v2)"
                     )
+
+        member _.LimitEvidence(_capped: CappedAxes) : LimitEvidence =
+            // The POSIX process-group mechanism has no whole-tree resource accounting at all — the same
+            // reason `Create`/`UpdateLimits` refuse any whole-tree cap on it in the first place. Every axis
+            // is `Unknown` UNCONDITIONALLY, deliberately ignoring `capped` — including for an axis this
+            // group never capped, unlike the Windows Job Object backend's `NotTripped` for that case.
+            // `capped` is NOT always `false` here, despite this mechanism refusing every whole-tree cap:
+            // `ProcessGroup.UpdateLimits` records an axis a request NAMES on the sticky `CappedAxes` before
+            // attempting the apply, so `capped.X = true` is reachable on this backend too, from a request
+            // this mechanism then refuses (see the "an axis named by a failed UpdateLimits still joins the
+            // sticky cap record" test). Ignoring `capped` here is a deliberate choice, not a because-it-
+            // can't-happen shortcut: there is no evidence apparatus on this mechanism at all, not "a cap may
+            // have fired unseen" — gating on `capped` would still have nothing honest to read (R-02).
+            LimitEvidence(LimitVerdict.Unknown, LimitVerdict.Unknown, LimitVerdict.Unknown)
 
         member _.HardRelease() =
             // Each pgid's leader is a child we posix_spawned, so we must waitpid it ourselves — `killpg`

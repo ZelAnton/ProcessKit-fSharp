@@ -96,7 +96,9 @@ class ProcessKit.Command
   member Arg(System.String) : ProcessKit.Command
   member Arg0(System.String) : ProcessKit.Command
   member Args(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
+  member CancelGrace(System.TimeSpan) : ProcessKit.Command
   member CancelOn(System.Threading.CancellationToken) : ProcessKit.Command
+  member CancelSignal(ProcessKit.Signal) : ProcessKit.Command
   member CreateNoWindow() : ProcessKit.Command
   member CurrentDir(System.String) : ProcessKit.Command
   member Encoding(System.Text.Encoding) : ProcessKit.Command
@@ -164,7 +166,9 @@ module ProcessKit.CommandModule
   static member arg(System.String, ProcessKit.Command) : ProcessKit.Command
   static member arg0(System.String, ProcessKit.Command) : ProcessKit.Command
   static member args(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Command) : ProcessKit.Command
+  static member cancelGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member cancelOn(System.Threading.CancellationToken, ProcessKit.Command) : ProcessKit.Command
+  static member cancelSignal(ProcessKit.Signal, ProcessKit.Command) : ProcessKit.Command
   static member create(System.String) : ProcessKit.Command
   static member createNoWindow(ProcessKit.Command) : ProcessKit.Command
   static member currentDir(System.String, ProcessKit.Command) : ProcessKit.Command
@@ -376,6 +380,41 @@ module ProcessKit.KillOnParentDeathScope+Tags
   field literal DirectChildOnly : System.Int32
   field literal Nothing : System.Int32
   field literal WholeTree : System.Int32
+
+class ProcessKit.LimitEvidence
+  property Cpu : ProcessKit.LimitVerdict { get }
+  property Memory : ProcessKit.LimitVerdict { get }
+  property Processes : ProcessKit.LimitVerdict { get }
+
+class ProcessKit.LimitVerdict
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.LimitVerdict>
+  member Equals(ProcessKit.LimitVerdict) : System.Boolean
+  member Equals(ProcessKit.LimitVerdict, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsNotTripped() : System.Boolean
+  member get_IsTripped() : System.Boolean
+  member get_IsUnknown() : System.Boolean
+  member get_Tag() : System.Int32
+  property IsNotTripped : System.Boolean { get }
+  property IsTripped : System.Boolean { get }
+  property IsUnknown : System.Boolean { get }
+  property NotTripped : ProcessKit.LimitVerdict { get }
+  property Tag : System.Int32 { get }
+  property Tripped : ProcessKit.LimitVerdict { get }
+  property Unknown : ProcessKit.LimitVerdict { get }
+  static member get_NotTripped() : ProcessKit.LimitVerdict
+  static member get_Tripped() : ProcessKit.LimitVerdict
+  static member get_Unknown() : ProcessKit.LimitVerdict
+
+module ProcessKit.LimitVerdict+Tags
+  field literal NotTripped : System.Int32
+  field literal Tripped : System.Int32
+  field literal Unknown : System.Int32
 
 class ProcessKit.LineTerminator
   :> System.Collections.IStructuralEquatable
@@ -958,6 +997,7 @@ class ProcessKit.ProcessGroup
   member AdoptByPid(System.Int32) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
   member Finalize() : System.Void
   member KillAll() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member LimitEvidence() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.LimitEvidence, ProcessKit.ProcessError>
   member MemberStats() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<ProcessKit.MemberStats>, ProcessKit.ProcessError>
   member Members() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<System.Int32>, ProcessKit.ProcessError>
   member MembersInfo() : Microsoft.FSharp.Core.FSharpResult<System.Collections.Generic.IReadOnlyList<ProcessKit.MemberInfo>, ProcessKit.ProcessError>
@@ -1148,6 +1188,7 @@ class ProcessKit.PtySessionOptions
   property WindowChars : System.Int32 { get }
 
 module ProcessKit.ReportJson
+  property LimitEvidenceTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.LimitEvidence> { get }
   property MemberInfoTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.MemberInfo> { get }
   property OutcomeTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.Outcome> { get }
   property ProcessGroupStatsTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.ProcessGroupStats> { get }
@@ -1156,6 +1197,7 @@ module ProcessKit.ReportJson
   property RunProfileTypeInfo : System.Text.Json.Serialization.Metadata.JsonTypeInfo<ProcessKit.RunProfile> { get }
 
 class ProcessKit.ReportJsonExtensions
+  static member ToReportJson(ProcessKit.LimitEvidence) : System.String
   static member ToReportJson(ProcessKit.MemberInfo) : System.String
   static member ToReportJson(ProcessKit.Outcome) : System.String
   static member ToReportJson(ProcessKit.ProcessGroupStats) : System.String

@@ -372,6 +372,10 @@ How it behaves:
 The soft phase is the supervised command's `Command.StopSignal` (default `Signal.Term`). The same
 setting is therefore honored by an explicit supervision-session `StopAsync`, a liveness restart, and
 the hosting extension's `StopAsync`; Windows refuses an unrepresentable custom signal at spawn.
+Cancelling supervision is a different event and reads a different pair: an incarnation torn down by a
+fired token is hard-killed at once unless the supervised command sets
+[`CancelGrace`](timeouts-and-cancellation.md#graceful-cancellation)/`CancelSignal`, which give that
+teardown its own soft signal and grace window. Supervision still reports `ProcessError.Cancelled`.
 - **Each endpoint attempt is bounded.** One HTTP/predicate attempt gives the endpoint/predicate up to `LivenessTimeout` to
   prove healthy (reusing the same poll/deadline core as `RunningProcess.WaitForHttpAsync`); a
   `false` result, a network failure, a raised exception, or a hung probe all count as one failed

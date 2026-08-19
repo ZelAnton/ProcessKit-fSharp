@@ -1050,6 +1050,81 @@ module internal Cgroup =
 
         cpu, memory, processCount, cgroupIoCounters cgroupPath
 
+    /// A `flat_keyed` cgroup v2 file's value for `key` — one `<key> <value>\n` line per key, matching
+    /// `/sys/fs/cgroup/**/memory.events`/`pids.events`/`cpu.stat`'s own documented format. Whole-token
+    /// matching only (a `key` of `"oom"` is never satisfied by an `"oom_kill"` line), and an unparsable,
+    /// negative, or truncated value is an honest miss (`None`), never a fabricated reading.
+    let private flatKeyedValue (text: string) (key: string) : int64 option =
+        text.Split '\n'
+        |> Array.tryPick (fun line ->
+            let fields = line.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+
+            if fields.Length >= 2 && fields[0] = key then
+                match Int64.TryParse fields[1] with
+                | true, value when value >= 0L -> Some value
+                | _ -> None
+            else
+                None)
+
+    /// One `LimitEvidence` axis: `files` in preference order (a caller-scoped `.local` file, when this
+    /// kernel has one, before the subtree total), and the `key` this axis reads from whichever of them
+    /// reads first. Never capped on this axis → `NotTripped` with no read at all — nothing was capped, so
+    /// nothing could have fired, and the cost of evidence stays off a group that asked for no caps.
+    /// Capped → the FIRST file that reads successfully decides the verdict (a present-but-zero counter is
+    /// an authoritative "did not fire", not a reason to fall through to the next file); a value present
+    /// and non-zero is `Tripped`, present and zero is `NotTripped`, and a file that reads but lacks the
+    /// key — or every listed file failing to read at all (an older kernel, a controller without that
+    /// accounting, a cgroup already gone) — is the honest `Unknown` gap.
+    let private axisVerdict (cgroupPath: string) (isCapped: bool) (files: string list) (key: string) : LimitVerdict =
+        if not isCapped then
+            LimitVerdict.NotTripped
+        else
+            let rec tryFiles files =
+                match files with
+                | [] -> LimitVerdict.Unknown
+                | file :: rest ->
+                    try
+                        let text = File.ReadAllText(Path.Combine(cgroupPath, file))
+
+                        match flatKeyedValue text key with
+                        | Some 0L -> LimitVerdict.NotTripped
+                        | Some _ -> LimitVerdict.Tripped
+                        | None -> LimitVerdict.Unknown
+                    with _ ->
+                        // The file itself could not be read (missing on this kernel, a controller never
+                        // enabled, a cgroup already removed by a racing teardown) — fall through to the
+                        // next candidate rather than treating an absent file as decisive; the recursive
+                        // base case above is the final honest `Unknown` once every candidate is exhausted.
+                        tryFiles rest
+
+            tryFiles files
+
+    /// Post-run, per-axis `LimitEvidence` for a cgroup v2 group: the ONLY containment backend with real
+    /// evidence to read (see `ProcessGroup.LimitEvidence`'s own doc comment for exactly what a Windows Job
+    /// Object and the POSIX process-group fallback answer instead, and why). Reads straight from the
+    /// kernel's own per-axis counters — never re-derived from the `ResourceLimits` that requested the cap
+    /// — so a configured cap that never fired reads `NotTripped`, one that did reads `Tripped`, and one
+    /// this cgroup cannot honestly attribute (an older kernel, a controller this hierarchy never enabled,
+    /// a cgroup that is already gone by the time this runs) reads `Unknown`.
+    ///
+    /// | Axis | Counter | Key |
+    /// |---|---|---|
+    /// | Memory | `memory.events.local` (preferred) / `memory.events` | `oom` — this cgroup hit **its own** cap and had to OOM. Deliberately not `oom_kill`, which also counts a *global* host OOM kill of a member, misattributing a system-wide event to this cap. |
+    /// | Processes | `pids.events.local` (preferred) / `pids.events` | `max` — a fork inside the cgroup was refused by `pids.max`. |
+    /// | CPU | `cpu.stat` | `nr_throttled` — the tree was throttled by `cpu.max`'s quota at least once. |
+    ///
+    /// `Cpu`'s raw verdict from `nr_throttled` is about `cpu.max`/`CpuQuota` alone; it is passed through
+    /// `CappedAxes.GuardCpuVerdict` before it reaches the returned `LimitEvidence`, so a group that ALSO
+    /// carries a `CpuTimeMax` (per-child `RLIMIT_CPU`, which `cpu.stat` cannot see at all) never reports a
+    /// fabricated `NotTripped` for it — including when `CpuQuota` itself was never set, so `nr_throttled`
+    /// is never even read (T-381/R-01).
+    let limitEvidence (cgroupPath: string) (capped: CappedAxes) : LimitEvidence =
+        LimitEvidence(
+            axisVerdict cgroupPath capped.Memory [ "memory.events.local"; "memory.events" ] "oom",
+            axisVerdict cgroupPath capped.Processes [ "pids.events.local"; "pids.events" ] "max",
+            capped.GuardCpuVerdict(axisVerdict cgroupPath capped.Cpu [ "cpu.stat" ] "nr_throttled")
+        )
+
     /// How one attempt to remove the cgroup directory ended.
     [<RequireQualifiedAccess; NoComparison>]
     type Removal =

@@ -4451,6 +4451,18 @@ module internal Windows =
                 ProcessError.Unsupported
                     $"Command.StopSignal({config.StopSignal}) on Windows; graceful stop uses the existing WM_CLOSE/CTRL+BREAK mechanisms and only the default Signal.Term contract is representable"
             )
+        elif config.CancelSignal |> Option.exists (fun signal -> signal <> Signal.Term) then
+            // The cancellation ladder's soft tier is the same Windows mechanism `StopSignal` gates, so it
+            // is refused on the same terms and for the same reason: an arbitrary POSIX signal is not
+            // representable here, and a graceful cancellation must never quietly downgrade to the hard
+            // kill while the call looked like it had been honoured. Screened whether or not
+            // `CancelGrace` is set, exactly like `StopSignal` (which is likewise refused with no
+            // `TimeoutGrace` configured) — a knob that cannot be honoured fails loudly at the boundary,
+            // rather than depending on whether some other knob happens to activate it.
+            Error(
+                ProcessError.Unsupported
+                    $"Command.CancelSignal({CommandConfig.cancelSignal config}) on Windows; a graceful cancellation uses the existing WM_CLOSE/CTRL+BREAK mechanisms and only the default Signal.Term contract is representable"
+            )
         else
             match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups, config.Arg0 with
             | Some _, _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")

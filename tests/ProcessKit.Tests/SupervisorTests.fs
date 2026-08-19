@@ -7,6 +7,7 @@ open System.IO
 open System.Net
 open System.Net.Http
 open System.Reflection
+open System.Runtime.InteropServices
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -760,6 +761,16 @@ type private LivenessDelayGate() =
 
 [<TestFixture>]
 type SupervisorTests() =
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+
+    // A real child, for the few tests whose subject is what the OS actually receives (T-373's
+    // cancellation ladder) rather than the supervision state machine the fake runners drive.
+    let shell (script: string) =
+        if isWindows then
+            Command.create "cmd.exe" |> Command.args [ "/c"; script ]
+        else
+            Command.create "/bin/sh" |> Command.args [ "-c"; script ]
 
     let ok () : Result<ProcessResult<string>, ProcessError> =
         Ok(ProcessResult<string>("fake", "out", "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ]))
@@ -3264,3 +3275,94 @@ type SupervisorTests() =
 
         Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> supervisor.Events -1 |> ignore))
         |> ignore
+
+    // ---- T-373: a supervised incarnation honours the command's cancellation ladder ----------------
+
+    [<Test>]
+    member _.``a cancelled supervised incarnation honours Command.CancelGrace (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore
+                "POSIX signal delivery: Windows has no signal tier (its soft phase is the documented best-effort WM_CLOSE/CTRL+BREAK)."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-supervisor-cancel-grace-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                use cts = new CancellationTokenSource()
+
+                // A real child, because the subject is what the OS receives: its SIGTERM handler is the
+                // only writer of the marker, so the file proves the ladder's soft rung reached the
+                // incarnation instead of the old immediate hard kill.
+                let command =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do sleep 0.05; done"
+                    |> Command.cancelGrace (TimeSpan.FromSeconds 5.0)
+
+                let supervisor = Supervisor(command).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+                let runTask = supervisor.RunAsync cts.Token
+                do! Task.Delay 400
+                cts.Cancel()
+
+                match! runTask with
+                | Error(ProcessError.Cancelled _) -> ()
+                | Error error -> Assert.Fail $"a cancelled supervision must report Cancelled, got {error}"
+                | Ok outcome -> Assert.Fail $"a cancelled supervision must not report success, got {outcome.Stopped}"
+
+                let mutable cleanedUp = File.Exists marker
+                let deadline = DateTime.UtcNow.AddSeconds 10.0
+
+                while not cleanedUp && DateTime.UtcNow < deadline do
+                    do! Task.Delay 20
+                    cleanedUp <- File.Exists marker
+
+                Assert.That(
+                    cleanedUp,
+                    Is.True,
+                    "cancelling supervision must deliver the incarnation's soft signal before escalating"
+                )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cancelled supervised incarnation without CancelGrace is still hard-killed (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore "POSIX signal delivery: Windows has no signal tier to prove the absence of."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-supervisor-cancel-hard-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                use cts = new CancellationTokenSource()
+
+                let command =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do sleep 0.05; done"
+
+                let supervisor = Supervisor(command).Backoff(TimeSpan.Zero, 1.0).Jitter(false)
+
+                let runTask = supervisor.RunAsync cts.Token
+                do! Task.Delay 400
+                cts.Cancel()
+
+                match! runTask with
+                | Error(ProcessError.Cancelled _) -> ()
+                | Error error -> Assert.Fail $"expected Cancelled, got {error}"
+                | Ok outcome -> Assert.Fail $"expected Cancelled, got {outcome.Stopped}"
+
+                // Give a (wrongly delivered) signal every chance to land before concluding it did not.
+                do! Task.Delay 750
+
+                Assert.That(
+                    File.Exists marker,
+                    Is.False,
+                    "the default incarnation cancellation must stay an immediate hard kill"
+                )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task

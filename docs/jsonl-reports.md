@@ -3,15 +3,17 @@
 [Previous: Overview](./)
 
 `ReportJson` is an **opt-in** `System.Text.Json` serializer for ProcessKit's own report types —
-`Outcome`, `ProcessResult<string>` / `ProcessResult<byte[]>`, `ProcessGroupStats`, `RunProfile`, and
-`MemberInfo` — so a finished run, a group's resource snapshot, or a member enumeration can be logged as
-one self-describing JSON object per line (JSONL), without hand-copying fields or hand-calling `.ToString()`
-on an enum. It ports the **shape** of ProcessKit-rs's `report-serde` feature; see
-[Coming from ProcessKit-rs](from-rust.md) for the wider vocabulary map.
+`Outcome`, `ProcessResult<string>` / `ProcessResult<byte[]>`, `ProcessGroupStats`, `RunProfile`,
+`MemberInfo`, and `LimitEvidence` — so a finished run, a group's resource snapshot, a member enumeration,
+or a group's post-run resource-limit evidence can be logged as one self-describing JSON object per line
+(JSONL), without hand-copying fields or hand-calling `.ToString()` on an enum. It ports the **shape** of
+ProcessKit-rs's `report-serde` feature; see [Coming from ProcessKit-rs](from-rust.md) for the wider
+vocabulary map.
 
-Nothing on `ProcessResult`/`ProcessGroupStats`/`RunProfile`/`MemberInfo` changed to add this — it is a
-separate serializer you reach for explicitly, either through the `ToReportJson()` extension methods or by
-passing one of `ReportJson`'s `JsonTypeInfo<'T>` properties to `JsonSerializer.Serialize` yourself.
+Nothing on `ProcessResult`/`ProcessGroupStats`/`RunProfile`/`MemberInfo`/`LimitEvidence` changed to add
+this — it is a separate serializer you reach for explicitly, either through the `ToReportJson()` extension
+methods or by passing one of `ReportJson`'s `JsonTypeInfo<'T>` properties to `JsonSerializer.Serialize`
+yourself.
 
 - [The schema](#the-schema)
 - [Secret hygiene](#secret-hygiene)
@@ -34,6 +36,7 @@ platform or the run could not report it. Time is always a number of **fractional
 | `process_group_stats` | `ProcessGroupStats` | `active_process_count`, `peak_process_count`, `total_cpu_time_secs`, `peak_memory_bytes`, `io_read_bytes`, `io_write_bytes`, `io_read_operations`, `io_write_operations` |
 | `run_profile` | `RunProfile` | `outcome`, `duration_secs`, `cpu_time_secs`, `peak_memory_bytes`, `io_read_bytes`, `io_write_bytes`, `io_read_operations`, `io_write_operations`, `samples`, `avg_cpu_cores` |
 | `member_info` | `MemberInfo` | `pid`, `ppid`, `exe_name`, `start_time` (ISO-8601) |
+| `limit_evidence` | `LimitEvidence` | `memory`, `processes`, `cpu` — each one of `"tripped"` / `"not_tripped"` / `"unknown"` (`LimitVerdict`'s stable identifiers) |
 
 An embedded `Outcome` (inside `process_result` / `run_profile`) is the same tagged object as the top-level
 one, under the `outcome` key. Each of a `process_result` line's `total_lines` and `total_bytes` fields is
