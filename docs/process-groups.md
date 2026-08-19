@@ -1175,6 +1175,89 @@ private-tree I/O where available) rather than a live group series, use
 `RunningProcess.ProfileAsync` — see
 [streaming.md](streaming.md).
 
+## Limit Evidence
+
+`Stats()` reports *what the tree consumed*; `LimitEvidence()` answers a different
+question a plain exit code or signal cannot: **did a resource cap this group
+configured actually fire?** A child killed by its memory cap and a child that
+crashed on its own both surface as an ordinary non-zero exit (or a `SIGKILL`) —
+`LimitEvidence()` closes that gap with one `LimitVerdict` per axis —
+`Memory`/`Processes`/`Cpu` — read from the container's own authoritative
+post-mortem counters, **never** re-derived from the `ResourceLimits` that
+requested the cap and never inferred from the run's outcome (a cap-driven kill
+and a self-inflicted crash can look identical from the outside).
+
+**Available only *after* the group has been torn down** —
+`ShutdownAsync`/`Dispose`/`DisposeAsync`, or the finalizer — the opposite
+lifetime rule `Stats()` follows. The evidence is captured exactly once, from the
+still-live container, in the instant immediately before its counters (and, for
+a Linux cgroup v2 group, the cgroup directory itself) are torn down, and is then
+cached: any number of later reads return that same snapshot. Calling it
+**before** teardown has completed returns a non-transient
+`ProcessError.Unsupported` — an honest "not yet available", never a fabricated
+verdict read off counters that are still changing:
+
+**F#**
+
+```fsharp
+task {
+    use group =
+        match ProcessGroup.Create(ProcessGroupOptions().WithMemoryMax(64L * 1024L * 1024L)) with
+        | Ok g -> g
+        | Error err -> failwith err.Message
+
+    // ... run children into `group` ...
+
+    do! group.ShutdownAsync()
+
+    match group.LimitEvidence() with
+    | Ok evidence -> printfn $"memory={evidence.Memory} processes={evidence.Processes} cpu={evidence.Cpu}"
+    | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+**C#**
+
+```csharp
+using var group = ProcessGroup.Create(new ProcessGroupOptions().WithMemoryMax(64L * 1024 * 1024)) switch
+{
+    { IsOk: true, ResultValue: var g } => g,
+    { IsOk: false, ErrorValue: var err } => throw new InvalidOperationException(err.Message),
+};
+
+// ... run children into `group` ...
+
+await group.ShutdownAsync();
+
+var evidence = group.LimitEvidence();
+if (evidence is { IsOk: true, ResultValue: var ev })
+    Console.WriteLine($"memory={ev.Memory} processes={ev.Processes} cpu={ev.Cpu}");
+```
+
+Each axis is a three-valued `LimitVerdict`, deliberately never folded into one
+whole-group answer (folding would have to merge `NotTripped` and `Unknown`
+together, turning "we have no evidence" into "no"):
+
+- **`Tripped`** — the kernel/OS recorded that this cap engaged: the tree was
+  OOM-killed under its memory cap, denied a fork by its process cap, or
+  throttled by its CPU quota.
+- **`NotTripped`** — the cap did **not** engage: either its counter is present
+  and reads zero, or this axis was never capped on this group at all — both are
+  the same honest "no".
+- **`Unknown`** — **no authoritative evidence is available**, so the answer is
+  refused rather than guessed at.
+
+| Mechanism | `Memory` / `Processes` / `Cpu` |
+|---|---|
+| Linux cgroup v2 | Real evidence from `memory.events`' `oom`, `pids.events`' `max`, and `cpu.stat`'s `nr_throttled` — `Tripped`/`NotTripped` per axis, or `Unknown` when a counter file/key can't be read (an older kernel, a controller this hierarchy never enabled, a cgroup already gone). |
+| Windows Job Object | `Unknown` on every axis it ever capped — not an oversight: a Job Object keeps no post-mortem record that any of these caps fired. An axis it never capped reads `NotTripped` without touching native at all. |
+| POSIX process group / macOS / BSD | `Unknown` on every axis, unconditionally — this mechanism has no whole-tree resource accounting to read at all (the same reason `Create`/`UpdateLimits` refuse any whole-tree cap on it in the first place). |
+
+Recorded **sticky** across a live `UpdateLimits`: an axis a request names joins
+the group's cap record whether that request then succeeds or fails, so a cap
+that fired and was later lifted still reads from the real counter instead of a
+guessed `NotTripped`.
+
 ---
 
 Next: [Streaming & interactive I/O](streaming.md)

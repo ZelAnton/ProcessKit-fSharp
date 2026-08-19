@@ -58,6 +58,7 @@ public class ReportJsonTests
         AssertWriteOnly(ReportJson.ProcessGroupStatsTypeInfo);
         AssertWriteOnly(ReportJson.RunProfileTypeInfo);
         AssertWriteOnly(ReportJson.MemberInfoTypeInfo);
+        AssertWriteOnly(ReportJson.LimitEvidenceTypeInfo);
     }
 
     [Test]

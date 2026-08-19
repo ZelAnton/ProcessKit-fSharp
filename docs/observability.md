@@ -14,6 +14,12 @@ and free when nothing is listening**:
 > durations, exit code / signal, retry / restart counts, run id) are emitted. This invariant holds across
 > all three channels.
 
+A resource group's post-run `ProcessGroup.LimitEvidence()` — per-axis evidence of whether a configured
+resource cap actually fired — is a separate, pull-based *read*, not a push notification on any of these
+three channels: nothing here logs, traces, or counts a cap tripping. Its `Unknown`-vs-`Tripped`-vs-
+`NotTripped` semantics are documented on [Process groups](process-groups.md#limit-evidence); its opt-in
+JSONL serialization (a `limit_evidence` line) is documented on [JSONL reports](jsonl-reports.md).
+
 ## Logging
 
 Attach any `Microsoft.Extensions.Logging.ILogger` with `Command.Logger` (F#: `Command.logger`):

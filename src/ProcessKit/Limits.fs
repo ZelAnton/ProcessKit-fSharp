@@ -443,6 +443,83 @@ type ResourceLimits
                     "whole-tree disk I/O rate limits require Linux cgroup v2 io.max or a Windows Job Object I/O rate controller; this mechanism has no equivalent"
             )
 
+/// Which resource-limit axes a `ProcessGroup` has carried a cap on at any point in its life — the
+/// STICKY record `ProcessGroup` keeps (recorded at `Create` and at every later `UpdateLimits`) so
+/// `ProcessGroup.LimitEvidence` stays honest across a live cap change: a cap that fired and was later
+/// lifted must still be answered from the container's own counter, not reported `NotTripped` for an
+/// axis nobody ever asked the container about. Recorded conservatively — every axis an `UpdateLimits`
+/// call NAMES joins the record whether that call then succeeds or fails, mirroring ProcessKit-rs's
+/// `CappedAxes` (see `group.rs`'s `update_limits_with`): neither backend applies its caps atomically, so
+/// a failure part-way through can still have reached the OS for that axis, and skipping the record on
+/// failure would let `LimitEvidence` answer `NotTripped` for it without ever reading a counter.
+[<Struct; NoComparison>]
+type internal CappedAxes =
+    { Memory: bool
+      Processes: bool
+      Cpu: bool }
+
+    /// No axis capped yet — the state of a freshly created, limit-free group.
+    static member None =
+        { Memory = false
+          Processes = false
+          Cpu = false }
+
+    /// A copy recording every axis `limits` configures, keeping every axis already recorded — sticky,
+    /// never un-records.
+    member this.Record(limits: ResourceLimits) : CappedAxes =
+        { Memory = this.Memory || limits.MemoryMax.IsSome
+          Processes = this.Processes || limits.MaxProcesses.IsSome
+          Cpu = this.Cpu || limits.CpuQuota.IsSome }
+
+/// The post-run verdict for **one** resource-limit axis — did a cap this group carried actually
+/// **engage** while the tree ran? Read from `ProcessGroup.LimitEvidence()`; see that member for exactly
+/// when it becomes available.
+///
+/// This answers a different question than `ProcessError.ResourceLimit`: that error is about
+/// **admission** — "could the cap you asked for even be applied?" This verdict is about what only the
+/// container itself can answer afterwards — "did a cap on this axis then actually fire?" A `Tripped`
+/// verdict is returned only on **authoritative kernel/OS evidence** recorded by the group's own
+/// container; exit codes and signals are never consulted, because a cap-driven kill and a self-inflicted
+/// crash can look identical from the outside, and inferring from them would manufacture exactly the
+/// false verdict this type exists to avoid.
+[<RequireQualifiedAccess; NoComparison>]
+type LimitVerdict =
+
+    /// The kernel/OS recorded that this cap engaged: the tree was OOM-killed under its memory cap,
+    /// denied a fork by its process cap, or throttled by its CPU quota.
+    | Tripped
+
+    /// This cap did **not** engage. Either its counter is present and reads zero, or this axis was never
+    /// capped on this group at all — both are the same honest "no"; neither is a fallback for missing
+    /// evidence (that is `Unknown`).
+    | NotTripped
+
+    /// **No authoritative evidence is available**, so the answer is refused rather than guessed at. The
+    /// containment mechanism keeps no post-mortem record for this axis at all (every axis on a Windows
+    /// Job Object, or the POSIX process-group fallback — neither persists a "this cap fired" counter), or
+    /// the specific counter file/key could not be read on this run (an older kernel, a controller without
+    /// that accounting, a cgroup already gone).
+    | Unknown
+
+/// Post-run evidence of whether the resource caps a `ProcessGroup` carried actually fired — one
+/// `LimitVerdict` per axis, read from the container the group itself owns. See
+/// `ProcessGroup.LimitEvidence()` for when it becomes available and what each axis means.
+///
+/// Deliberately per-axis rather than one whole-group verdict: folding three honest three-valued
+/// verdicts into one would have to merge `NotTripped` and `Unknown` together, turning "we have no
+/// evidence" into "no". Sealed with an internal constructor — built only by the backend that reads it.
+[<Sealed>]
+type LimitEvidence internal (memory: LimitVerdict, processes: LimitVerdict, cpu: LimitVerdict) =
+
+    /// The verdict for `ResourceLimits.MemoryMax`.
+    member _.Memory = memory
+
+    /// The verdict for `ResourceLimits.MaxProcesses`.
+    member _.Processes = processes
+
+    /// The verdict for `ResourceLimits.CpuQuota`.
+    member _.Cpu = cpu
+
 /// Options applied when creating a `ProcessGroup`: the graceful-shutdown window and whole-tree
 /// resource limits.
 [<Sealed>]

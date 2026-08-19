@@ -41,6 +41,10 @@ type internal MemberStatsSeamBackend(memberStats: unit -> Result<MemberStats lis
 
         member _.MemberStats() = memberStats ()
         member _.UpdateLimits(_limits) = Ok()
+
+        member _.LimitEvidence(_capped) =
+            LimitEvidence(LimitVerdict.Unknown, LimitVerdict.Unknown, LimitVerdict.Unknown)
+
         member _.HardRelease() = ()
 
 [<TestFixture>]

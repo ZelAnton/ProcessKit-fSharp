@@ -52,6 +52,22 @@ module private WindowsIoRateControlTestSupport =
                 // no NT volume target can be claimed honestly in that case, so the gated test skips.
                 []
 
+/// Test support for `Native.Cgroup.limitEvidence` (T-381) — a fresh temp directory standing in for a
+/// cgroup v2 directory, pure file I/O, no real cgroup v2 mount required (mirrors the `cgroupStats` tests
+/// in StatsTests.fs).
+module private LimitEvidenceTestSupport =
+
+    let withTempCgroupDir (body: string -> unit) =
+        let directory =
+            Path.Combine(Path.GetTempPath(), $"processkit-limit-evidence-{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory directory |> ignore
+
+        try
+            body directory
+        finally
+            Directory.Delete(directory, true)
+
 /// A zero-cost stand-in for a pidfd used by the identity-safe delivery seam tests below:
 /// `Native.Cgroup.deliverIdentitySafe` is generic over the pin handle, so a test pins with this token
 /// instead of a real file descriptor.
@@ -111,6 +127,74 @@ type internal LimitContractBackend(initial: ResourceLimits, shouldFail: Resource
             else
                 inForce <- limits
                 Ok()
+
+        member _.LimitEvidence(_capped) =
+            LimitEvidence(LimitVerdict.Unknown, LimitVerdict.Unknown, LimitVerdict.Unknown)
+
+        member _.HardRelease() = ()
+
+/// A synthetic `IContainmentBackend` whose `LimitEvidence` echoes exactly the `CappedAxes` it was called
+/// with (`Tripped` for a capped axis, `NotTripped` for one that is not — an arbitrary but distinguishable
+/// mapping, never meant to model a real cgroup counter; `Native.Cgroup.limitEvidence`'s own tests cover
+/// that), and records it on `LastCapped` — so a test can assert `ProcessGroup`'s sticky cap-tracking
+/// (recorded at `Create` and at every `UpdateLimits`, even a failing one) without any real OS container.
+/// `updateLimitsFails` lets a test drive the "recorded even though the apply itself failed" case (T-207's
+/// own `LimitContractBackend` covers the `Options`-reflection half of that contract; this one covers the
+/// evidence-record half).
+type internal LimitEvidenceEchoBackend(updateLimitsFails: bool) =
+    let mutable lastCapped: CappedAxes option = None
+
+    /// The `CappedAxes` this backend's `LimitEvidence` was last called with, or `None` before the group
+    /// this backend is behind has been torn down (`ProcessGroup.hardRelease` is the only caller).
+    member _.LastCapped = lastCapped
+
+    interface IContainmentBackend with
+        member _.Mechanism = Mechanism.JobObject
+
+        member _.Spawn(_command) =
+            Error(ProcessError.Unsupported "LimitEvidenceEchoBackend does not spawn")
+
+        member _.Track(_spawned) = Ok()
+
+        member _.Adopt(_pid) =
+            Error(ProcessError.Unsupported "LimitEvidenceEchoBackend does not adopt")
+
+        member _.AdoptByPid(_pid) =
+            Error(ProcessError.Unsupported "LimitEvidenceEchoBackend does not adopt by pid")
+
+        member _.Release(_spawned) = ()
+        member _.Wait(_handle) = task { return Outcome.Exited 0 }
+        member _.PidOf(_spawned) = None
+        member _.KillChild(_spawned) = ()
+        member _.KillTree() = Ok()
+        member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
+        member _.SignalChild(_spawned, _signal) = Ok()
+        member _.Members() = Ok []
+        member _.Signal(_signal) = Ok()
+        member _.Suspend() = Ok()
+        member _.Resume() = Ok()
+
+        member _.Stats() =
+            Ok(ProcessGroupStats(0, None, None, None, None))
+
+        member _.MemberStats() = Ok []
+
+        member _.UpdateLimits(_limits) =
+            if updateLimitsFails then
+                Error(ProcessError.ResourceLimit "simulated update failure (T-381 evidence-record contract)")
+            else
+                Ok()
+
+        member _.LimitEvidence(capped: CappedAxes) : LimitEvidence =
+            lastCapped <- Some capped
+
+            let verdict (isCapped: bool) =
+                if isCapped then
+                    LimitVerdict.Tripped
+                else
+                    LimitVerdict.NotTripped
+
+            LimitEvidence(verdict capped.Memory, verdict capped.Processes, verdict capped.Cpu)
 
         member _.HardRelease() = ()
 
@@ -2427,3 +2511,173 @@ type WindowsIoRateControlTests() =
                 match group.UpdateLimits ResourceLimits.None with
                 | Error error -> Assert.Fail $"the prior I/O policy could not be removed after rollback: {error}"
                 | Ok() -> Assert.That(group.Options.Limits.IoMax, Is.EqualTo None)
+
+    // -----------------------------------------------------------------------------------------------
+    // LimitEvidence (T-381) — Native.Cgroup.limitEvidence's authoritative counters, pure file I/O
+    // against a temp directory (mirroring the `cgroupStats` tests in StatsTests.fs — no real cgroup v2
+    // mount required), plus the public ProcessGroup.LimitEvidence() lifecycle and per-backend contracts.
+    // -----------------------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``limitEvidence answers NotTripped for an axis never capped, without needing any counter file``() =
+        LimitEvidenceTestSupport.withTempCgroupDir (fun directory ->
+            let evidence = Native.Cgroup.limitEvidence directory CappedAxes.None
+            Assert.That(evidence.Memory, Is.EqualTo LimitVerdict.NotTripped)
+            Assert.That(evidence.Processes, Is.EqualTo LimitVerdict.NotTripped)
+            Assert.That(evidence.Cpu, Is.EqualTo LimitVerdict.NotTripped))
+
+    [<Test>]
+    member _.``limitEvidence reads Tripped from a positive counter and NotTripped from a present zero one``() =
+        LimitEvidenceTestSupport.withTempCgroupDir (fun directory ->
+            File.WriteAllText(Path.Combine(directory, "memory.events"), "low 0\noom 1\n")
+            File.WriteAllText(Path.Combine(directory, "pids.events"), "max 0\n")
+            File.WriteAllText(Path.Combine(directory, "cpu.stat"), "usage_usec 5\nnr_throttled 3\n")
+
+            let capped: CappedAxes =
+                { Memory = true
+                  Processes = true
+                  Cpu = true }
+
+            let evidence = Native.Cgroup.limitEvidence directory capped
+            Assert.That(evidence.Memory, Is.EqualTo LimitVerdict.Tripped, "oom=1 must read as Tripped")
+            Assert.That(evidence.Processes, Is.EqualTo LimitVerdict.NotTripped, "max=0 must read as NotTripped")
+            Assert.That(evidence.Cpu, Is.EqualTo LimitVerdict.Tripped, "nr_throttled=3 must read as Tripped"))
+
+    [<Test>]
+    member _.``limitEvidence answers Unknown for a capped axis whose counter file is entirely missing``() =
+        LimitEvidenceTestSupport.withTempCgroupDir (fun directory ->
+            let capped: CappedAxes =
+                { Memory = true
+                  Processes = true
+                  Cpu = true }
+
+            let evidence = Native.Cgroup.limitEvidence directory capped
+            Assert.That(evidence.Memory, Is.EqualTo LimitVerdict.Unknown)
+            Assert.That(evidence.Processes, Is.EqualTo LimitVerdict.Unknown)
+            Assert.That(evidence.Cpu, Is.EqualTo LimitVerdict.Unknown))
+
+    [<Test>]
+    member _.``limitEvidence answers Unknown, never a fabricated NotTripped, when a present file lacks the key``() =
+        LimitEvidenceTestSupport.withTempCgroupDir (fun directory ->
+            // cpu.stat exists and is readable, but this (synthetic, old-kernel-shaped) file never accounts
+            // nr_throttled at all — an honest gap, not "it never throttled".
+            File.WriteAllText(Path.Combine(directory, "cpu.stat"), "usage_usec 5\n")
+
+            let capped: CappedAxes = { CappedAxes.None with Cpu = true }
+            let evidence = Native.Cgroup.limitEvidence directory capped
+            Assert.That(evidence.Cpu, Is.EqualTo LimitVerdict.Unknown))
+
+    [<Test>]
+    member _.``limitEvidence prefers the caller-scoped .local event files over the subtree totals``() =
+        LimitEvidenceTestSupport.withTempCgroupDir (fun directory ->
+            File.WriteAllText(Path.Combine(directory, "memory.events.local"), "oom 1\n")
+            File.WriteAllText(Path.Combine(directory, "memory.events"), "oom 0\n")
+            File.WriteAllText(Path.Combine(directory, "pids.events.local"), "max 0\n")
+            File.WriteAllText(Path.Combine(directory, "pids.events"), "max 9\n")
+
+            let capped: CappedAxes =
+                { Memory = true
+                  Processes = true
+                  Cpu = false }
+
+            let evidence = Native.Cgroup.limitEvidence directory capped
+            Assert.That(evidence.Memory, Is.EqualTo LimitVerdict.Tripped, "memory.events.local's oom=1 must win")
+            Assert.That(evidence.Processes, Is.EqualTo LimitVerdict.NotTripped, "pids.events.local's max=0 must win"))
+
+    [<Test>]
+    member _.``Windows Job Object LimitEvidence is Unknown for a capped axis and NotTripped for one never capped (Windows)``
+        ()
+        =
+        if not isWindows then
+            Assert.Ignore "Windows Job Object LimitEvidence contract."
+
+        match Native.Windows.createWindowsJob () with
+        | Error error -> Assert.Fail $"could not create a Job Object: {error}"
+        | Ok job ->
+            let backend = JobObjectBackend job :> IContainmentBackend
+
+            try
+                let capped: CappedAxes =
+                    { Memory = true
+                      Processes = false
+                      Cpu = true }
+
+                let evidence = backend.LimitEvidence capped
+                Assert.That(evidence.Memory, Is.EqualTo LimitVerdict.Unknown)
+                Assert.That(evidence.Processes, Is.EqualTo LimitVerdict.NotTripped)
+                Assert.That(evidence.Cpu, Is.EqualTo LimitVerdict.Unknown)
+            finally
+                backend.HardRelease()
+
+    [<Test>]
+    member _.``POSIX process-group LimitEvidence is Unknown on every axis regardless of what was capped``() =
+        let backend = ProcessGroupBackend() :> IContainmentBackend
+
+        let capped: CappedAxes =
+            { Memory = true
+              Processes = true
+              Cpu = true }
+
+        let evidence = backend.LimitEvidence capped
+        Assert.That(evidence.Memory, Is.EqualTo LimitVerdict.Unknown)
+        Assert.That(evidence.Processes, Is.EqualTo LimitVerdict.Unknown)
+        Assert.That(evidence.Cpu, Is.EqualTo LimitVerdict.Unknown)
+        backend.HardRelease()
+
+    [<Test>]
+    member _.``ProcessGroup.LimitEvidence is unavailable before teardown and returns a cached snapshot after it``() =
+        let backend = LimitEvidenceEchoBackend(updateLimitsFails = false)
+
+        let group =
+            ProcessGroup.FromBackend(backend :> IContainmentBackend, ProcessGroupOptions())
+
+        match group.LimitEvidence() with
+        | Error(ProcessError.Unsupported _) -> ()
+        | other -> Assert.Fail $"expected Unsupported before teardown, got {other}"
+
+        (group :> IDisposable).Dispose()
+
+        match group.LimitEvidence(), group.LimitEvidence() with
+        | Ok first, Ok second ->
+            Assert.That(first.Memory, Is.EqualTo second.Memory)
+            Assert.That(first.Processes, Is.EqualTo second.Processes)
+            Assert.That(first.Cpu, Is.EqualTo second.Cpu)
+        | other -> Assert.Fail $"expected a cached Ok evidence after teardown, got {other}"
+
+    [<Test>]
+    member _.``ProcessGroup.LimitEvidence reflects the axes actually capped at Create``() =
+        let backend = LimitEvidenceEchoBackend(updateLimitsFails = false)
+
+        let options = ProcessGroupOptions().WithMemoryMax(1024L).WithCpuQuota(1.0)
+
+        let group = ProcessGroup.FromBackend(backend :> IContainmentBackend, options)
+        (group :> IDisposable).Dispose()
+
+        match group.LimitEvidence() with
+        | Ok evidence ->
+            Assert.That(evidence.Memory, Is.EqualTo LimitVerdict.Tripped, "MemoryMax was capped at Create")
+            Assert.That(evidence.Processes, Is.EqualTo LimitVerdict.NotTripped, "MaxProcesses was never capped")
+            Assert.That(evidence.Cpu, Is.EqualTo LimitVerdict.Tripped, "CpuQuota was capped at Create")
+        | Error err -> Assert.Fail $"{err}"
+
+    [<Test>]
+    member _.``an axis named by a failed UpdateLimits still joins the sticky cap record``() =
+        let backend = LimitEvidenceEchoBackend(updateLimitsFails = true)
+
+        let group =
+            ProcessGroup.FromBackend(backend :> IContainmentBackend, ProcessGroupOptions())
+
+        match group.UpdateLimits(ResourceLimits.None.WithMaxProcesses 4) with
+        | Error(ProcessError.ResourceLimit _) -> ()
+        | other -> Assert.Fail $"expected the simulated update failure, got {other}"
+
+        (group :> IDisposable).Dispose()
+
+        match group.LimitEvidence() with
+        | Ok evidence ->
+            Assert.That(
+                evidence.Processes,
+                Is.EqualTo LimitVerdict.Tripped,
+                "the axis a FAILED UpdateLimits named must still be recorded as capped — never NotTripped as if it were never asked about"
+            )
+        | Error err -> Assert.Fail $"{err}"

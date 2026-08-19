@@ -230,21 +230,52 @@ type internal MemberInfoJsonConverter() =
 
         writer.WriteEndObject()
 
+/// Serializes a `LimitEvidence` report: one `LimitVerdict` per axis (`memory`/`processes`/`cpu`), each
+/// written as its stable machine identifier — `"tripped"` / `"not_tripped"` / `"unknown"` — never a raw
+/// union-case ordinal or a BCL `.ToString()` spelling, matching every other converter in this schema.
+[<Sealed>]
+type internal LimitEvidenceJsonConverter() =
+    inherit JsonConverter<LimitEvidence>()
+
+    override _.HandleNull = true
+
+    override _.Read(_reader, _typeToConvert, _options) : LimitEvidence =
+        raise (
+            NotSupportedException
+                "ReportJson serializes a LimitEvidence for a report line; it deliberately never deserializes one back (write-only report schema — see docs/jsonl-reports.md)."
+        )
+
+    override _.Write(writer: Utf8JsonWriter, value: LimitEvidence, _options: JsonSerializerOptions) : unit =
+        let verdictName (verdict: LimitVerdict) : string =
+            match verdict with
+            | LimitVerdict.Tripped -> "tripped"
+            | LimitVerdict.NotTripped -> "not_tripped"
+            | LimitVerdict.Unknown -> "unknown"
+
+        writer.WriteStartObject()
+        writer.WriteString("kind", "limit_evidence")
+        writer.WriteString("memory", verdictName value.Memory)
+        writer.WriteString("processes", verdictName value.Processes)
+        writer.WriteString("cpu", verdictName value.Cpu)
+        writer.WriteEndObject()
+
 /// AOT-safe `System.Text.Json` metadata for the opt-in JSONL report serializer: one self-describing JSON
 /// object per line for `Outcome`, `ProcessResult&lt;string&gt;`/`ProcessResult&lt;byte[]&gt;`,
-/// `ProcessGroupStats`, `RunProfile`, and `MemberInfo` — the shapes this port has today. Ports the
-/// **shape**, not the code, of ProcessKit-rs's `report-serde` feature; see `docs/jsonl-reports.md` for the
-/// full schema, the versioning promise, and C#/F# consumer examples reading a JSONL stream.
+/// `ProcessGroupStats`, `RunProfile`, `MemberInfo`, and `LimitEvidence` — the shapes this port has today.
+/// Ports the **shape**, not the code, of ProcessKit-rs's `report-serde` feature; see
+/// `docs/jsonl-reports.md` for the full schema, the versioning promise, and C#/F# consumer examples
+/// reading a JSONL stream.
 ///
-/// **Opt-in.** Nothing on `ProcessResult`/`ProcessGroupStats`/`RunProfile`/`MemberInfo` themselves changed
-/// — this is a separate serializer you reach for explicitly, via `JsonSerializer.Serialize(value,
-/// ReportJson.OutcomeTypeInfo)` or the `ToReportJson()` extension methods on `ReportJsonExtensions`.
+/// **Opt-in.** Nothing on `ProcessResult`/`ProcessGroupStats`/`RunProfile`/`MemberInfo`/`LimitEvidence`
+/// themselves changed — this is a separate serializer you reach for explicitly, via
+/// `JsonSerializer.Serialize(value, ReportJson.OutcomeTypeInfo)` or the `ToReportJson()` extension methods
+/// on `ReportJsonExtensions`.
 ///
 /// **Four rules, matching the source feature:**
 ///  1. **A tagged shape carries a `"kind"` identifier**, spelled as this schema's own stable, documented
 ///     machine name — never a raw union-case ordinal or a BCL `.ToString()`. `Outcome` is `exited` /
 ///     `signalled` / `timed_out` / `unobserved`; each report line's own envelope is `process_result` /
-///     `process_group_stats` / `run_profile` / `member_info`.
+///     `process_group_stats` / `run_profile` / `member_info` / `limit_evidence`.
 ///  2. **`Serialize` only — deliberately no `Deserialize`.** These are values the library *reports*, never
 ///     values a caller supplies back to it; every converter's `Read` throws `NotSupportedException`. Every
 ///     `JsonTypeInfo&lt;'T&gt;` below is still safe to pass to a `JsonSerializer.Deserialize` call by a
@@ -297,6 +328,10 @@ module ReportJson =
     let MemberInfoTypeInfo: JsonTypeInfo<MemberInfo> =
         JsonMetadataServices.CreateValueInfo<MemberInfo>(options, MemberInfoJsonConverter())
 
+    /// AOT-safe metadata for serializing a `LimitEvidence` report.
+    let LimitEvidenceTypeInfo: JsonTypeInfo<LimitEvidence> =
+        JsonMetadataServices.CreateValueInfo<LimitEvidence>(options, LimitEvidenceJsonConverter())
+
 /// C#-friendly `ToReportJson()` overloads over `ReportJson`'s metadata — one compact JSON object per call,
 /// with no embedded newline, so appending `Environment.NewLine` (or `\n`) after it is a valid JSONL line.
 /// F# callers can use these too, or call `JsonSerializer.Serialize(value, ReportJson.OutcomeTypeInfo)`
@@ -341,3 +376,9 @@ type ReportJsonExtensions =
     static member ToReportJson(memberInfo: MemberInfo) : string =
         ArgumentNullException.ThrowIfNull memberInfo
         JsonSerializer.Serialize(memberInfo, ReportJson.MemberInfoTypeInfo)
+
+    /// This resource-limit evidence as one JSONL report line (`ReportJson.LimitEvidenceTypeInfo`).
+    [<Extension>]
+    static member ToReportJson(evidence: LimitEvidence) : string =
+        ArgumentNullException.ThrowIfNull evidence
+        JsonSerializer.Serialize(evidence, ReportJson.LimitEvidenceTypeInfo)

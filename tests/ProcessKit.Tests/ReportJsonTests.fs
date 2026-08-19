@@ -6,9 +6,9 @@ open NUnit.Framework
 open ProcessKit
 
 /// The opt-in JSONL report serializer (T-375): `Outcome` / `ProcessResult` / `ProcessGroupStats` /
-/// `RunProfile` / `MemberInfo`, each as one self-describing line — a stable `"kind"` machine identifier,
-/// an explicit `null` for every unavailable metric, and never a captured stdout/stderr/argv/environment
-/// value on the wire.
+/// `RunProfile` / `MemberInfo` / `LimitEvidence` (T-381), each as one self-describing line — a stable
+/// `"kind"` machine identifier, an explicit `null` for every unavailable metric, and never a captured
+/// stdout/stderr/argv/environment value on the wire.
 [<TestFixture>]
 type ReportJsonTests() =
 
@@ -355,6 +355,22 @@ type ReportJsonTests() =
         Assert.That(root.GetProperty("start_time").ValueKind, Is.EqualTo JsonValueKind.Null)
 
     // -----------------------------------------------------------------------------------------------
+    // LimitEvidence
+    // -----------------------------------------------------------------------------------------------
+
+    [<Test>]
+    member _.``LimitEvidence reports one verdict identifier per axis``() =
+        let evidence =
+            LimitEvidence(LimitVerdict.Tripped, LimitVerdict.NotTripped, LimitVerdict.Unknown)
+
+        use doc = JsonDocument.Parse(evidence.ToReportJson())
+        let root = doc.RootElement
+        Assert.That(root.GetProperty("kind").GetString(), Is.EqualTo "limit_evidence")
+        Assert.That(root.GetProperty("memory").GetString(), Is.EqualTo "tripped")
+        Assert.That(root.GetProperty("processes").GetString(), Is.EqualTo "not_tripped")
+        Assert.That(root.GetProperty("cpu").GetString(), Is.EqualTo "unknown")
+
+    // -----------------------------------------------------------------------------------------------
     // JSONL formatting — one compact object per line, no embedded newline.
     // -----------------------------------------------------------------------------------------------
 
@@ -374,12 +390,15 @@ type ReportJsonTests() =
 
         let memberLine = MemberInfo(1, None, None, None).ToReportJson()
 
-        for line in [ outcomeLine; resultLine; statsLine; profileLine; memberLine ] do
+        let evidenceLine =
+            LimitEvidence(LimitVerdict.Tripped, LimitVerdict.NotTripped, LimitVerdict.Unknown).ToReportJson()
+
+        for line in [ outcomeLine; resultLine; statsLine; profileLine; memberLine; evidenceLine ] do
             Assert.That(line.Contains "\n", Is.False, line)
             Assert.That(line.Contains "\r", Is.False, line)
 
         let jsonl =
-            String.Join("\n", [ outcomeLine; resultLine; statsLine; profileLine; memberLine ])
+            String.Join("\n", [ outcomeLine; resultLine; statsLine; profileLine; memberLine; evidenceLine ])
 
         for line in jsonl.Split '\n' do
             use doc = JsonDocument.Parse line
