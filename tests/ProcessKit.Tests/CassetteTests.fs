@@ -1344,9 +1344,12 @@ type CassetteTests() =
                     Assert.That(result.OutputContainsAny [ "CAFÉ" ], Is.True, $"{source} OutputContainsAny")
 
                     match result.EnsureSuccess() with
-                    | Error(ProcessError.Exit(_, 7, stdout, stderr)) ->
+                    | Error(ProcessError.Exit(_, 7, stdout, stderr, stdoutBytes)) ->
                         Assert.That(stdout, Is.EqualTo text, $"{source} Exit stdout")
                         Assert.That(stderr, Is.EqualTo "warning", $"{source} Exit stderr")
+                        // A byte[]-based checking path (T-391): the non-UTF-8-safe Latin-1 bytes survive
+                        // exactly on StdoutBytes even though the decoded Stdout text is lossy.
+                        Assert.That(stdoutBytes, Is.EqualTo(Some result.Stdout), $"{source} Exit StdoutBytes")
                     | other -> Assert.Fail $"{source} must preserve the non-zero Exit error text, got {other}"
 
                 do!
@@ -2145,7 +2148,7 @@ type CassetteTests() =
                                 use recorder =
                                     RecordReplayRunner.Record(
                                         path,
-                                        ErrorRunner [ ProcessError.Exit("vault", 3, "", "denied") ],
+                                        ErrorRunner [ ProcessError.Exit("vault", 3, "", "denied", None) ],
                                         options
                                     )
 
@@ -2159,7 +2162,7 @@ type CassetteTests() =
                         | Error error -> Assert.Fail $"failure load: {error}"
                         | Ok replayer ->
                             match! (runner replayer).CaptureStringAsync(command, CancellationToken.None) with
-                            | Error(ProcessError.Exit(program, 3, _, stderr)) ->
+                            | Error(ProcessError.Exit(program, 3, _, stderr, _)) ->
                                 Assert.That(program, Is.EqualTo "vault", "a replayed failure names the LIVE program")
                                 Assert.That(stderr, Is.EqualTo "denied")
                             | other -> Assert.Fail $"a projected failure must replay as itself, got {other}"
@@ -3008,10 +3011,10 @@ type CassetteTests() =
                   ProcessError.NotFound("not-found-empty-path", Some "")
                   ProcessError.Spawn("spawn-tool", "EACCES: permission denied")
                   ProcessError.Stdin("stdin-tool", "could not open /tmp/does-not-exist")
-                  ProcessError.Exit("exit-tool", 3, "partial stdout", "boom")
-                  ProcessError.Signalled("signalled-known", Some 9, "some stdout", "killed")
-                  ProcessError.Signalled("signalled-unknown", None, "some stdout", "killed")
-                  ProcessError.Timeout("timeout-tool", TimeSpan.FromMilliseconds 2500.0, "slow out", "slow err")
+                  ProcessError.Exit("exit-tool", 3, "partial stdout", "boom", None)
+                  ProcessError.Signalled("signalled-known", Some 9, "some stdout", "killed", None)
+                  ProcessError.Signalled("signalled-unknown", None, "some stdout", "killed", None)
+                  ProcessError.Timeout("timeout-tool", TimeSpan.FromMilliseconds 2500.0, "slow out", "slow err", None)
                   ProcessError.OutputTooLarge("too-many-lines", Some 10, None, 11, 4096)
                   ProcessError.OutputTooLarge("too-many-bytes", None, Some 1024, 0, 2048)
                   ProcessError.Parse("parse-tool", "unexpected token at offset 3")
@@ -3205,8 +3208,8 @@ type CassetteTests() =
     member _.``duplicate recorded failures replay in capture order, then repeat the last``() : Task =
         withCassette (fun path ->
             task {
-                let first = ProcessError.Exit("tool", 1, "", "first failure")
-                let second = ProcessError.Exit("tool", 2, "", "second failure")
+                let first = ProcessError.Exit("tool", 1, "", "first failure", None)
+                let second = ProcessError.Exit("tool", 2, "", "second failure", None)
 
                 do!
                     task {
@@ -3250,7 +3253,7 @@ type CassetteTests() =
                     RecordReplayOptions().WithRedaction(fun s -> s.Replace("hunter2", "[REDACTED]"))
 
                 let secrets =
-                    [ ProcessError.Exit("exit-tool", 1, "token=hunter2", "auth failed for hunter2")
+                    [ ProcessError.Exit("exit-tool", 1, "token=hunter2", "auth failed for hunter2", None)
                       ProcessError.Spawn("spawn-tool", "could not run: --password=hunter2")
                       ProcessError.JsonRpc(
                           "rpc-tool",
@@ -3262,7 +3265,7 @@ type CassetteTests() =
                       ProcessError.NotFound("which-tool", Some "/opt/hunter2/bin:/usr/bin") ]
 
                 let scrubbed =
-                    [ ProcessError.Exit("exit-tool", 1, "token=[REDACTED]", "auth failed for [REDACTED]")
+                    [ ProcessError.Exit("exit-tool", 1, "token=[REDACTED]", "auth failed for [REDACTED]", None)
                       ProcessError.Spawn("spawn-tool", "could not run: --password=[REDACTED]")
                       ProcessError.JsonRpc(
                           "rpc-tool",
@@ -3398,7 +3401,7 @@ type CassetteTests() =
                   ProcessError.NotReady("tool", TimeSpan.FromSeconds 1.0)
                   ProcessError.ResourceLimit "no whole-tree limit primitive here"
                   ProcessError.Adopt(4321, "the target had already exited")
-                  ProcessError.RetryPredicate("tool", ProcessError.Exit("tool", 1, "", ""), "the predicate threw") ]
+                  ProcessError.RetryPredicate("tool", ProcessError.Exit("tool", 1, "", "", None), "the predicate threw") ]
 
             for expected in unrecorded do
                 let path = Path.GetTempFileName()
@@ -3562,7 +3565,7 @@ type CassetteTests() =
                     use replayer = replayer
 
                     match! (runner replayer).CaptureStringAsync(Command.create "tool", CancellationToken.None) with
-                    | Error(ProcessError.Timeout("tool", timeout, _, stderr)) ->
+                    | Error(ProcessError.Timeout("tool", timeout, _, stderr, _)) ->
                         Assert.That(timeout, Is.LessThanOrEqualTo TimeSpan.MaxValue)
                         Assert.That(stderr, Is.EqualTo "slow")
                     | other -> Assert.Fail $"expected a clamped Timeout failure, got {other}"

@@ -385,7 +385,7 @@ type TestabilityTests() =
         Assert.That(result.IsSuccess, Is.False)
 
         match ProcessResult.ensureSuccess result with
-        | Error(ProcessError.Exit(_, code, _, stderr)) ->
+        | Error(ProcessError.Exit(_, code, _, stderr, _)) ->
             Assert.That(code, Is.EqualTo 2)
             Assert.That(stderr, Is.EqualTo "boom")
         | other -> Assert.Fail $"expected an Exit error, got {other}"
@@ -400,7 +400,7 @@ type TestabilityTests() =
         Assert.That(result.Duration, Is.EqualTo elapsed)
 
         match ProcessResult.ensureSuccess result with
-        | Error(ProcessError.Timeout(_, timeout, _, _)) ->
+        | Error(ProcessError.Timeout(_, timeout, _, _, _)) ->
             Assert.That(timeout, Is.EqualTo elapsed, "configured duration unknown — using actual elapsed")
         | other -> Assert.Fail $"expected a Timeout error, got {other}"
 

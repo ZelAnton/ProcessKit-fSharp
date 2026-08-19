@@ -299,7 +299,7 @@ type CommandTests() =
         Assert.That((ProcessError.Io "pipe").IsTransient, Is.True)
         Assert.That((ProcessError.NotFound("git", None)).IsTransient, Is.False)
         Assert.That((ProcessError.Cancelled "git").IsTransient, Is.False)
-        Assert.That((ProcessError.Exit("git", 1, "", "")).IsTransient, Is.False)
+        Assert.That((ProcessError.Exit("git", 1, "", "", None)).IsTransient, Is.False)
 
     [<Test>]
     member _.``Result.Match projects Ok and Error``() =

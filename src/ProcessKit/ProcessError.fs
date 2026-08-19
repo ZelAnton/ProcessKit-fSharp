@@ -255,14 +255,22 @@ type ProcessError =
     /// field when you want to name the directories that were searched.
     | NotFound of Program: string * Searched: string option
 
-    /// A success-requiring verb (`run`) observed a non-zero exit code.
-    | Exit of Program: string * Code: int * Stdout: string * Stderr: string
+    /// A success-requiring verb (`run`) observed a non-zero exit code. `StdoutBytes` carries the exact
+    /// pre-decode stdout bytes when the checking verb was built over `ProcessResult<byte[]>` (a
+    /// bytes-based capture — `OutputBytesAsync`/`ProcessResult.ensureSuccess` on a `byte[]` result and
+    /// their pipeline twins); `None` for a text-based capture (`Stdout` is then the only representation,
+    /// never reconstructed into bytes). See `ProcessError.StdoutBytes` for the read-without-destructure
+    /// accessor.
+    | Exit of Program: string * Code: int * Stdout: string * Stderr: string * StdoutBytes: byte[] option
 
-    /// The process was terminated by a signal (Unix) or otherwise killed without a code.
-    | Signalled of Program: string * Signal: int option * Stdout: string * Stderr: string
+    /// The process was terminated by a signal (Unix) or otherwise killed without a code. `StdoutBytes`
+    /// is the exact pre-decode capture for a bytes-based checking verb, `None` for a text-based one — see
+    /// `Exit.StdoutBytes` above.
+    | Signalled of Program: string * Signal: int option * Stdout: string * Stderr: string * StdoutBytes: byte[] option
 
-    /// The run exceeded its configured timeout.
-    | Timeout of Program: string * Timeout: TimeSpan * Stdout: string * Stderr: string
+    /// The run exceeded its configured timeout. `StdoutBytes` is the exact pre-decode capture for a
+    /// bytes-based checking verb, `None` for a text-based one — see `Exit.StdoutBytes` above.
+    | Timeout of Program: string * Timeout: TimeSpan * Stdout: string * Stderr: string * StdoutBytes: byte[] option
 
     /// The run's actual exit status was never observed (see `Outcome.Unobserved`) — a native API
     /// failure, an unresolved POSIX reap race, or a hard-killed tree that was not reaped inside the
@@ -391,15 +399,15 @@ type ProcessError =
             | Some path ->
                 $"program '{MessageText.fragment program}' was not found (searched {MessageText.searchedPath path})"
             | None -> $"program '{MessageText.fragment program}' was not found"
-        | ProcessError.Exit(program, code, _, stderr) ->
+        | ProcessError.Exit(program, code, _, stderr, _) ->
             $"'{MessageText.fragment program}' exited with code {code}{MessageText.diagnosticTail stderr}"
-        | ProcessError.Signalled(program, signal, _, stderr) ->
+        | ProcessError.Signalled(program, signal, _, stderr, _) ->
             let tail = MessageText.diagnosticTail stderr
 
             match signal with
             | Some s -> $"'{MessageText.fragment program}' was terminated by signal {s}{tail}"
             | None -> $"'{MessageText.fragment program}' was killed{tail}"
-        | ProcessError.Timeout(program, timeout, _, stderr) ->
+        | ProcessError.Timeout(program, timeout, _, stderr, _) ->
             $"'{MessageText.fragment program}' timed out after {timeout.TotalSeconds}s{MessageText.diagnosticTail stderr}"
         | ProcessError.Unobserved(program, detail) ->
             $"'{MessageText.fragment program}' has no observed exit status: {MessageText.fragment detail}"
@@ -486,9 +494,9 @@ type ProcessError =
         match this with
         | ProcessError.Spawn(program, _)
         | ProcessError.NotFound(program, _)
-        | ProcessError.Exit(program, _, _, _)
-        | ProcessError.Signalled(program, _, _, _)
-        | ProcessError.Timeout(program, _, _, _)
+        | ProcessError.Exit(program, _, _, _, _)
+        | ProcessError.Signalled(program, _, _, _, _)
+        | ProcessError.Timeout(program, _, _, _, _)
         | ProcessError.Unobserved(program, _)
         | ProcessError.Cancelled program
         | ProcessError.NotReady(program, _)
@@ -508,19 +516,33 @@ type ProcessError =
     /// attempt inside `RetryPredicate`); `None` otherwise.
     member this.Stdout: string option =
         match this with
-        | ProcessError.Exit(_, _, stdout, _)
-        | ProcessError.Signalled(_, _, stdout, _)
-        | ProcessError.Timeout(_, _, stdout, _) -> Some stdout
+        | ProcessError.Exit(_, _, stdout, _, _)
+        | ProcessError.Signalled(_, _, stdout, _, _)
+        | ProcessError.Timeout(_, _, stdout, _, _) -> Some stdout
         | ProcessError.RetryPredicate(_, original, _) -> original.Stdout
+        | _ -> None
+
+    /// The exact pre-decode stdout bytes when the error carries them — the checking verb was built over
+    /// `ProcessResult<byte[]>` (a bytes-based capture), so the raw bytes survive alongside the lossy,
+    /// already-decoded `Stdout` text (`Exit` / `Signalled` / `Timeout`, or the original attempt inside
+    /// `RetryPredicate`). `None` when the capture was text-based (`ProcessResult<string>`): the bytes are
+    /// never reconstructed from the decoded string — that would fabricate data, not report exact bytes —
+    /// and `None` for every other case, which carries no stdout at all.
+    member this.StdoutBytes: byte[] option =
+        match this with
+        | ProcessError.Exit(_, _, _, _, stdoutBytes)
+        | ProcessError.Signalled(_, _, _, _, stdoutBytes)
+        | ProcessError.Timeout(_, _, _, _, stdoutBytes) -> stdoutBytes
+        | ProcessError.RetryPredicate(_, original, _) -> original.StdoutBytes
         | _ -> None
 
     /// The captured stderr when the error carries it (`Exit` / `Signalled` / `Timeout`, or the original
     /// attempt inside `RetryPredicate`); `None` otherwise.
     member this.Stderr: string option =
         match this with
-        | ProcessError.Exit(_, _, _, stderr)
-        | ProcessError.Signalled(_, _, _, stderr)
-        | ProcessError.Timeout(_, _, _, stderr) -> Some stderr
+        | ProcessError.Exit(_, _, _, stderr, _)
+        | ProcessError.Signalled(_, _, _, stderr, _)
+        | ProcessError.Timeout(_, _, _, stderr, _) -> Some stderr
         | ProcessError.RetryPredicate(_, original, _) -> original.Stderr
         | _ -> None
 
@@ -529,9 +551,9 @@ type ProcessError =
     /// `RetryPredicate`); `None` otherwise.
     member this.Combined: string option =
         match this with
-        | ProcessError.Exit(_, _, stdout, stderr)
-        | ProcessError.Signalled(_, _, stdout, stderr)
-        | ProcessError.Timeout(_, _, stdout, stderr) -> Some(ProcessError.CombineStreams(stdout, stderr))
+        | ProcessError.Exit(_, _, stdout, stderr, _)
+        | ProcessError.Signalled(_, _, stdout, stderr, _)
+        | ProcessError.Timeout(_, _, stdout, stderr, _) -> Some(ProcessError.CombineStreams(stdout, stderr))
         | ProcessError.RetryPredicate(_, original, _) -> original.Combined
         | _ -> None
 
@@ -539,7 +561,7 @@ type ProcessError =
     /// `None` otherwise (a signal kill or timeout has none).
     member this.Code: int option =
         match this with
-        | ProcessError.Exit(_, code, _, _) -> Some code
+        | ProcessError.Exit(_, code, _, _, _) -> Some code
         | ProcessError.RetryPredicate(_, original, _) -> original.Code
         | _ -> None
 
@@ -547,7 +569,7 @@ type ProcessError =
     /// `RetryPredicate` original is one; `None` otherwise.
     member this.Signal: int option =
         match this with
-        | ProcessError.Signalled(_, signal, _, _) -> signal
+        | ProcessError.Signalled(_, signal, _, _, _) -> signal
         | ProcessError.RetryPredicate(_, original, _) -> original.Signal
         | _ -> None
 

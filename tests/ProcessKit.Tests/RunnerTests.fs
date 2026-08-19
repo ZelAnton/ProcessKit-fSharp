@@ -308,7 +308,7 @@ type RunnerTests() =
             let! result = Command.create "boom" |> Runner.run runner CancellationToken.None
 
             match result with
-            | Error(ProcessError.Exit(_, code, _, stderr)) ->
+            | Error(ProcessError.Exit(_, code, _, stderr, _)) ->
                 Assert.That(code, Is.EqualTo 2)
                 Assert.That(stderr, Is.EqualTo "kaboom")
             | other -> Assert.Fail $"expected an Exit error, got {other}"
@@ -352,7 +352,7 @@ type RunnerTests() =
             let! result = Command.create "boom" |> Runner.probe runner CancellationToken.None
 
             match result with
-            | Error(ProcessError.Exit(_, 2, _, _)) -> Assert.Pass()
+            | Error(ProcessError.Exit(_, 2, _, _, _)) -> Assert.Pass()
             | other -> Assert.Fail $"expected an Exit error, got {other}"
         }
         :> Task
@@ -397,7 +397,7 @@ type RunnerTests() =
                 { new IProcessRunner with
                     member _.CaptureStringAsync(_, _) =
                         calls <- calls + 1
-                        Task.FromResult(Error(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+                        Task.FromResult(Error(ProcessError.Exit("svc", 7, "stdout", "stderr", None)))
 
                     member _.CaptureBytesAsync(command, _) =
                         Task.FromResult(Error(ProcessError.Unsupported command.Program))
@@ -418,7 +418,7 @@ type RunnerTests() =
                 match result with
                 | Error(ProcessError.RetryPredicate(program, original, detail)) ->
                     Assert.That(program, Is.EqualTo "svc")
-                    Assert.That(original, Is.EqualTo(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+                    Assert.That(original, Is.EqualTo(ProcessError.Exit("svc", 7, "stdout", "stderr", None)))
                     Assert.That(original.Stdout, Is.EqualTo(Some "stdout"))
                     Assert.That(original.Stderr, Is.EqualTo(Some "stderr"))
                     Assert.That(detail, Does.Contain "classifier boom")
@@ -437,11 +437,11 @@ type RunnerTests() =
                 { new IProcessRunner with
                     member _.CaptureStringAsync(_, _) =
                         calls <- calls + 1
-                        Task.FromResult(Error(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+                        Task.FromResult(Error(ProcessError.Exit("svc", 7, "stdout", "stderr", None)))
 
                     member _.CaptureBytesAsync(_, _) =
                         calls <- calls + 1
-                        Task.FromResult(Error(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+                        Task.FromResult(Error(ProcessError.Exit("svc", 7, "stdout", "stderr", None)))
 
                     member _.SpawnAsync(command, _) =
                         Task.FromResult(Error(ProcessError.Unsupported command.Program)) }
@@ -453,7 +453,7 @@ type RunnerTests() =
                 match result with
                 | Error(ProcessError.RetryPredicate(program, original, detail)) ->
                     Assert.That(program, Is.EqualTo "svc")
-                    Assert.That(original, Is.EqualTo(ProcessError.Exit("svc", 7, "stdout", "stderr")))
+                    Assert.That(original, Is.EqualTo(ProcessError.Exit("svc", 7, "stdout", "stderr", None)))
                     Assert.That(detail, Does.Contain "classifier boom")
                 | other -> Assert.Fail $"{label} returned {other}"
 
@@ -489,7 +489,7 @@ type RunnerTests() =
                 { new IProcessRunner with
                     member _.CaptureStringAsync(_, _) =
                         calls <- calls + 1
-                        Task.FromResult(Error(ProcessError.Exit("svc", 3, "", "failed")))
+                        Task.FromResult(Error(ProcessError.Exit("svc", 3, "", "failed", None)))
 
                     member _.CaptureBytesAsync(command, _) =
                         Task.FromResult(Error(ProcessError.Unsupported command.Program))
@@ -506,7 +506,7 @@ type RunnerTests() =
             let! result = command |> Runner.run alwaysFailing CancellationToken.None
 
             match result with
-            | Error(ProcessError.Exit("svc", 3, "", "failed")) -> ()
+            | Error(ProcessError.Exit("svc", 3, "", "failed", _)) -> ()
             | other -> Assert.Fail $"expected the original terminal Exit, got {other}"
 
             Assert.That(calls, Is.EqualTo 1)
@@ -526,7 +526,7 @@ type RunnerTests() =
                             calls <- calls + 1
 
                             if calls < 3 then
-                                Task.FromResult(Error(ProcessError.Exit("svc", 1, "", "retryable")))
+                                Task.FromResult(Error(ProcessError.Exit("svc", 1, "", "retryable", None)))
                             else
                                 Task.FromResult(Ok(ProcessResult.Success "ok"))
 
@@ -546,7 +546,7 @@ type RunnerTests() =
             let! trueResult, trueCalls = runWith (fun _ -> true)
 
             match falseResult with
-            | Error(ProcessError.Exit("svc", 1, "", "retryable")) -> ()
+            | Error(ProcessError.Exit("svc", 1, "", "retryable", _)) -> ()
             | other -> Assert.Fail $"false shouldRetry should keep the first error, got {other}"
 
             match trueResult with
@@ -786,7 +786,7 @@ type RunnerTests() =
             let! result = command |> Runner.run alwaysFailing CancellationToken.None
 
             match result with
-            | Error(ProcessError.Exit(_, 1, _, _)) -> ()
+            | Error(ProcessError.Exit(_, 1, _, _, _)) -> ()
             | other -> Assert.Fail $"expected an Exit error, got {other}"
 
             Assert.That(calls, Is.EqualTo 1)
@@ -865,7 +865,7 @@ type RunnerTests() =
             let! result = command |> Runner.run alwaysFailing CancellationToken.None
 
             match result with
-            | Error(ProcessError.Exit(_, 1, _, _)) -> ()
+            | Error(ProcessError.Exit(_, 1, _, _, _)) -> ()
             | other -> Assert.Fail $"expected an Exit error, got {other}"
 
             Assert.That(calls, Is.EqualTo 3)
@@ -992,7 +992,7 @@ type RunnerTests() =
             // A non-zero exit means a child ran and may already have drained the stream, so the run ends
             // on the first attempt's own error instead of replaying empty stdin into a second one.
             match result with
-            | Error(ProcessError.Exit(_, 1, _, _)) -> ()
+            | Error(ProcessError.Exit(_, 1, _, _, _)) -> ()
             | other -> Assert.Fail $"expected the first attempt's Exit error, got {other}"
 
             Assert.That(calls, Is.EqualTo 1)
@@ -1011,7 +1011,7 @@ type RunnerTests() =
 
                         if calls = 1 then
                             Task.FromResult(
-                                Error(ProcessError.Timeout("svc", TimeSpan.FromSeconds 5.0, "partial", "slow"))
+                                Error(ProcessError.Timeout("svc", TimeSpan.FromSeconds 5.0, "partial", "slow", None))
                             )
                         else
                             Task.FromResult(Ok(ProcessResult.Success "hello"))
@@ -1034,7 +1034,7 @@ type RunnerTests() =
             // The first error survives intact — it is not replaced by a later attempt's result, nor by a
             // `RetryPredicate` from a classifier the gate never consults.
             match result with
-            | Error(ProcessError.Timeout(_, timeout, stdout, _)) ->
+            | Error(ProcessError.Timeout(_, timeout, stdout, _, _)) ->
                 Assert.That(timeout, Is.EqualTo(TimeSpan.FromSeconds 5.0))
                 Assert.That(stdout, Is.EqualTo "partial")
             | other -> Assert.Fail $"expected the first attempt's Timeout error, got {other}"
@@ -2016,7 +2016,7 @@ line-2"
                 |> Runner.runUnit (BoundedCapture.runnerExiting 3 "output\n") CancellationToken.None
 
             match result with
-            | Error(ProcessError.Exit("capture", 3, _, _)) -> ()
+            | Error(ProcessError.Exit("capture", 3, _, _, _)) -> ()
             | other -> Assert.Fail $"expected Exit 3, got {other}"
         }
         :> Task
@@ -2031,7 +2031,7 @@ line-2"
                 |> Runner.run (BoundedCapture.runnerExiting 1 (BoundedCapture.payload 5)) CancellationToken.None
 
             match result with
-            | Error(ProcessError.Exit("capture", 1, _, _)) -> ()
+            | Error(ProcessError.Exit("capture", 1, _, _, _)) -> ()
             | other -> Assert.Fail $"expected Exit 1, got {other}"
         }
         :> Task

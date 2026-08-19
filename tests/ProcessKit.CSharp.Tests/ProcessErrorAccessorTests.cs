@@ -16,7 +16,13 @@ public class ProcessErrorAccessorTests
     [Test]
     public void Exit_accessors_expose_program_code_and_streams_without_destructuring()
     {
-        ProcessError error = ProcessError.NewExit("git", 128, "partial stdout", "fatal: not a git repository");
+        ProcessError error = ProcessError.NewExit(
+            "git",
+            128,
+            "partial stdout",
+            "fatal: not a git repository",
+            FSharpOption<byte[]>.None
+        );
 
         Assert.That(error.IsExit, Is.True);
         Assert.That(error.Program is { Value: "git" });
@@ -26,6 +32,35 @@ public class ProcessErrorAccessorTests
         Assert.That(error.Combined is { Value: "partial stdout\nfatal: not a git repository" });
         Assert.That(error.Signal, Is.Null); // an Exit never carries a signal
         Assert.That(error.Message, Does.Contain("exited with code 128"));
+        Assert.That(error.StdoutBytes, Is.Null); // a text-based Exit never fabricates bytes from Stdout
+    }
+
+    [Test]
+    public void StdoutBytes_carries_exact_pre_decode_bytes_for_a_bytes_based_Exit()
+    {
+        // Invalid UTF-8 (a lone continuation byte) is the whole point: the exact bytes must survive on
+        // StdoutBytes even though the decoded Stdout text is necessarily a lossy replacement-character
+        // preview (T-391 — the F# side of this same regression lives in
+        // ProcessErrorSanitizationTests.fs).
+        byte[] rawBytes = [0x68, 0x69, 0x80, 0x41];
+        string decodedText = System.Text.Encoding.UTF8.GetString(rawBytes);
+
+        ProcessError error = ProcessError.NewExit(
+            "tool",
+            1,
+            decodedText,
+            "",
+            FSharpOption<byte[]>.Some(rawBytes)
+        );
+
+        Assert.That(error.StdoutBytes is { Value: not null });
+
+        if (error.StdoutBytes is { Value: var bytes })
+        {
+            Assert.That(bytes, Is.EqualTo(rawBytes)); // exact byte-for-byte round-trip
+        }
+
+        Assert.That(error.Stdout is { Value: var stdout } && stdout == decodedText);
     }
 
     [Test]

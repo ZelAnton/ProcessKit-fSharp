@@ -35,15 +35,16 @@ type ApiParityTests() =
 
     [<Test>]
     member _.``ProcessError accessors read fields across cases without destructuring``() =
-        let exit = ProcessError.Exit("git", 2, "out", "err")
+        let exit = ProcessError.Exit("git", 2, "out", "err", None)
         Assert.That(exit.Program, Is.EqualTo(Some "git"))
         Assert.That(exit.Code, Is.EqualTo(Some 2))
         Assert.That(exit.Stdout, Is.EqualTo(Some "out"))
         Assert.That(exit.Stderr, Is.EqualTo(Some "err"))
         Assert.That(exit.Signal, Is.EqualTo(None: int option))
         Assert.That(exit.Combined, Is.EqualTo(Some "out\nerr"))
+        Assert.That(exit.StdoutBytes, Is.EqualTo(None: byte[] option))
 
-        let signalled = ProcessError.Signalled("tool", Some 9, "", "boom")
+        let signalled = ProcessError.Signalled("tool", Some 9, "", "boom", None)
         Assert.That(signalled.Program, Is.EqualTo(Some "tool"))
         Assert.That(signalled.Signal, Is.EqualTo(Some 9))
         Assert.That(signalled.Code, Is.EqualTo(None: int option))
@@ -207,7 +208,11 @@ type ApiParityTests() =
             | Error error -> Assert.Fail $"OutputBytes errored: {error.Message}"
             | Ok result ->
                 match ProcessResult.ensureSuccess result with
-                | Error(ProcessError.Exit(_, code, _, _)) -> Assert.That(code, Is.EqualTo 7)
+                | Error(ProcessError.Exit(_, code, _, _, stdoutBytes)) ->
+                    Assert.That(code, Is.EqualTo 7)
+                    // A bytes-based checking verb: FailureError attaches the exact pre-decode bytes
+                    // alongside the decoded Stdout text (T-391).
+                    Assert.That(stdoutBytes, Is.EqualTo(Some result.Stdout))
                 | Error other -> Assert.Fail $"expected an Exit error, got {other.Message}"
                 | Ok _ -> Assert.Fail "expected exit 7 to fail ensureSuccess"
         }

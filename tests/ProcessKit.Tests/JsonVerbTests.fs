@@ -98,7 +98,7 @@ type JsonVerbTests() =
                 |> Runner.outputJson<Widget> runner CancellationToken.None None
 
             match result with
-            | Error(ProcessError.Exit(_, 1, _, stderr)) -> Assert.That(stderr, Is.EqualTo "boom")
+            | Error(ProcessError.Exit(_, 1, _, stderr, _)) -> Assert.That(stderr, Is.EqualTo "boom")
             | other -> Assert.Fail $"expected an Exit error, got {other}"
         }
         :> Task
@@ -111,7 +111,7 @@ type JsonVerbTests() =
                 |> Runner.outputJsonTyped<Widget> runner CancellationToken.None widgetTypeInfo
 
             match result with
-            | Error(ProcessError.Exit(_, 1, _, stderr)) -> Assert.That(stderr, Is.EqualTo "boom")
+            | Error(ProcessError.Exit(_, 1, _, stderr, _)) -> Assert.That(stderr, Is.EqualTo "boom")
             | other -> Assert.Fail $"expected an Exit error, got {other}"
         }
         :> Task

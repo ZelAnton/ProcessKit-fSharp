@@ -1353,7 +1353,10 @@ module internal PipelineRunner =
                             // silently downgrading it to Cancelled merely because no session was created.
                             match timeout with
                             | Some deadline ->
-                                return Error(ProcessError.Timeout(stages[stages.Length - 1].Program, deadline, "", ""))
+                                return
+                                    Error(
+                                        ProcessError.Timeout(stages[stages.Length - 1].Program, deadline, "", "", None)
+                                    )
                             | None -> return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
                         | None -> return Error(ProcessError.Cancelled stages[stages.Length - 1].Program)
                     else

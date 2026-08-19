@@ -694,14 +694,16 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | CassetteFailureKind.Parse -> Ok(ProcessError.Parse(program, detail))
         | CassetteFailureKind.Exit ->
             match Option.ofNullable failure.Code with
-            | Some code -> Ok(ProcessError.Exit(program, code, stdout, stderr))
+            // A cassette records stdout as JSON text, never raw bytes, so a replayed failure's
+            // `StdoutBytes` is always `None` — it is never fabricated from the recorded string.
+            | Some code -> Ok(ProcessError.Exit(program, code, stdout, stderr, None))
             | None -> Error "an 'Exit' failure carries no exit code"
         | CassetteFailureKind.Signalled ->
-            Ok(ProcessError.Signalled(program, Option.ofNullable failure.Signal, stdout, stderr))
+            Ok(ProcessError.Signalled(program, Option.ofNullable failure.Signal, stdout, stderr, None))
         | CassetteFailureKind.Timeout ->
             match Option.ofNullable failure.TimeoutMs with
             | Some milliseconds ->
-                Ok(ProcessError.Timeout(program, TimeSpan.FromMilliseconds milliseconds, stdout, stderr))
+                Ok(ProcessError.Timeout(program, TimeSpan.FromMilliseconds milliseconds, stdout, stderr, None))
             | None -> Error "a 'Timeout' failure carries no timeout"
         | CassetteFailureKind.OutputTooLarge ->
             Ok(
@@ -1626,21 +1628,24 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 { noFailurePayload with
                     Kind = CassetteFailureKind.Parse
                     Detail = redactText detail }
-        | ProcessError.Exit(_, code, stdout, stderr) ->
+        | ProcessError.Exit(_, code, stdout, stderr, _) ->
+            // `StdoutBytes` is not recorded: a cassette entry is JSON text, and replay always rebuilds
+            // with `StdoutBytes = None` (see `failureToError` above) — recording it would promise a
+            // round-trip this format cannot honour.
             Some
                 { noFailurePayload with
                     Kind = CassetteFailureKind.Exit
                     Code = Nullable code
                     Stdout = redactText stdout
                     Stderr = redactText stderr }
-        | ProcessError.Signalled(_, signal, stdout, stderr) ->
+        | ProcessError.Signalled(_, signal, stdout, stderr, _) ->
             Some
                 { noFailurePayload with
                     Kind = CassetteFailureKind.Signalled
                     Signal = Option.toNullable signal
                     Stdout = redactText stdout
                     Stderr = redactText stderr }
-        | ProcessError.Timeout(_, timeout, stdout, stderr) ->
+        | ProcessError.Timeout(_, timeout, stdout, stderr, _) ->
             Some
                 { noFailurePayload with
                     Kind = CassetteFailureKind.Timeout

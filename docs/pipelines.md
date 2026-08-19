@@ -212,7 +212,7 @@ for you:
 ```fsharp
 match! pipeline.RunAsync() with
 | Ok out -> printfn $"{out}"
-| Error(ProcessError.Exit(program, code, _, stderr)) ->
+| Error(ProcessError.Exit(program, code, _, stderr, _)) ->
     eprintfn $"{program} exited {code}: {stderr}" // program = "grep", code = 2
 | Error err -> eprintfn $"{err.Message}"
 ```

@@ -37,7 +37,7 @@ type ErgonomicsTests() =
     member _.``a non-zero exit outside OkCodes still fails Run``() : Task =
         task {
             match! (shell "exit 2").RunAsync() with
-            | Error(ProcessError.Exit(_, 2, _, _)) -> Assert.Pass()
+            | Error(ProcessError.Exit(_, 2, _, _, _)) -> Assert.Pass()
             | other -> Assert.Fail $"expected Exit 2, got {other}"
         }
         :> Task
@@ -54,7 +54,7 @@ type ErgonomicsTests() =
             | Error error -> Assert.Fail $"{error}"
 
             match! command.RunAsync() with
-            | Error(ProcessError.Exit(_, 0, _, _)) -> Assert.Pass()
+            | Error(ProcessError.Exit(_, 0, _, _, _)) -> Assert.Pass()
             | other -> Assert.Fail $"expected Exit 0, got {other}"
         }
         :> Task

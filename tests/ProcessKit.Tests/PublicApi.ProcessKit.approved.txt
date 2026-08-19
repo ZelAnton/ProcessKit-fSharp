@@ -776,11 +776,12 @@ class ProcessKit.ProcessError
   property Signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property Stderr : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
   property Stdout : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
+  property StdoutBytes : Microsoft.FSharp.Core.FSharpOption<System.Byte[]> { get }
   property Tag : System.Int32 { get }
   static member NewAdopt(System.Int32, System.String) : ProcessKit.ProcessError
   static member NewCancelled(System.String) : ProcessKit.ProcessError
   static member NewCassetteMiss(System.String) : ProcessKit.ProcessError
-  static member NewExit(System.String, System.Int32, System.String, System.String) : ProcessKit.ProcessError
+  static member NewExit(System.String, System.Int32, System.String, System.String, Microsoft.FSharp.Core.FSharpOption<System.Byte[]>) : ProcessKit.ProcessError
   static member NewIo(System.String) : ProcessKit.ProcessError
   static member NewJsonRpc(System.String, System.String, System.Int32, System.String, Microsoft.FSharp.Core.FSharpOption<System.String>) : ProcessKit.ProcessError
   static member NewNotFound(System.String, Microsoft.FSharp.Core.FSharpOption<System.String>) : ProcessKit.ProcessError
@@ -790,10 +791,10 @@ class ProcessKit.ProcessError
   static member NewParse(System.String, System.String) : ProcessKit.ProcessError
   static member NewResourceLimit(System.String) : ProcessKit.ProcessError
   static member NewRetryPredicate(System.String, ProcessKit.ProcessError, System.String) : ProcessKit.ProcessError
-  static member NewSignalled(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int32>, System.String, System.String) : ProcessKit.ProcessError
+  static member NewSignalled(System.String, Microsoft.FSharp.Core.FSharpOption<System.Int32>, System.String, System.String, Microsoft.FSharp.Core.FSharpOption<System.Byte[]>) : ProcessKit.ProcessError
   static member NewSpawn(System.String, System.String) : ProcessKit.ProcessError
   static member NewStdin(System.String, System.String) : ProcessKit.ProcessError
-  static member NewTimeout(System.String, System.TimeSpan, System.String, System.String) : ProcessKit.ProcessError
+  static member NewTimeout(System.String, System.TimeSpan, System.String, System.String, Microsoft.FSharp.Core.FSharpOption<System.Byte[]>) : ProcessKit.ProcessError
   static member NewUnobserved(System.String, System.String) : ProcessKit.ProcessError
   static member NewUnsupported(System.String) : ProcessKit.ProcessError
 
@@ -824,10 +825,12 @@ class ProcessKit.ProcessError+Exit : ProcessKit.ProcessError
   member get_Program() : System.String
   member get_Stderr() : System.String
   member get_Stdout() : System.String
+  member get_StdoutBytes() : Microsoft.FSharp.Core.FSharpOption<System.Byte[]>
   property Code : System.Int32 { get }
   property Program : System.String { get }
   property Stderr : System.String { get }
   property Stdout : System.String { get }
+  property StdoutBytes : Microsoft.FSharp.Core.FSharpOption<System.Byte[]> { get }
 
 class ProcessKit.ProcessError+Io : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
@@ -916,10 +919,12 @@ class ProcessKit.ProcessError+Signalled : ProcessKit.ProcessError
   member get_Signal() : Microsoft.FSharp.Core.FSharpOption<System.Int32>
   member get_Stderr() : System.String
   member get_Stdout() : System.String
+  member get_StdoutBytes() : Microsoft.FSharp.Core.FSharpOption<System.Byte[]>
   property Program : System.String { get }
   property Signal : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property Stderr : System.String { get }
   property Stdout : System.String { get }
+  property StdoutBytes : Microsoft.FSharp.Core.FSharpOption<System.Byte[]> { get }
 
 class ProcessKit.ProcessError+Spawn : ProcessKit.ProcessError
   :> System.Collections.IStructuralEquatable
@@ -964,10 +969,12 @@ class ProcessKit.ProcessError+Timeout : ProcessKit.ProcessError
   member get_Program() : System.String
   member get_Stderr() : System.String
   member get_Stdout() : System.String
+  member get_StdoutBytes() : Microsoft.FSharp.Core.FSharpOption<System.Byte[]>
   member get_Timeout() : System.TimeSpan
   property Program : System.String { get }
   property Stderr : System.String { get }
   property Stdout : System.String { get }
+  property StdoutBytes : Microsoft.FSharp.Core.FSharpOption<System.Byte[]> { get }
   property Timeout : System.TimeSpan { get }
 
 class ProcessKit.ProcessError+Unobserved : ProcessKit.ProcessError
