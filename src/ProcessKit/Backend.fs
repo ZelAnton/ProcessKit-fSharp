@@ -786,12 +786,12 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             // spawn->migrate window where a descendant forked in that first instant could escape the
             // limits. See `Native.Posix.spawnPosixIntoCgroup`. `Spawned.Handle` is the launcher pid,
             // which becomes the target's pid unchanged across `exec`.
-            let effective =
-                match currentLimits.CpuTimeMax with
-                | Some duration -> Native.Posix.withCpuTimeLimit duration command
-                | None -> Ok command
-
-            effective
+            // One rewrite applies BOTH per-process caps that have to reach the child before its program
+            // starts: this group's whole-tree `CpuTimeMax` and any `Command.Rlimit` the command carries.
+            // Folding them here, in one place, is what keeps the shared CPU-time axis honest — applying
+            // them separately would let whichever ran last overwrite the other (see
+            // `Native.Posix.withProcessLimits`, which takes the stricter of the two).
+            Native.Posix.withProcessLimits currentLimits.CpuTimeMax command
             |> Result.bind (fun wrapped ->
                 Native.Posix.spawnPosixIntoCgroup wrapped (System.IO.Path.Combine(cgroupPath, "cgroup.procs")))
 
@@ -1260,11 +1260,12 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
         member _.Mechanism = Mechanism.ProcessGroup
 
         member _.Spawn(command) =
-            match initialLimits.CpuTimeMax with
-            | Some duration ->
-                Native.Posix.withCpuTimeLimit duration command
-                |> Result.bind Native.Posix.spawnPosix
-            | None -> Native.Posix.spawnPosix command
+            // Both per-child caps in one rewrite: this group's whole-tree `CpuTimeMax` and any
+            // `Command.Rlimit` the command carries, with the stricter value winning on the CPU-time axis
+            // they share (see `Native.Posix.withProcessLimits`). A command with neither is passed through
+            // untouched.
+            Native.Posix.withProcessLimits initialLimits.CpuTimeMax command
+            |> Result.bind Native.Posix.spawnPosix
 
         member _.Track(spawned) =
             // Each posix_spawn already formed its own process group (pgid = child pid), so the child is

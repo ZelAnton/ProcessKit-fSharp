@@ -474,6 +474,26 @@ limit-capable container; the POSIX process-group mechanism supports only the per
 rlimit. Any unsupported request fails at creation with `ProcessError.ResourceLimit` rather than
 returning a silently-unbounded group.
 
+**Per-process resource limits (`Command.Rlimit`)**
+
+| Capability | Windows | Linux | macOS / BSD |
+|---|:---:|:---:|:---:|
+| `Rlimit(Cpu\|Core\|Data\|FileSize\|NoFile\|Stack, soft, hard)` | ❌ `ProcessError.Unsupported` | ✅ via util-linux `prlimit` | ❌ `ProcessError.ResourceLimit` (no util-linux) |
+
+`Command.Rlimit` caps ONE process rather than the tree: the value is applied to the child before its
+program starts (`setrlimit(2)` semantics) and inherited individually by every descendant, each of which
+may lower it further or raise its soft value back to the inherited hard one. Values are in the
+resource's own unit — bytes for `Core`/`Data`/`FileSize`/`Stack`, seconds for `Cpu`, a count for
+`NoFile` — and there is no "unlimited" value, because the builder exists to lower what the child
+inherited. Applying it needs a helper that can call `setrlimit` between the spawn and the `exec`, which
+on .NET means an external one: util-linux's `prlimit`, resolved only from a trusted system directory
+(`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and never from `PATH`, exactly as `setpriv` is. A host
+holding it in none of them — macOS/BSD, which have no util-linux, or a minimal image — refuses the
+spawn with `ProcessError.ResourceLimit`; Windows, which has no `setrlimit` concept at all, refuses with
+`ProcessError.Unsupported` and offers the whole-tree Job Object caps above instead. Where `Cpu` meets
+the group's `WithCpuTimeMax`, the stricter of the two values is what the child gets
+(see [Resource limits](process-groups.md#per-process-limits-on-a-command)).
+
 `WithCpuAffinity` pins the tree to a set of zero-based core indices and carries two platform ceilings,
 both reported as a typed `ProcessError.ResourceLimit` at creation/update rather than as a silently
 dropped pin. **Windows:** `JOBOBJECT_BASIC_LIMIT_INFORMATION.Affinity` is one pointer-sized mask

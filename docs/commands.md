@@ -1170,6 +1170,87 @@ Drive such tools non-interactively instead (key-based auth, `ssh -o BatchMode=ye
 `GIT_TERMINAL_PROMPT=0`), or feed a known answer over
 [interactive stdin](streaming.md).
 
+### Per-process resource limits (`Rlimit`)
+
+**`Rlimit(resource, soft, hard)`** caps one Unix per-process resource for the child
+(`setrlimit(2)`), applied before its program starts and inherited individually by
+every descendant it forks. Six resources are typed as `RlimitResource`:
+
+| Resource | Unit | Caps |
+|---|---|---|
+| `Cpu` | seconds | CPU time (`SIGXCPU` at the soft value, `SIGKILL` at the hard one) |
+| `Core` | bytes | core dump size — `0, 0` disables dumps for a child handling secrets |
+| `Data` | bytes | the data segment (the allocation arena) |
+| `FileSize` | bytes | the largest file the child may create or extend |
+| `NoFile` | count | simultaneously open file descriptors |
+| `Stack` | bytes | the main thread's stack |
+
+**F#**
+
+```fsharp
+task {
+    // No core dumps, at most 64 open descriptors, and no file over 4 MiB.
+    let sandboxed =
+        Command.create "untrusted-tool"
+        |> Command.rlimit RlimitResource.Core 0L 0L
+        |> Command.rlimit RlimitResource.NoFile 64L 128L
+        |> Command.rlimit RlimitResource.FileSize 4194304L 4194304L
+
+    let! _ = sandboxed.RunAsync()
+    ()
+}
+```
+
+**C#**
+
+```csharp
+// No core dumps, at most 64 open descriptors, and no file over 4 MiB.
+await new Command("untrusted-tool")
+    .Rlimit(RlimitResource.Core, 0, 0)
+    .Rlimit(RlimitResource.NoFile, 64, 128)
+    .Rlimit(RlimitResource.FileSize, 4_194_304, 4_194_304)
+    .RunAsync();
+```
+
+The `soft` value is what is in force; `hard` is the ceiling the child may raise its
+own soft value back up to. Calls for different resources accumulate, and repeating
+one replaces its pair in place (last write wins). `soft` must be non-negative and no
+greater than `hard` — both are rejected at the builder boundary with
+`ArgumentOutOfRangeException`. There is no "unlimited" value: this builder exists to
+**lower** what the child inherited (raising a hard limit needs privilege, and the
+kernel's refusal stops the launch rather than quietly ignoring the request).
+
+**A config-driven caller** can name a resource by its **stable identifier** —
+`"cpu"`, `"core"`, `"data"`, `"file_size"`, `"no_file"`, `"stack"` — through
+`RlimitResource.TryFromName` (an option, `None` on a miss) or `RlimitResource.FromName`
+(the same lookup, raising `ArgumentException` and listing every accepted spelling).
+The identifiers are held stable across a major version, `RlimitResource.All`
+enumerates them, and an unknown one is always an honest miss: never a limit silently
+applied to the wrong axis or to none at all.
+
+**How it composes, and how it fails — never a silent downgrade:**
+
+- **With `ResourceLimits.CpuTimeMax`** (the whole-tree CPU-time cap of
+  [process groups](process-groups.md#resource-limits)) — both target CPU time, so the
+  **stricter** value wins on each of the soft and hard values, and the two are applied
+  together in one step. Adding either can only tighten the effective cap.
+- **On Windows** — there is no `setrlimit` equivalent, so a spawn carrying any rlimit
+  fails with `ProcessError.Unsupported`, on the contained and the detached path alike.
+  Whole-tree Job Object caps are available instead through `ProcessGroupOptions`.
+- **On a POSIX host without the helper** — the limits are applied by util-linux's
+  `prlimit`, which sets them on itself and `exec`s the target *in place* (same pid, so
+  containment, `Priority`, and a PTY are unaffected). Like `setpriv`, it is loaded only
+  from a trusted system directory (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and never
+  from `PATH`; a host holding it in none of them (macOS/BSD, a minimal image) fails
+  with `ProcessError.ResourceLimit` rather than running the child uncapped. `prlimit`
+  is used rather than a `/bin/sh` `ulimit` shim because it takes **bytes** for every
+  size resource, while `ulimit`'s block unit differs between shells — a value applied
+  at half or double what was asked for is exactly the silent divergence a limit must
+  not have.
+- **With `Arg0`** — refused with `ProcessError.Unsupported`, because the helper
+  `exec`s the target by name and has no seam for a distinct `argv[0]` (the same
+  refusal a `Uid`/`Gid` drop, `Pty`, or a cgroup-backend run gives).
+
 ### Windows privilege drop (restricted token & integrity level)
 
 Two **Windows-only** builders are the counterpart of the Unix drop above. They do

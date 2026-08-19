@@ -4431,11 +4431,23 @@ module internal Windows =
                 disposeCreatedPipes ()
                 Error(ProcessError.Spawn(command.Program, ex.Message))
 
+    /// The honest typed refusal for `Command.Rlimit` on Windows — the ONE message both Windows spawn
+    /// paths give, so the contained launch and the detached one can never drift apart on it. `Unsupported`
+    /// rather than `ResourceLimit` because Windows has no per-process `setrlimit(2)` concept at ALL to
+    /// apply badly: its resource caps live on the Job Object and govern the whole tree, which is a
+    /// different instrument with different semantics and no honest way to stand in for a per-process one
+    /// (see `ProcessGroupOptions`/`ResourceLimits` for the whole-tree caps Windows does have). Refused
+    /// before any spawn work, never a child running with the caps silently dropped.
+    let private rlimitUnsupportedOnWindows: ProcessError =
+        ProcessError.Unsupported
+            "Command.Rlimit is a Unix per-process setrlimit(2) primitive; Windows has no equivalent (use ProcessGroupOptions resource limits for whole-tree Job Object caps)"
+
     let spawnWindows (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
-        // `Command.Umask`/`Uid`/`Gid`/`Groups`/`Setsid`/`Arg0` are Unix-only primitives with no Windows
-        // equivalent (a file-mode creation mask, `setuid`/`setgid`/supplementary-group privilege drop, a
-        // `setsid()` session detach, and a distinct `argv[0]` — `CreateProcessW` takes one raw command
-        // line, not an argv array with an independent first element). Honour each request honestly as
+        // `Command.Umask`/`Uid`/`Gid`/`Groups`/`Setsid`/`Arg0`/`Rlimit` are Unix-only primitives with no
+        // Windows equivalent (a file-mode creation mask, `setuid`/`setgid`/supplementary-group privilege
+        // drop, a `setsid()` session detach, a distinct `argv[0]` — `CreateProcessW` takes one raw command
+        // line, not an argv array with an independent first element — and a per-process `setrlimit(2)`
+        // cap, whose nearest Windows relative is the whole-tree Job Object limit set). Honour each request honestly as
         // `ProcessError.Unsupported` BEFORE any spawn work, rather than silently ignoring it — symmetric
         // to the port's other Unix-only gates (e.g. every non-`Kill` `Signal` on Windows → `Unsupported`
         // in `Backend.fs`). Reported one at a time; the first requested-but-unsupported knob names the
@@ -4446,6 +4458,8 @@ module internal Windows =
             Error(
                 ProcessError.Unsupported "Command.ExtraFd is POSIX-only; Windows has no child file-descriptor namespace"
             )
+        elif not config.Rlimits.IsEmpty then
+            Error rlimitUnsupportedOnWindows
         elif config.StopSignal <> Signal.Term then
             Error(
                 ProcessError.Unsupported
@@ -4552,19 +4566,23 @@ module internal Windows =
     /// Launch `command` as a detached child — running, contained by nothing, unowned (see the section
     /// comment above). Returns its pid and the OS-reported start time, read while our own process handle
     /// is still open so the pid cannot have been recycled underneath the identity pair. The `Umask`/
-    /// `Uid`/`Gid`/`Groups`/`Setsid`/`Arg0` Unix-only knobs are refused exactly as `spawnWindows` refuses
-    /// them, so the detached path diverges from the ordinary one only where detachment itself requires it.
+    /// `Uid`/`Gid`/`Groups`/`Setsid`/`Arg0`/`Rlimit` Unix-only knobs are refused exactly as `spawnWindows`
+    /// refuses them, so the detached path diverges from the ordinary one only where detachment itself
+    /// requires it.
     let spawnDetachedWindows (command: Command) : Result<DetachedSpawn, ProcessError> =
         let config = command.Config
 
-        match config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups, config.Arg0 with
-        | Some _, _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
-        | _, Some _, _, _, _, _ -> Error(ProcessError.Unsupported "uid")
-        | _, _, Some _, _, _, _ -> Error(ProcessError.Unsupported "gid")
-        | _, _, _, true, _, _ -> Error(ProcessError.Unsupported "setsid")
-        | _, _, _, _, Some _, _ -> Error(ProcessError.Unsupported "groups")
-        | _, _, _, _, _, Some _ -> Error(ProcessError.Unsupported "arg0")
-        | None, None, None, false, None, None ->
+        match
+            config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups, config.Arg0, config.Rlimits.IsEmpty
+        with
+        | Some _, _, _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
+        | _, Some _, _, _, _, _, _ -> Error(ProcessError.Unsupported "uid")
+        | _, _, Some _, _, _, _, _ -> Error(ProcessError.Unsupported "gid")
+        | _, _, _, true, _, _, _ -> Error(ProcessError.Unsupported "setsid")
+        | _, _, _, _, Some _, _, _ -> Error(ProcessError.Unsupported "groups")
+        | _, _, _, _, _, Some _, _ -> Error(ProcessError.Unsupported "arg0")
+        | _, _, _, _, _, _, false -> Error rlimitUnsupportedOnWindows
+        | None, None, None, false, None, None, true ->
             // Decide the launch (PATHEXT / effective-child-`PATH` substitution / cmd.exe batch wrapper)
             // BEFORE any handle is allocated, exactly as `spawnWindowsCore` does — an unsafe batch
             // argument, or a program the command's own overridden child `PATH` does not hold, is refused

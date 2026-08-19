@@ -2844,3 +2844,496 @@ type WindowsIoRateControlTests() =
                 "the axis a FAILED UpdateLimits named must still be recorded as capped — never NotTripped as if it were never asked about"
             )
         | Error err -> Assert.Fail $"{err}"
+
+/// Test support for the per-process rlimit builders (`Command.Rlimit`). Deliberately a top-level private
+/// module rather than `let` helpers on a fixture, matching this file's own
+/// `WindowsIoRateControlTestSupport`/`LimitEvidenceTestSupport` convention.
+module private RlimitTestSupport =
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+
+    /// A fresh, empty temp directory; the caller deletes it.
+    let freshDir (label: string) : string =
+        let directory =
+            Path.Combine(Path.GetTempPath(), $"processkit-rlimit-{label}-{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory directory |> ignore
+        directory
+
+    /// Write a file that the library's OWN resolver accepts as a directly executable program on THIS
+    /// host — a `.exe` where PATHEXT decides, a mode 700 file where the execute bit does (the expectation
+    /// is derived from the runtime rather than hardcoded for one platform). Never executed by these
+    /// tests: they exercise the rewrite that BUILDS a launch, not the launch itself.
+    let writeExecutable (directory: string) (name: string) : string =
+        let fileName = if isWindows then name + ".exe" else name
+        let path = Path.Combine(directory, fileName)
+        File.WriteAllText(path, "")
+
+        if not isWindows then
+            File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+
+        path
+
+    /// Run `body resolvedHelper target` with the trusted-helper list pointing at a directory that holds a
+    /// fake `prlimit` and a fake target program, restoring the real list afterwards. The helper path is
+    /// the one the production resolver returns, never a second opinion about it, so the assertions
+    /// compare against exactly what a spawn would launch.
+    let withFakeHelper (body: string -> string -> unit) : unit =
+        let directory = freshDir "helper"
+
+        try
+            writeExecutable directory "prlimit" |> ignore
+            let target = writeExecutable directory "target"
+            Native.Posix.trustedHelperDirectoriesForTests <- Some [ directory ]
+
+            try
+                match Native.Posix.trustedHelperPathForTests "prlimit" with
+                | None -> Assert.Fail "the fake prlimit must resolve inside the overridden trusted directory"
+                | Some resolvedHelper -> body resolvedHelper target
+            finally
+                Native.Posix.trustedHelperDirectoriesForTests <- None
+        finally
+            Directory.Delete(directory, true)
+
+    /// Run `body emptyTrustedDirectory` with the trusted-helper list pointing at a directory that holds
+    /// nothing at all — the "this host has no util-linux" case, made deterministic on a host that does.
+    let withoutHelper (body: string -> unit) : unit =
+        let directory = freshDir "no-helper"
+
+        try
+            Native.Posix.trustedHelperDirectoriesForTests <- Some [ directory ]
+
+            try
+                body directory
+            finally
+                Native.Posix.trustedHelperDirectoriesForTests <- None
+        finally
+            Directory.Delete(directory, true)
+
+    /// The soft and hard columns `/proc/self/limits` prints for one row, as raw text (so `unlimited`
+    /// survives the read instead of being coerced into a number).
+    let procLimit (limitsText: string) (label: string) : (string * string) option =
+        limitsText.Split '\n'
+        |> Array.map (fun line -> line.TrimEnd '\r')
+        |> Array.tryPick (fun line ->
+            if line.StartsWith(label, StringComparison.Ordinal) then
+                let columns =
+                    line.Substring(label.Length).Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+
+                if columns.Length >= 2 then
+                    Some(columns[0], columns[1])
+                else
+                    None
+            else
+                None)
+
+    /// The arguments of a rewritten command, as a plain list for a whole-value comparison.
+    let argsOf (command: Command) : string list = command.Config.Args |> List.ofSeq
+
+/// The typed per-process Unix rlimit builders (T-377): the `RlimitResource`/`Rlimit` value API and its
+/// stable name mapping, the `Command.Rlimit` builder, the `prlimit` rewrite that applies the set before
+/// the child's program starts, its precedence against the whole-tree `ResourceLimits.CpuTimeMax`, and the
+/// honest typed refusals on a host (or platform) that cannot apply it.
+[<TestFixture>]
+type PerProcessRlimitTests() =
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
+
+    [<Test>]
+    member _.``every resource has a stable name that round-trips through TryFromName and FromName``() =
+        Assert.That(RlimitResource.All.Count, Is.EqualTo 6, "every rlimit resource must be enumerable")
+
+        for resource in RlimitResource.All do
+            Assert.That(RlimitResource.TryFromName resource.Name, Is.EqualTo(Some resource))
+            Assert.That(RlimitResource.FromName resource.Name, Is.EqualTo resource)
+
+        // The exact spellings are a compatibility surface, not an implementation detail: pin them.
+        let names =
+            RlimitResource.All
+            |> Seq.map (fun resource -> resource.Name)
+            |> String.concat ", "
+
+        Assert.That(names, Is.EqualTo "cpu, core, data, file_size, no_file, stack")
+
+    [<Test>]
+    member _.``an unknown resource name is an honest miss, never a silent default``() =
+        // Near misses a config file realistically produces: another spelling, another case, empty.
+        for miss in [ "nofile"; "NoFile"; "Cpu"; "filesize"; "unknown"; "" ] do
+            Assert.That(RlimitResource.TryFromName miss, Is.EqualTo(None: RlimitResource option), miss)
+
+            match Assert.Throws<ArgumentException>(Action(fun () -> RlimitResource.FromName miss |> ignore)) with
+            | null -> Assert.Fail $"'{miss}' must be refused, not resolved to some resource"
+            | thrown ->
+                // The typed error names every accepted spelling, so a config author can fix it from the
+                // message rather than from the source.
+                Assert.That(thrown.Message, Does.Contain "no_file")
+                Assert.That(thrown.Message, Does.Contain "file_size")
+
+        Assert.Throws<ArgumentNullException>(
+            Action(fun () -> RlimitResource.FromName Unchecked.defaultof<string> |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``Rlimit renders its stable name and both values``() =
+        let command = Command.create "tool" |> Command.rlimit RlimitResource.NoFile 64L 128L
+
+        Assert.That(string command.Rlimits[0], Is.EqualTo "no_file=64:128")
+
+    [<Test>]
+    member _.``Command.Rlimit accumulates distinct resources and replaces a repeated one in place``() =
+        let command =
+            Command.create "tool"
+            |> Command.rlimit RlimitResource.Core 1L 1L
+            |> Command.rlimit RlimitResource.NoFile 32L 64L
+            |> Command.rlimit RlimitResource.Core 0L 0L
+
+        let rendered = command.Rlimits |> Seq.map string |> String.concat " "
+
+        // Last write wins for a repeated resource, and it keeps its original position rather than moving
+        // to the end — the same replace-in-place contract the Rust crate's `rlimit` builder has.
+        Assert.That(rendered, Is.EqualTo "core=0:0 no_file=32:64")
+
+        // A command that was never given one carries none at all.
+        Assert.That(Command.create "tool" |> (fun command -> command.Rlimits) |> Seq.isEmpty, Is.True)
+
+    [<Test>]
+    member _.``Command.Rlimit rejects a negative value and a soft limit above its hard limit``() =
+        let rejected (soft: int64) (hard: int64) =
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () ->
+                    Command.create "tool"
+                    |> Command.rlimit RlimitResource.NoFile soft hard
+                    |> ignore)
+            )
+            |> ignore
+
+        rejected -1L 10L
+        rejected 10L -1L
+        rejected 65L 64L
+
+        // The boundary itself is valid: soft may equal hard, and zero is a meaningful cap (no core dumps).
+        let accepted =
+            Command.create "tool"
+            |> Command.rlimit RlimitResource.NoFile 64L 64L
+            |> Command.rlimit RlimitResource.Core 0L 0L
+
+        Assert.That(accepted.Rlimits.Count, Is.EqualTo 2)
+
+    [<Test>]
+    member _.``a command without rlimits or a group CPU-time cap is passed through untouched``() =
+        let command = Command.create "tool" |> Command.arg "x"
+
+        match Native.Posix.withProcessLimits None command with
+        | Ok passed -> Assert.That(Object.ReferenceEquals(passed, command), Is.True, "no rewrite was needed")
+        | Error error -> Assert.Fail $"an unlimited command must not be rewritten at all, got {error}"
+
+    [<Test>]
+    member _.``the rewrite launches the trusted prlimit helper with one option per resource, then the target``() =
+        RlimitTestSupport.withFakeHelper (fun helper target ->
+            let command =
+                Command.create target
+                |> Command.arg "--flag"
+                |> Command.rlimit RlimitResource.Core 0L 0L
+                |> Command.rlimit RlimitResource.NoFile 64L 128L
+                |> Command.rlimit RlimitResource.FileSize 4096L 8192L
+                |> Command.rlimit RlimitResource.Data 134217728L 134217728L
+                |> Command.rlimit RlimitResource.Stack 4194304L 8388608L
+
+            match Native.Posix.withProcessLimits None command with
+            | Error error -> Assert.Fail $"the rewrite must succeed when the helper resolves, got {error}"
+            | Ok rewritten ->
+                Assert.That(rewritten.Program, Is.EqualTo helper, "the helper is launched by its trusted path")
+
+                // Byte values reach the helper verbatim (prlimit takes bytes for every size resource), the
+                // caller's order is preserved, `--` separates the limits from the target, and the target is
+                // the RESOLVED absolute path so no PATH entry can interpose on it.
+                let expected =
+                    [ "--core=0:0"
+                      "--nofile=64:128"
+                      "--fsize=4096:8192"
+                      "--data=134217728:134217728"
+                      "--stack=4194304:8388608"
+                      "--"
+                      Path.GetFullPath target
+                      "--flag" ]
+                    |> String.concat "\n"
+
+                Assert.That(RlimitTestSupport.argsOf rewritten |> String.concat "\n", Is.EqualTo expected)
+
+                let spent: string =
+                    "the limits are encoded in the argv now, so a second pass must not wrap a second helper"
+
+                Assert.That(rewritten.Config.Rlimits.IsEmpty, Is.True, spent)
+
+                match Native.Posix.withProcessLimits None rewritten with
+                | Ok again -> Assert.That(Object.ReferenceEquals(again, rewritten), Is.True, spent)
+                | Error error -> Assert.Fail $"the second pass must be a no-op, got {error}")
+
+    [<Test>]
+    member _.``a whole-tree CpuTimeMax and a per-process CPU rlimit resolve to the stricter of the two``() =
+        RlimitTestSupport.withFakeHelper (fun _ target ->
+            let withCpu (soft: int64) (hard: int64) =
+                Command.create target |> Command.rlimit RlimitResource.Cpu soft hard
+
+            let cpuOption (cpuTimeMax: TimeSpan option) (command: Command) =
+                match Native.Posix.withProcessLimits cpuTimeMax command with
+                | Error error -> failwith $"the rewrite must succeed, got {error}"
+                | Ok rewritten ->
+                    RlimitTestSupport.argsOf rewritten
+                    |> List.tryFind (fun arg -> arg.StartsWith("--cpu=", StringComparison.Ordinal))
+
+            // The per-process pair is stricter on both values, so it survives the group's looser cap.
+            Assert.That(cpuOption (Some(TimeSpan.FromSeconds 100.0)) (withCpu 5L 6L), Is.EqualTo(Some "--cpu=5:6"))
+
+            // ... and the other way round: a stricter GROUP cap is never relaxed by a looser per-process
+            // one. The group's own rounding is unchanged (a soft second count, one extra second of hard
+            // budget so the child can observe SIGXCPU first).
+            Assert.That(cpuOption (Some(TimeSpan.FromSeconds 3.0)) (withCpu 50L 60L), Is.EqualTo(Some "--cpu=3:4"))
+
+            // Each value is taken on its own, so a crossed pair still yields the stricter of each.
+            Assert.That(cpuOption (Some(TimeSpan.FromSeconds 4.0)) (withCpu 2L 90L), Is.EqualTo(Some "--cpu=2:5"))
+
+            // A group cap with no per-process CPU limit is carried by the same rewrite rather than a
+            // second shim that could overwrite it — 2.5s rounds up to a 3 second soft budget.
+            let other = Command.create target |> Command.rlimit RlimitResource.NoFile 64L 128L
+
+            Assert.That(cpuOption (Some(TimeSpan.FromSeconds 2.5)) other, Is.EqualTo(Some "--cpu=3:4")))
+
+    [<Test>]
+    member _.``Arg0 combined with a per-process rlimit is a typed Unsupported, never a misapplied argv0``() =
+        RlimitTestSupport.withFakeHelper (fun _ target ->
+            let command =
+                Command.create target
+                |> Command.arg0 "override"
+                |> Command.rlimit RlimitResource.NoFile 64L 128L
+
+            match Native.Posix.withProcessLimits None command with
+            | Error(ProcessError.Unsupported detail) ->
+                Assert.That(detail, Does.Contain "Arg0")
+                Assert.That(detail, Does.Contain "prlimit")
+            | other -> Assert.Fail $"expected a typed Unsupported for Arg0 with a rlimit, got {other}")
+
+    [<Test>]
+    member _.``a host holding prlimit in no trusted directory is refused, never served an unlimited child``() =
+        RlimitTestSupport.withoutHelper (fun emptyTrustedDirectory ->
+            let command = Command.create "tool" |> Command.rlimit RlimitResource.NoFile 64L 128L
+
+            match Native.Posix.withProcessLimits None command with
+            | Error(ProcessError.ResourceLimit detail) ->
+                Assert.That(detail, Does.Contain "prlimit")
+
+                let namesSearched: string =
+                    "the refusal must name the trusted directories that were actually searched"
+
+                Assert.That(detail, Does.Contain emptyTrustedDirectory, namesSearched)
+            | other -> Assert.Fail $"expected a typed ResourceLimit naming the missing helper, got {other}")
+
+    [<Test>]
+    member _.``a CpuTimeMax-only run still takes the shell shim and needs no util-linux helper``() =
+        if isWindows then
+            Assert.Ignore "The RLIMIT_CPU shim is the POSIX path (/bin/sh)."
+
+        // The helper is deliberately absent: the whole-tree CPU-time cap predates the rlimit builders and
+        // must keep working on a host without util-linux (macOS/BSD, a minimal image).
+        RlimitTestSupport.withoutHelper (fun _ ->
+            let command = Command.create "/bin/sh" |> Command.args [ "-c"; "exit 0" ]
+
+            match Native.Posix.withProcessLimits (Some(TimeSpan.FromSeconds 2.0)) command with
+            | Ok rewritten -> Assert.That(rewritten.Program, Is.EqualTo "/bin/sh")
+            | Error error -> Assert.Fail $"a CPU-time-only run must not depend on prlimit, got {error}")
+
+    [<Test>]
+    member _.``Windows refuses a per-process rlimit with a typed Unsupported on both spawn paths``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The Windows refusal is what this asserts."
+
+            let command =
+                Command.create "cmd.exe"
+                |> Command.args [ "/c"; "exit 0" ]
+                |> Command.rlimit RlimitResource.NoFile 64L 128L
+
+            match! command.OutputStringAsync() with
+            | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Does.Contain "Rlimit")
+            | other -> Assert.Fail $"expected a typed Unsupported on Windows, got {other}"
+
+            // The detached launch is refused on the same terms — an unowned child gets no weaker honesty.
+            match command.LaunchDetached() with
+            | Error(ProcessError.Unsupported detail) -> Assert.That(detail, Does.Contain "Rlimit")
+            | other -> Assert.Fail $"expected a typed Unsupported for the detached launch, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``every supported resource reaches the child with the exact value that was asked for``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Reads /proc/self/limits, which only Linux has."
+
+            if (Native.Posix.trustedHelperPathForTests "prlimit").IsNone then
+                Assert.Ignore "This host holds no trusted prlimit helper (util-linux is not installed)."
+
+            let command =
+                Command.create "cat"
+                |> Command.arg "/proc/self/limits"
+                |> Command.rlimit RlimitResource.Cpu 60L 61L
+                |> Command.rlimit RlimitResource.Core 0L 0L
+                |> Command.rlimit RlimitResource.Data 134217728L 268435456L
+                |> Command.rlimit RlimitResource.FileSize 4096L 8192L
+                |> Command.rlimit RlimitResource.NoFile 64L 128L
+                |> Command.rlimit RlimitResource.Stack 4194304L 8388608L
+
+            match! command.OutputStringAsync() with
+            | Error error -> Assert.Fail $"the capped child failed to run: {error}"
+            | Ok result ->
+                let reported (label: string) =
+                    match RlimitTestSupport.procLimit result.Stdout label with
+                    | Some pair -> pair
+                    | None -> failwith $"/proc/self/limits carried no '{label}' row:\n{result.Stdout}"
+
+                // Bytes are bytes: what the builder was given is what the kernel reports, with no block
+                // rounding anywhere in between (the reason this path uses prlimit, not a shell ulimit).
+                Assert.That(reported "Max cpu time", Is.EqualTo(("60", "61")))
+                Assert.That(reported "Max core file size", Is.EqualTo(("0", "0")))
+                Assert.That(reported "Max data size", Is.EqualTo(("134217728", "268435456")))
+                Assert.That(reported "Max file size", Is.EqualTo(("4096", "8192")))
+                Assert.That(reported "Max open files", Is.EqualTo(("64", "128")))
+                Assert.That(reported "Max stack size", Is.EqualTo(("4194304", "8388608")))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the stricter of a group CpuTimeMax and a per-process CPU rlimit is what the child gets``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Reads /proc/self/limits, which only Linux has."
+
+            if (Native.Posix.trustedHelperPathForTests "prlimit").IsNone then
+                Assert.Ignore "This host holds no trusted prlimit helper (util-linux is not installed)."
+
+            let cpuTimeOf (groupSeconds: float) (soft: int64) (hard: int64) =
+                task {
+                    let options =
+                        ProcessGroupOptions().WithCpuTimeMax(TimeSpan.FromSeconds groupSeconds)
+
+                    match ProcessGroup.Create options with
+                    | Error error -> return failwith $"CPU-time limited group creation failed: {error}"
+                    | Ok group ->
+                        use group = group
+
+                        let command =
+                            Command.create "cat"
+                            |> Command.arg "/proc/self/limits"
+                            |> Command.rlimit RlimitResource.Cpu soft hard
+
+                        match! group.StartAsync command with
+                        | Error error -> return failwith $"the capped child failed to start: {error}"
+                        | Ok running ->
+                            use running = running
+
+                            match! running.OutputStringAsync() with
+                            | Error error -> return failwith $"the capped child failed: {error}"
+                            | Ok result ->
+                                match RlimitTestSupport.procLimit result.Stdout "Max cpu time" with
+                                | Some pair -> return pair
+                                | None -> return failwith $"no CPU-time row:\n{result.Stdout}"
+                }
+
+            // A looser group cap never relaxes the per-process one...
+            let! strictPerProcess = cpuTimeOf 100.0 5L 6L
+            Assert.That(strictPerProcess, Is.EqualTo(("5", "6")))
+
+            // ... and a looser per-process pair never relaxes the group's cap.
+            let! strictGroup = cpuTimeOf 3.0 50L 60L
+            Assert.That(strictGroup, Is.EqualTo(("3", "4")))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a POSIX host without the helper refuses the spawn itself, not just the rewrite``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "Windows refuses with Unsupported instead; asserted separately."
+
+            let directory = RlimitTestSupport.freshDir "spawn-no-helper"
+
+            try
+                Native.Posix.trustedHelperDirectoriesForTests <- Some [ directory ]
+
+                try
+                    let command =
+                        Command.create "/bin/sh"
+                        |> Command.args [ "-c"; "exit 0" ]
+                        |> Command.rlimit RlimitResource.NoFile 64L 128L
+
+                    match! command.OutputStringAsync() with
+                    | Error(ProcessError.ResourceLimit detail) -> Assert.That(detail, Does.Contain "prlimit")
+                    | Ok result ->
+                        Assert.Fail
+                            $"the run must be refused when no trusted prlimit exists, but it ran ({result.Outcome})"
+                    | Error other -> Assert.Fail $"expected a typed ResourceLimit, got {other}"
+                finally
+                    Native.Posix.trustedHelperDirectoriesForTests <- None
+            finally
+                Directory.Delete(directory, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a dry run reports the configured limits instead of dropping them from the preview``() =
+        let command =
+            Command.create "tool"
+            |> Command.arg "build"
+            |> Command.rlimit RlimitResource.NoFile 64L 128L
+            |> Command.rlimit RlimitResource.Core 0L 0L
+
+        let render = ProcessKit.Testing.DryRunRunner.Render command
+
+        Assert.That(render, Is.EqualTo "tool build (rlimits: no_file=64:128, core=0:0)")
+
+        // A command without limits renders exactly as it always did.
+        Assert.That(
+            ProcessKit.Testing.DryRunRunner.Render(Command.create "tool" |> Command.arg "build"),
+            Is.EqualTo "tool build"
+        )
+
+    [<Test>]
+    member _.``a command carrying rlimits records and replays through a cassette``() : Task =
+        task {
+            let path =
+                Path.Combine(Path.GetTempPath(), $"processkit-rlimit-cassette-{Guid.NewGuid():N}.json")
+
+            let command =
+                Command.create "tool"
+                |> Command.arg "build"
+                |> Command.rlimit RlimitResource.NoFile 64L 128L
+
+            try
+                // The inner runner is the dry run: recording exercises the whole cassette path on every
+                // platform without a real spawn (a Windows spawn would be refused, by design).
+                let recorder =
+                    ProcessKit.Testing.RecordReplayRunner.Record(path, ProcessKit.Testing.DryRunRunner())
+
+                match! (recorder :> IProcessRunner).CaptureStringAsync(command, CancellationToken.None) with
+                | Ok result -> Assert.That(result.Stdout, Does.Contain "no_file=64:128")
+                | Error error -> Assert.Fail $"recording a command with rlimits failed: {error}"
+
+                match recorder.Save() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"saving the cassette failed: {error}"
+
+                // Replay serves the recording without spawning anything, so the limits neither refuse the
+                // run nor go missing from what was recorded about it.
+                match ProcessKit.Testing.RecordReplayRunner.Replay path with
+                | Error error -> Assert.Fail $"loading the cassette failed: {error}"
+                | Ok replayer ->
+                    match! (replayer :> IProcessRunner).CaptureStringAsync(command, CancellationToken.None) with
+                    | Ok result -> Assert.That(result.Stdout, Does.Contain "no_file=64:128")
+                    | Error error -> Assert.Fail $"replaying a command with rlimits failed: {error}"
+            finally
+                if File.Exists path then
+                    File.Delete path
+        }
+        :> Task

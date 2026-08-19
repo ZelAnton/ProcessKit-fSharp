@@ -220,6 +220,15 @@ type internal CommandConfig =
       // Windows spawn with `ProcessError.Unsupported` (there is no Windows equivalent), never a silent
       // drop. Only the low permission bits are meaningful, as with `umask(2)` itself.
       Umask: int option
+      // Unix per-process `setrlimit(2)` caps applied to the child before its program starts, in the
+      // order the builder added them, at most one entry per resource (`Command.Rlimit` replaces a
+      // repeated resource in place). Empty (the default) applies none, byte-identical to before this
+      // knob existed. Unix-only: a non-empty set fails a Windows spawn with `ProcessError.Unsupported`,
+      // never a silent drop. On POSIX the whole set is handed to the util-linux `prlimit` helper, which
+      // applies it to itself and then `exec`s the real program IN PLACE (same pid, so containment,
+      // priority, and any pty the rest of the chain set up are unchanged) — see
+      // `Native.Posix.withProcessLimits`.
+      Rlimits: ImmutableList<Rlimit>
       // Unix privilege drop: run the child under this user id (`setuid`) / group id (`setgid`). `None`
       // (the default) inherits the parent's ids. Unix-only: a set value fails a Windows spawn with
       // `ProcessError.Unsupported`, never a silent drop. Because `posix_spawn` exposes no uid/gid
@@ -357,6 +366,7 @@ module internal CommandConfig =
           WindowsCtrlSignals = false
           Priority = None
           Umask = None
+          Rlimits = ImmutableList<Rlimit>.Empty
           Uid = None
           Gid = None
           Groups = None
@@ -764,6 +774,13 @@ type Command internal (config: CommandConfig) =
 
     /// The working directory, when overridden.
     member _.WorkingDirectory = config.WorkingDirectory
+
+    /// The per-process Unix rlimits configured through `Command.Rlimit`, in the order they were added
+    /// (at most one entry per resource), or an empty list when none were — so a config-driven caller can
+    /// read back exactly what it asked for, and a diagnostic can report it. A fresh list each read, so a
+    /// caller can never mutate a command's limits through it.
+    member _.Rlimits: IReadOnlyList<Rlimit> =
+        config.Rlimits |> Seq.toArray :> IReadOnlyList<Rlimit>
 
     /// Append a single argument. `value` must not contain an embedded NUL (`'\000'`) — see
     /// `CommandConfig.rejectEmbeddedNul`.
@@ -1485,6 +1502,71 @@ type Command internal (config: CommandConfig) =
         CommandConfig.ensureNoWindowsTokenHardening config "Umask"
         Command({ config with Umask = Some mask })
 
+    /// Cap one Unix **per-process** resource for the child (`setrlimit(2)`): `soft` is the value in
+    /// force, `hard` the ceiling the child may raise its own soft value back up to. Both are in the
+    /// resource's own native unit — bytes, seconds, or a count, as `RlimitResource` documents. The cap
+    /// is applied before the child's program starts and is inherited INDIVIDUALLY by each descendant
+    /// (each gets its own copy of the cap, not a shared budget); a descendant may lower its own limits
+    /// further, and may raise its soft value again as far as the inherited hard value. That makes this
+    /// a robustness bound, not a containment boundary — the whole-tree caps of
+    /// `ProcessGroupOptions`/`ResourceLimits` are the boundary, and the two compose.
+    ///
+    /// Calls for DIFFERENT resources accumulate; repeating the same resource replaces the earlier pair
+    /// in place (last write wins), like every other builder knob. `soft` and `hard` must be
+    /// non-negative and `soft` must not exceed `hard` — both rejected with
+    /// `ArgumentOutOfRangeException` here at the builder boundary rather than deep in a native call.
+    /// There is deliberately no "unlimited" value: this knob exists to LOWER what the child inherited,
+    /// and raising a hard limit above the inherited one needs privilege (see the refusal note below).
+    ///
+    /// **Precedence with the whole-tree `ResourceLimits.CpuTimeMax`.** Both target CPU time when a
+    /// `Rlimit(RlimitResource.Cpu, ...)` runs inside a group that also sets `CpuTimeMax`. Neither wins
+    /// by position: the STRICTER of the two is applied on each of the soft and hard values (the smaller
+    /// number), so adding one can only ever tighten the effective cap, never relax the other. They are
+    /// applied ONCE, together, by the same pre-exec step, so the looser value can never silently
+    /// overwrite the tighter one on the way to the child.
+    ///
+    /// **Unix-only, and honestly so.** On **Windows** there is no `setrlimit` analogue, so a spawn
+    /// carrying any rlimit fails with `ProcessError.Unsupported` — never a child running uncapped.
+    /// On **POSIX** the limits are applied by the util-linux `prlimit` helper, which sets them on
+    /// itself and then `exec`s the real program in place (same pid, so containment, `Priority`, and a
+    /// PTY are all unaffected). Like `setpriv` and `setsid --ctty`, that helper is loaded only from a
+    /// trusted system directory (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and never from `PATH`; a
+    /// host holding it in none of them — macOS/BSD, which have no util-linux, or a minimal image —
+    /// fails the spawn with `ProcessError.ResourceLimit` rather than dropping the caps. A limit the
+    /// kernel itself refuses (raising a hard limit above the inherited one without privilege) fails the
+    /// helper before it `exec`s anything, so the child never runs with the cap silently unapplied; the
+    /// helper's message reaches the run's stderr.
+    ///
+    /// Because the helper `exec`s the target BY NAME it has no seam for a distinct `argv[0]`, so
+    /// combining this with `Command.Arg0` is refused at spawn with `ProcessError.Unsupported` —
+    /// exactly as `Arg0` is refused alongside the `setpriv`/`setsid --ctty`/`CpuTimeMax` shims, and for
+    /// the same reason: the override would otherwise land on the helper's own `argv[0]` instead of the
+    /// program that was actually asked for.
+    member _.Rlimit(resource: RlimitResource, soft: int64, hard: int64) =
+        ArgumentOutOfRangeException.ThrowIfNegative(soft, nameof soft)
+        ArgumentOutOfRangeException.ThrowIfNegative(hard, nameof hard)
+
+        if soft > hard then
+            raise (
+                ArgumentOutOfRangeException(
+                    nameof soft,
+                    soft,
+                    $"the {resource.Name} rlimit soft value ({soft}) must not exceed its hard value ({hard})"
+                )
+            )
+
+        let limit = Rlimit(resource, soft, hard)
+
+        let existing =
+            config.Rlimits |> Seq.tryFindIndex (fun current -> current.Resource = resource)
+
+        let updated =
+            match existing with
+            | Some index -> config.Rlimits.SetItem(index, limit)
+            | None -> config.Rlimits.Add limit
+
+        Command({ config with Rlimits = updated })
+
     /// Run the child under this Unix user id (`setuid`). **Unix-only:** on Windows (which has no
     /// equivalent) a requested uid fails the spawn with `ProcessError.Unsupported` rather than being
     /// silently ignored. Because `posix_spawn` has no uid attribute, a command with a uid (or `Gid`) is
@@ -1978,6 +2060,15 @@ module Command =
     /// Set the child's Unix file-mode creation mask (`umask(2)`). Unix-only: a set mask fails a Windows
     /// spawn with `ProcessError.Unsupported`. The default leaves the inherited umask untouched.
     let umask (mask: int) (command: Command) = command.Umask mask
+
+    /// Cap one Unix per-process resource for the child (`setrlimit(2)`): `soft` is the value in force,
+    /// `hard` the ceiling the child may raise it back to, both in the resource's native unit (bytes,
+    /// seconds, or a count). Different resources accumulate; the same one replaces in place. Unix-only:
+    /// a set limit fails a Windows spawn with `ProcessError.Unsupported`, and a POSIX host without the
+    /// util-linux `prlimit` helper fails with `ProcessError.ResourceLimit`. Combined with a whole-tree
+    /// `ResourceLimits.CpuTimeMax`, the stricter CPU-time value wins. See `Command.Rlimit`.
+    let rlimit (resource: RlimitResource) (soft: int64) (hard: int64) (command: Command) =
+        command.Rlimit(resource, soft, hard)
 
     /// Run the child under this Unix user id (`setuid`). Unix-only: a set uid fails a Windows spawn with
     /// `ProcessError.Unsupported`; dropping needs privilege (else `ProcessError.Spawn`). See `Command.Uid`.

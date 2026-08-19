@@ -875,7 +875,9 @@ The six caps are:
   [CPU affinity](#cpu-affinity) for the two platform ceilings.
 - `WithCpuTimeMax(duration)` — CPU time, not wall time. Windows applies the Job's
   `PerJobUserTimeLimit`; POSIX installs `RLIMIT_CPU` before each child `exec` (soft limit rounded up
-  to seconds, hard limit one second later so `SIGXCPU` can be observed).
+  to seconds, hard limit one second later so `SIGXCPU` can be observed). This is the one cap a
+  command's own `Rlimit(RlimitResource.Cpu, …)` also targets — see
+  [Per-process limits on a command](#per-process-limits-on-a-command) for which of the two wins.
 - `WithIoMax(target, readBytesPerSecond, writeBytesPerSecond, readOperationsPerSecond, writeOperationsPerSecond)` —
   directional disk bandwidth and IOPS ceilings for one explicit device or volume. The overload using
   `int64` treats zero as unbounded; the option overload uses `None`. At least one direction must be
@@ -919,6 +921,37 @@ run at the **real cgroup v2 root** (cgroup v2's "no internal processes" rule let
 the controllers be enabled only there) — so an ordinary container or a
 systemd-managed process fails too. The prerequisites are spelled out in
 [platform-support.md](platform-support.md).
+
+### Per-process limits on a command
+
+The caps above are **whole-tree**: one budget the group's kernel container enforces over
+every process in it at once. A command can also carry **per-process** Unix rlimits of its
+own — `Command.Rlimit(resource, soft, hard)`, documented in
+[Running commands](commands.md#per-process-resource-limits-rlimit) — which are applied to
+the child before its program starts and inherited *individually* by each descendant it
+forks. Ten descendants under a `MemoryMax` share one memory budget; under an rlimit each
+gets its own copy of the cap, and each may lower it further or raise its soft value back
+to the hard one. The two compose: use the group for a boundary, an rlimit for a bound on
+each process.
+
+They meet on exactly one axis, **CPU time**, which `WithCpuTimeMax` and
+`Rlimit(RlimitResource.Cpu, soft, hard)` both cap. When a command carrying the latter runs
+in a group carrying the former, the **stricter** of the two is applied on each of the soft
+and the hard value — the smaller number wins, whichever knob it came from, and both are
+installed in a single step so the looser one can never overwrite the tighter one on the
+way to the child. Adding either can therefore only tighten what the child actually gets:
+
+| Group `WithCpuTimeMax` | Command `Rlimit(Cpu, …)` | The child gets |
+|---|---|---|
+| 100 s | `5, 6` | soft 5 s, hard 6 s (the command's, stricter) |
+| 3 s | `50, 60` | soft 3 s, hard 4 s (the group's, stricter) |
+| 4 s | `2, 90` | soft 2 s, hard 5 s (the stricter of each value) |
+| 2.5 s | *(none)* | soft 3 s, hard 4 s (the group's, rounded up as always) |
+
+Per-process rlimits are **Unix-only** and need util-linux's `prlimit` in a trusted system
+directory. Windows refuses them with `ProcessError.Unsupported` (its whole-tree Job Object
+caps above are the Windows answer); a POSIX host without the helper refuses with
+`ProcessError.ResourceLimit`. Neither ever runs the child with the caps silently dropped.
 
 ### Disk I/O rate limits
 
