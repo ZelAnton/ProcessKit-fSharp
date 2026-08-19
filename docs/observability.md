@@ -61,10 +61,18 @@ per-process value — a log sink already scopes by process, and cross-process co
 ProcessKit publishes an `ActivitySource` named **`ProcessKitDiagnostics.ActivitySourceName`** (`"ProcessKit"`).
 A completed run yields one `processkit.run` span whose duration is the real run length, tagged with:
 
-`processkit.program`, `processkit.run_id`, `processkit.outcome` (`exited` / `signalled` / `timedout`),
-`processkit.exit_code` (when it exited), `processkit.signal` (when signalled), `processkit.pid` — **never
-argv or environment**. The span nests under whatever `Activity` was current when the run started, so a
-run inside an HTTP request appears under that request's trace.
+`processkit.program`, `processkit.run_id`, `processkit.outcome` (`exited` / `signalled` / `timedout` /
+`unobserved`), `processkit.exit_code` (when it exited), `processkit.signal` (when signalled),
+`processkit.pid` — **never argv or environment**. The span nests under whatever `Activity` was current
+when the run started, so a run inside an HTTP request appears under that request's trace.
+
+These four span and metric labels are frozen as spelled here, and they are a different set from the
+report identifiers published in the generated dictionary `spec/identifiers.json` (see
+[Stable identifiers](jsonl-reports.md#stable-identifiers)), which is the source of truth whenever a
+consumer needs the identifier of an `Outcome`, a `ProcessError`, a `Mechanism`, or a `Signal`. Three of
+the four labels are spelled identically in both; the one exception is `Outcome.TimedOut`, whose span and
+metric label has always been `timedout` while its report identifier is `timed_out`. Neither is being
+respelled to match the other: both shipped, and a dashboard or an alert keyed on either would break.
 
 Wire it into OpenTelemetry:
 

@@ -37,6 +37,7 @@
 		<Compile Include="ErgonomicsTests.fs" />
 		<Compile Include="StatsTests.fs" />
 		<Compile Include="ReportJsonTests.fs" />
+		<Compile Include="IdentifiersManifestTests.fs" />
 		<Compile Include="LimitsTests.fs" />
 		<Compile Include="CapabilityTests.fs" />
 		<Compile Include="CassetteTests.fs" />
@@ -81,6 +82,11 @@
 		<None Include="PublicApi.ProcessKit.Testing.approved.txt" CopyToOutputDirectory="PreserveNewest" />
 		<None Include="PublicApi.ProcessKit.Extensions.DependencyInjection.approved.txt" CopyToOutputDirectory="PreserveNewest" />
 		<None Include="PublicApi.ProcessKit.Extensions.Hosting.approved.txt" CopyToOutputDirectory="PreserveNewest" />
+		<!-- The committed stable-identifier dictionary for IdentifiersManifestTests, copied next to the
+		     test assembly the same way the API baselines above are. The test rebuilds it from the live
+		     union cases and fails on any difference, so a regenerated copy has to land back in
+		     $(RepoRoot)spec/identifiers.json rather than only in the output directory. -->
+		<None Include="$(RepoRoot)spec/identifiers.json" Link="identifiers.json" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 	<ItemGroup>

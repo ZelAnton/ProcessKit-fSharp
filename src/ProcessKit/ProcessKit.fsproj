@@ -50,6 +50,10 @@
 		<Compile Include="Mechanism.fs" />
 		<Compile Include="KillOnParentDeathScope.fs" />
 		<Compile Include="Signal.fs" />
+		<!-- The stable-identifier dictionary. Placed right after the four types it names
+		     (ProcessError, Outcome, Mechanism, Signal) and before ReportJson, which reads an
+		     Outcome's identifier from here rather than repeating the spelling. -->
+		<Compile Include="StableIdentifiers.fs" />
 		<Compile Include="CgroupCpuMax.fs" />
 		<Compile Include="Limits.fs" />
 		<Compile Include="ProcessResult.fs" />

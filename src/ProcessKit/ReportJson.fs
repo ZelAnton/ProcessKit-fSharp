@@ -20,31 +20,30 @@ module internal ReportJsonWrite =
 
     /// Writes an `Outcome` as `{"kind": "<identifier>", "code": <int|null>, "signal_number": <int|null>,
     /// ["reason": "<string>"]}`. `kind` is the outcome's own stable identifier — `exited` / `signalled` /
-    /// `timed_out` / `unobserved` — never a raw union-case ordinal or `.ToString()` spelling. `code` and
-    /// `signal_number` are always present, `null` on every case that does not carry them, so a JSONL reader
-    /// never has to special-case a missing key; `reason` is present only on `unobserved`, the one case with
-    /// a payload the other three have no field for.
+    /// `timed_out` / `unobserved` — never a raw union-case ordinal or `.ToString()` spelling. It is read
+    /// from `StableIdentifiers.outcome`, the single place those four names are spelled and the same source
+    /// the committed `spec/identifiers.json` dictionary is generated from, so this wire form and that
+    /// dictionary cannot drift apart. `code` and `signal_number` are always present, `null` on every case
+    /// that does not carry them, so a JSONL reader never has to special-case a missing key; `reason` is
+    /// present only on `unobserved`, the one case with a payload the other three have no field for.
     let outcome (writer: Utf8JsonWriter) (value: Outcome) : unit =
         writer.WriteStartObject()
+        writer.WriteString("kind", StableIdentifiers.outcome value)
 
         match value with
         | Outcome.Exited code ->
-            writer.WriteString("kind", "exited")
             writer.WriteNumber("code", code)
             writer.WriteNull "signal_number"
         | Outcome.Signalled signal ->
-            writer.WriteString("kind", "signalled")
             writer.WriteNull "code"
 
             match signal with
             | Some number -> writer.WriteNumber("signal_number", number)
             | None -> writer.WriteNull "signal_number"
         | Outcome.TimedOut ->
-            writer.WriteString("kind", "timed_out")
             writer.WriteNull "code"
             writer.WriteNull "signal_number"
         | Outcome.Unobserved reason ->
-            writer.WriteString("kind", "unobserved")
             writer.WriteNull "code"
             writer.WriteNull "signal_number"
             writer.WriteString("reason", reason)

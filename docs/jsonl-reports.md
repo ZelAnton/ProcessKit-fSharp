@@ -16,6 +16,7 @@ methods or by passing one of `ReportJson`'s `JsonTypeInfo<'T>` properties to `Js
 yourself.
 
 - [The schema](#the-schema)
+- [Stable identifiers](#stable-identifiers)
 - [Secret hygiene](#secret-hygiene)
 - [AOT / trimming](#aot--trimming)
 - [Versioning](#versioning)
@@ -49,6 +50,39 @@ Example: a run whose exit code `3` is in its own accepted-code set, as one line 
 ```json
 {"kind":"process_result","program":"tool","outcome":{"kind":"exited","code":3,"signal_number":null},"success":true,"ok_codes":[0,3],"duration_secs":1.5,"truncated":false,"total_lines":null,"total_bytes":null}
 ```
+
+## Stable identifiers
+
+The `kind` names above are not the only stable strings ProcessKit publishes, and none of them are
+meant to be transcribed out of this page by hand. The canonical list lives in the repository as
+`spec/identifiers.json` — a generated, machine readable dictionary of every stable identifier, in the
+same shape as the ProcessKit-rs crate's own `spec/identifiers.json`, so a sibling implementation, a
+conformance test, or a log pipeline can read one file instead of scraping documentation:
+
+```json
+{ "path": "ProcessKit.Outcome", "class": "report_only",
+  "variants": [ { "variant": "Exited", "identifier": "exited" } ] }
+```
+
+Four types are published today: `Mechanism` and `Signal` (`class: "configurable"` — values a caller
+supplies) and `Outcome` and `ProcessError` (`class: "report_only"` — values ProcessKit reports).
+`Signal.Other` is deliberately absent: it carries a raw signal number, whose meaning is the number
+itself rather than a name this library could publish.
+
+Two properties make the file worth pinning:
+
+- **It is generated from the live types, and cannot go stale.** Every identifier is read from the
+  library function that also spells the `kind` this serializer writes, and the variant list is
+  enumerated from the union cases themselves. Adding a case without an identifier fails the build;
+  adding one without regenerating the file fails the test that rebuilds it and compares text, which
+  CI runs as its own step.
+- **Identifiers are additive and frozen.** A new variant appends an entry. An identifier that has
+  shipped is never renamed, respelled, or reused for a different variant — that is what makes it safe
+  for a reader in another language to key on, and it is the same promise the field names in the
+  schema above carry.
+
+The dictionary holds identifiers only. It never carries a program name, an argument vector, an
+environment value, a path, or captured output — nothing from a run reaches it, on any platform.
 
 ## Secret hygiene
 

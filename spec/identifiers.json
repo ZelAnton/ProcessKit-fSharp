@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "maintenance": "Canonical dictionary of ProcessKit's stable machine identifiers, generated from the live union cases by tests/ProcessKit.Tests/IdentifiersManifestTests.fs; never edited by hand. A shipped identifier is frozen: new variants are appended, existing ones are never renamed or reused. Update docs/jsonl-reports.md together with this file.",
+  "enums": [
+    {
+      "path": "ProcessKit.Mechanism",
+      "class": "configurable",
+      "variants": [
+        { "variant": "JobObject", "identifier": "job_object" },
+        { "variant": "CgroupV2", "identifier": "cgroup_v2" },
+        { "variant": "ProcessGroup", "identifier": "process_group" }
+      ]
+    },
+    {
+      "path": "ProcessKit.Signal",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Term", "identifier": "term" },
+        { "variant": "Kill", "identifier": "kill" },
+        { "variant": "Int", "identifier": "int" },
+        { "variant": "Hup", "identifier": "hup" },
+        { "variant": "Quit", "identifier": "quit" },
+        { "variant": "Usr1", "identifier": "usr1" },
+        { "variant": "Usr2", "identifier": "usr2" }
+      ]
+    },
+    {
+      "path": "ProcessKit.Outcome",
+      "class": "report_only",
+      "variants": [
+        { "variant": "Exited", "identifier": "exited" },
+        { "variant": "Signalled", "identifier": "signalled" },
+        { "variant": "TimedOut", "identifier": "timed_out" },
+        { "variant": "Unobserved", "identifier": "unobserved" }
+      ]
+    },
+    {
+      "path": "ProcessKit.ProcessError",
+      "class": "report_only",
+      "variants": [
+        { "variant": "Spawn", "identifier": "spawn" },
+        { "variant": "NotFound", "identifier": "not_found" },
+        { "variant": "Exit", "identifier": "exit" },
+        { "variant": "Signalled", "identifier": "signalled" },
+        { "variant": "Timeout", "identifier": "timeout" },
+        { "variant": "Unobserved", "identifier": "unobserved" },
+        { "variant": "Cancelled", "identifier": "cancelled" },
+        { "variant": "NotReady", "identifier": "not_ready" },
+        { "variant": "Parse", "identifier": "parse" },
+        { "variant": "RetryPredicate", "identifier": "retry_predicate" },
+        { "variant": "JsonRpc", "identifier": "json_rpc" },
+        { "variant": "OutputTooLarge", "identifier": "output_too_large" },
+        { "variant": "OutputIncomplete", "identifier": "output_incomplete" },
+        { "variant": "Stdin", "identifier": "stdin" },
+        { "variant": "ResourceLimit", "identifier": "resource_limit" },
+        { "variant": "Adopt", "identifier": "adopt" },
+        { "variant": "CassetteMiss", "identifier": "cassette_miss" },
+        { "variant": "Io", "identifier": "io" },
+        { "variant": "Unsupported", "identifier": "unsupported" }
+      ]
+    }
+  ]
+}
