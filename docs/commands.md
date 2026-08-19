@@ -1227,7 +1227,10 @@ kernel's refusal stops the launch rather than quietly ignoring the request).
 (the same lookup, raising `ArgumentException` and listing every accepted spelling).
 The identifiers are held stable across a major version, `RlimitResource.All`
 enumerates them, and an unknown one is always an honest miss: never a limit silently
-applied to the wrong axis or to none at all.
+applied to the wrong axis or to none at all. A tool that would rather read the set than
+transcribe it finds the same six spellings in the generated dictionary
+`spec/identifiers.json` in the repository, under `ProcessKit.RlimitResource` — see
+[Stable identifiers](jsonl-reports.md#stable-identifiers).
 
 **How it composes, and how it fails — never a silent downgrade:**
 

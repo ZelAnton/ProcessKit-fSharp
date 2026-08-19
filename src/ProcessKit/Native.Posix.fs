@@ -3197,13 +3197,16 @@ module internal Posix =
     let private posixSpawnSetsid = if isMacOs then 0x0400s else 0x80s
 
     // ----------------------------------------------------------------------------------
-    // Trusted resolution of the POSIX security helpers (`setpriv` / `setsid`)
+    // Trusted resolution of the POSIX security helpers (`setpriv` / `setsid` / `prlimit`)
     // ----------------------------------------------------------------------------------
     //
-    // `setpriv` and `setsid --ctty` are SECURITY helpers, not ordinary tools. `setpriv` performs the
-    // uid/gid drop and arms `PR_SET_PDEATHSIG`, so on the path that matters most it runs as ROOT, before
-    // the credentials it is there to lower have been lowered; `setsid --ctty` establishes the child's
-    // controlling terminal. Launching either by BARE NAME would hand their lookup to libc's `exec*p`,
+    // `setpriv`, `setsid --ctty` and `prlimit` are SECURITY helpers, not ordinary tools. `setpriv`
+    // performs the uid/gid drop and arms `PR_SET_PDEATHSIG`, so on the path that matters most it runs as
+    // ROOT, before the credentials it is there to lower have been lowered; `setsid --ctty` establishes the
+    // child's controlling terminal; `prlimit` applies the requested `setrlimit(2)` pairs and then `exec`s
+    // the caller's own program, so a hijacked copy would both hold the caller's credentials and get to
+    // substitute the target outright. Launching any of them by BARE NAME would hand their lookup to
+    // libc's `exec*p`,
     // which walks the CURRENT PROCESS's `PATH` — so a `setpriv` planted in any directory that precedes
     // `/usr/bin` there would be executed with the parent's full (often root) privileges, before any drop.
     // That is precisely the hijack the Windows side already refuses: `Native.Windows.systemCmdExe` takes
@@ -3211,18 +3214,20 @@ module internal Posix =
     // "the shell itself must not be hijackable" — and this POSIX case is the MORE privileged of the two,
     // so it gets the same treatment rather than a weaker one.
     //
-    // Neither helper is therefore ever resolved on `PATH`. Both are looked up only in a fixed list of
+    // No helper is therefore ever resolved on `PATH`. All three are looked up only in a fixed list of
     // trusted system directories, in order, and the ABSOLUTE path of the match is what actually runs:
-    // as `argv[0]` of the `posix_spawnp` itself (the plain and detached drop paths, `setprivCommand`), or
-    // as the first word of the argv another pinned helper `exec`s (the `setsid --ctty` pty shim and the
-    // `/bin/sh` cgroup launcher, `setprivWrappedArgv`). `exec*p` performs NO `PATH` search for a
+    // as `argv[0]` of the `posix_spawnp` itself (the plain and detached drop paths, `setprivCommand`; and
+    // an rlimit-only command, which `withProcessLimits` leaves outermost), or as the first word of the
+    // argv another pinned helper `exec`s (the `setsid --ctty` pty shim and the
+    // `/bin/sh` cgroup launcher, `setprivWrappedArgv`; and the `prlimit` layer, applied innermost so any
+    // chain the dispatch builds wraps it). `exec*p` performs NO `PATH` search for a
     // path-form program, so no `PATH` entry can interpose anywhere along the chain — matching how the
     // cgroup launcher and the `RLIMIT_CPU` shim already pin `/bin/sh` by absolute path.
     // `Command.PreferLocal` deliberately does not participate either: it substitutes the caller's own
     // TARGET program (`applyPreferLocal`) and never the security helper that launches it.
     //
     // The list is `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` — the FHS locations of util-linux, with the
-    // user-command directories first because both helpers are `bin` (not `sbin`) tools. `/bin` is NOT a
+    // user-command directories first because all three helpers are `bin` (not `sbin`) tools. `/bin` is NOT a
     // redundant duplicate of `/usr/bin` and must not be dropped as one: on a merged-`/usr` host
     // (Debian/Ubuntu, Fedora) the two do resolve to the same directory, but on Alpine/musl they do not —
     // its `util-linux` package installs `setsid` into `/usr/bin` and `setpriv` into `/bin` (verified in
@@ -3234,11 +3239,12 @@ module internal Posix =
     // not a filesystem-integrity check: it assumes the trusted directories themselves are only writable
     // by root, exactly as every other program on the host already assumes.
     //
-    // Honest failure, never a downgrade. A host that holds neither helper in a trusted directory — a
+    // Honest failure, never a downgrade. A host that holds a helper in no trusted directory — a
     // non-FHS layout (NixOS/Guix), a minimal image, or macOS/BSD, which have no util-linux at all — gets
     // the SAME typed error class it already got when the helper was missing outright: a
-    // `ProcessError.Spawn` naming whichever knob needed `setpriv`, and a `ProcessError.Unsupported` for a
-    // PTY. What never happens is running the target with the requested hardening silently un-applied, or
+    // `ProcessError.Spawn` naming whichever knob needed `setpriv`, a `ProcessError.Unsupported` for a
+    // PTY, and a `ProcessError.ResourceLimit` for a `Command.Rlimit` with no `prlimit` to apply it. What
+    // never happens is running the target with the requested hardening silently un-applied, or
     // through a helper picked up from somewhere untrusted.
 
     /// The util-linux privilege-drop / parent-death-signal helper (`Command.Uid`/`Gid`/`Groups`,
@@ -3260,7 +3266,7 @@ module internal Posix =
     [<Literal>]
     let private rlimitHelper = "prlimit"
 
-    /// The only directories either POSIX security helper may be loaded from, searched in this order (see
+    /// The only directories a POSIX security helper may be loaded from, searched in this order (see
     /// the section comment). Deliberately a fixed list rather than `PATH`.
     let private trustedHelperDirectories = [ "/usr/bin"; "/bin"; "/usr/sbin"; "/sbin" ]
 
@@ -3282,7 +3288,7 @@ module internal Posix =
     let private trustedHelperDirectoriesText () =
         String.concat ", " (trustedHelperDirectoriesInUse ())
 
-    /// Resolve a security helper (`setpriv`/`setsid`) to the absolute path of the first match among the
+    /// Resolve a security helper (`setpriv`/`setsid`/`prlimit`) to the absolute path of the first match among the
     /// trusted directories, reusing the shared `Common.probeDir` — so the "present and directly
     /// executable" rule is the one the rest of the library already uses, not a second copy (the empty
     /// `PATHEXT` argument is a POSIX no-op; this whole module is POSIX-only). `None` when no trusted

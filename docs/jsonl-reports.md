@@ -64,7 +64,7 @@ a conformance test, or a log pipeline can read one file instead of scraping docu
   "variants": [ { "variant": "Exited", "identifier": "exited" } ] }
 ```
 
-Six types are published today:
+Seven types are published today:
 
 | Type | `class` | Where the identifier is used |
 |---|---|---|
@@ -74,6 +74,7 @@ Six types are published today:
 | `ProcessError` | `report_only` | `SupervisionEvent.FailureKind` |
 | `LimitVerdict` | `report_only` | each axis of a `limit_evidence` line, above |
 | `SupervisionEventKind` | `report_only` | `SupervisionEvent.Name` |
+| `RlimitResource` | `configurable` | the resource name a config-driven caller supplies, which ProcessKit **parses back** through `RlimitResource.TryFromName`/`FromName`; also what `Rlimit.ToString()` renders (`no_file=64:128`). The one published vocabulary the library reads as well as writes — see [Commands → per-process resource limits](commands.md#per-process-resource-limits-rlimit) |
 
 `Signal.Other` is deliberately absent: it carries a raw signal number, whose meaning is the number
 itself rather than a name this library could publish.
@@ -93,7 +94,10 @@ Two properties make the file worth pinning:
   from the live cases themselves. For the four types ProcessKit does emit as text, that is the very
   function the emitting code calls — so the `kind` this serializer writes, a `FailureKind`, an event
   `Name`, and the dictionary entry cannot disagree, and a test ties each published identifier back to
-  the string a consumer actually receives. Adding a union case without an identifier fails the build.
+  the string a consumer actually receives. `RlimitResource` is tied the other way round, being the one
+  vocabulary ProcessKit *reads*: a test feeds every published identifier back through
+  `RlimitResource.TryFromName` and asserts it returns the case it was published for, so a name taken from
+  this file is always one the builder accepts. Adding a union case without an identifier fails the build.
   Adding a `SupervisionEventKind` fails the manifest test instead, since F# requires a wildcard arm when
   matching a .NET enum and the compiler therefore cannot refuse it. Adding any case without regenerating
   the file fails the test that rebuilds it and compares text, which CI runs as its own step.

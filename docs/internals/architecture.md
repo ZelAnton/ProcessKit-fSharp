@@ -22,70 +22,73 @@ The files currently compile in this exact order. The headings are architectural 
 8. `RunTelemetryScope.fs` — exactly-once run telemetry lifetime.
 9. `Mechanism.fs` — selected containment mechanism.
 10. `KillOnParentDeathScope.fs` — per-platform scope of parent-death cleanup.
-11. `Signal.fs` — portable signal model.
-12. `CgroupCpuMax.fs` — cgroup v2 `cpu.max` quota formatting and parsing.
-13. `Limits.fs` — resource and process-group options.
-14. `ProcessResult.fs` — captured result.
-15. `TryParser.fs` — .NET try-parse adapter.
-16. `OutputPolicy.fs` — buffered and streaming overflow policies.
-17. `OutputEvent.fs` — stdout/stderr event model.
-18. `Finished.fs` — finish result.
-19. `Stats.fs` — group/run statistics and samplers.
-20. `Stdin.fs` — stdin source model.
-21. `PostKillReap.fs` — bounded post-kill reap budget and the ledger that adopts an unfinished wait.
-22. `PostExitDrain.fs` — bounded post-exit output drain and the severable read end it cuts.
-23. `Timeouts.fs` — timeout normalization.
-24. `Backoff.fs` — exponential-backoff and jitter math for retries and supervision.
-25. `Priority.fs` — priority model and native mapping.
-26. `LineTerminator.fs` — line-ending rules.
-27. `RotatingFileSink.fs` — size-rotating tee sink for long-lived logs.
-28. `Command.fs` — immutable command configuration and builder API.
-29. `MemberInfo.fs` — per-member identity snapshot of a contained tree.
-30. `ReportJson.fs` — write-only JSON projection of results, stats, run profiles, and member snapshots.
-31. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
+11. `SoftStopScope.fs` — how far a soft stop reaches on one live group, read before a signal is attempted.
+12. `Signal.fs` — portable signal model.
+13. `ShutdownReport.fs` — what one graceful teardown actually observed: soft-signal fate, member counts, drain or escalation, elapsed time.
+14. `CgroupCpuMax.fs` — cgroup v2 `cpu.max` quota formatting and parsing.
+15. `Limits.fs` — resource and process-group options.
+16. `StableIdentifiers.fs` — the single spelling of every union case's stable machine identifier, generated into `spec/identifiers.json`.
+17. `ProcessResult.fs` — captured result.
+18. `TryParser.fs` — .NET try-parse adapter.
+19. `OutputPolicy.fs` — buffered and streaming overflow policies.
+20. `OutputEvent.fs` — stdout/stderr event model.
+21. `Finished.fs` — finish result.
+22. `Stats.fs` — group/run statistics and samplers.
+23. `Stdin.fs` — stdin source model.
+24. `PostKillReap.fs` — bounded post-kill reap budget and the ledger that adopts an unfinished wait.
+25. `PostExitDrain.fs` — bounded post-exit output drain and the severable read end it cuts.
+26. `Timeouts.fs` — timeout normalization.
+27. `Backoff.fs` — exponential-backoff and jitter math for retries and supervision.
+28. `Priority.fs` — priority model and native mapping.
+29. `LineTerminator.fs` — line-ending rules.
+30. `RotatingFileSink.fs` — size-rotating tee sink for long-lived logs.
+31. `Command.fs` — immutable command configuration and builder API.
+32. `MemberInfo.fs` — per-member identity snapshot of a contained tree.
+33. `ReportJson.fs` — write-only JSON projection of results, stats, run profiles, and member snapshots.
+34. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
 
 ### Native and platform layer
 
-32. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
-33. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, console code page, limits, and accounting calls.
-34. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
-35. `ProcessLookup.fs` — standalone identity-safe lookup and reuse-safe liveness for a bare pid held outside any group, over the two per-pid readers above.
-36. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
-37. `Capabilities.fs` — containment mechanism selection and the three-valued capability snapshot probed from it.
-38. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
+35. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
+36. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, console code page, limits, and accounting calls.
+37. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
+38. `ProcessLookup.fs` — standalone identity-safe lookup and reuse-safe liveness for a bare pid held outside any group, over the two per-pid readers above.
+39. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
+40. `Capabilities.fs` — containment mechanism selection and the three-valued capability snapshot probed from it.
+41. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
 
 ### Backend, pump, and channels
 
-39. `Backend.fs` — containment interface and its three implementations.
-40. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
-41. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
-42. `ProcessStdin.fs` — interactive stdin handle.
-43. `ReadinessProbe.fs` — readiness polling.
-44. `RunningHost.fs` — the spawned-host contract a live handle is built from.
-45. `ConsumptionGate.fs` — consumption-claim state machine and terminal-wait ledger of one handle.
-46. `RunTerminal.fs` — one handle's shared terminal waits, bounds, tokens, and teardown.
-47. `ExpectWindow.fs` — bounded expect window and ANSI filtering for interactive sessions.
-48. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
-49. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
-50. `RunningProcess.fs` — the public live-handle facade over the six files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
+42. `Backend.fs` — containment interface and its three implementations.
+43. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
+44. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
+45. `ProcessStdin.fs` — interactive stdin handle.
+46. `ReadinessProbe.fs` — readiness polling.
+47. `RunningHost.fs` — the spawned-host contract a live handle is built from.
+48. `ConsumptionGate.fs` — consumption-claim state machine and terminal-wait ledger of one handle.
+49. `RunTerminal.fs` — one handle's shared terminal waits, bounds, tokens, and teardown.
+50. `ExpectWindow.fs` — bounded expect window and ANSI filtering for interactive sessions.
+51. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
+52. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
+53. `RunningProcess.fs` — the public live-handle facade over the six files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
 
 ### Runner and verbs
 
-51. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
-52. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
-53. `PtySession.fs` — expect-style interaction over a live handle.
-54. `IProcessRunner.fs` — injectable runner seam.
-55. `Runner.fs` — capture primitives and reusable verbs.
-56. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
-57. `DelegatingProcessRunner.fs` — runner decorator base.
-58. `ProcessGroup.fs` — containment owner and shared-group runner.
-59. `JobRunner.fs` — default private-group runner.
-60. `CommandVerbs.fs` — default-runner `Command` extensions.
-61. `PipelineRunner.fs` — internal pipeline execution.
-62. `Pipeline.fs` — pipeline public API.
-63. `Supervisor.fs` — restart supervision.
-64. `CliClient.fs` — configured command client.
-65. `Exec.fs` — concise execution entry points.
+54. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
+55. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
+56. `PtySession.fs` — expect-style interaction over a live handle.
+57. `IProcessRunner.fs` — injectable runner seam.
+58. `Runner.fs` — capture primitives and reusable verbs.
+59. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
+60. `DelegatingProcessRunner.fs` — runner decorator base.
+61. `ProcessGroup.fs` — containment owner and shared-group runner.
+62. `JobRunner.fs` — default private-group runner.
+63. `CommandVerbs.fs` — default-runner `Command` extensions.
+64. `PipelineRunner.fs` — internal pipeline execution.
+65. `Pipeline.fs` — pipeline public API.
+66. `Supervisor.fs` — restart supervision.
+67. `CliClient.fs` — configured command client.
+68. `Exec.fs` — concise execution entry points.
 
 When adding a file, place it after everything it consumes and before everything that consumes it. Alphabetical sorting or SDK globbing would silently destroy this ordering model.
 
@@ -253,7 +256,7 @@ Kill-on-drop covers the owner *disposing* the group; it cannot cover the owner p
 
 ### Trusted helper resolution
 
-The three trusted-directory POSIX helpers above (`setpriv` for a uid/gid drop and for `--pdeathsig`, `setsid --ctty` for a PTY's controlling terminal) are the code that *performs* the hardening, and on the drop path the first of them runs as root, before the credentials it exists to lower have been lowered. Launching either by bare name would resolve it through libc's `exec*p` `PATH` search, so a same-named binary planted in any directory ahead of `/usr/bin` would run with the parent's full privileges. `Native.Posix.trustedHelperPath` therefore resolves both helpers **only** against the fixed list `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` (reusing `Native.Common.probeDir`, so the "present and directly executable" rule is not duplicated) and the spawn runs the resolved **absolute path** — as `argv[0]` of the `posix_spawnp` on the plain and detached drop paths, and as the first word of the argv a pinned helper `exec`s in the PTY shim and the cgroup launcher. This is the POSIX counterpart of `Native.Windows.systemCmdExe`, which takes the batch wrapper's `cmd.exe` from `Environment.SystemDirectory` rather than `PATH`/`%ComSpec%` for the same reason. `Command.PreferLocal` substitutes only the caller's target program (`applyPreferLocal`), never a helper. When no trusted directory holds the helper, the request fails with the same typed error it already produced on a host missing the tool outright — `ProcessError.Spawn` naming the knob that needed `setpriv`, `ProcessError.Unsupported` for a PTY — never a `PATH` fallback and never a silently un-hardened child; the consumer-facing statement of that contract is in [Hardening untrusted children](../hardening.md#where-the-unix-helper-binaries-come-from). `/bin/sh` is the one program these chains also `exec` that is *not* resolved that way: both the cgroup launcher and the `KillOnParentDeath` guard take the absolute `/bin/sh` directly, because that path is fixed by POSIX instead of varying by distribution the way the util-linux tools do (the guard still checks it through the same `Native.Common.probeDir` before building its argv). Its absence is typed as well, never a downgrade — `ProcessError.Spawn` for the guard, because arming without it would leave the pre-arm window open while still reporting `DirectChildOnly`, and `ProcessError.ResourceLimit` for the cgroup launcher, the same answer the rest of that path gives when the limits cannot be enforced. (The `RLIMIT_CPU` shim, outside these chains, pins the same absolute path for the same reason.)
+The three trusted-directory POSIX helper binaries above — `setpriv` (a uid/gid drop, and `--pdeathsig`), `setsid --ctty` (a PTY's controlling terminal), and `prlimit` (a `Command.Rlimit` soft/hard pair) — are the code that *performs* the hardening, and on the drop path `setpriv` runs as root, before the credentials it exists to lower have been lowered. Launching any of them by bare name would resolve it through libc's `exec*p` `PATH` search, so a same-named binary planted in any directory ahead of `/usr/bin` would run with the parent's full privileges. `Native.Posix.trustedHelperPath` therefore resolves all three **only** against the fixed list `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` (reusing `Native.Common.probeDir`, so the "present and directly executable" rule is not duplicated) and the spawn runs the resolved **absolute path** — as `argv[0]` of the `posix_spawnp` where the helper is the outermost link (the plain and detached drop paths, and an rlimit-only command with no drop, PTY, or cgroup launcher above it), and as the first word of the argv a pinned helper `exec`s where another link wraps it (the PTY shim, the cgroup launcher, and the `prlimit` layer that `withProcessLimits` applies innermost, so whatever chain the dispatch builds wraps it rather than the other way round). This is the POSIX counterpart of `Native.Windows.systemCmdExe`, which takes the batch wrapper's `cmd.exe` from `Environment.SystemDirectory` rather than `PATH`/`%ComSpec%` for the same reason. `Command.PreferLocal` substitutes only the caller's target program (`applyPreferLocal`), never a helper. When no trusted directory holds the helper, the request fails with the same typed error it already produced on a host missing the tool outright — `ProcessError.Spawn` naming the knob that needed `setpriv`, `ProcessError.Unsupported` for a PTY, `ProcessError.ResourceLimit` for a `Command.Rlimit` with no `prlimit` to apply it — never a `PATH` fallback and never a silently un-hardened child; the consumer-facing statement of that contract is in [Hardening untrusted children](../hardening.md#where-the-unix-helper-binaries-come-from). `/bin/sh` is the one program these chains also `exec` that is *not* resolved that way: both the cgroup launcher and the `KillOnParentDeath` guard take the absolute `/bin/sh` directly, because that path is fixed by POSIX instead of varying by distribution the way the util-linux tools do (the guard still checks it through the same `Native.Common.probeDir` before building its argv). Its absence is typed as well, never a downgrade — `ProcessError.Spawn` for the guard, because arming without it would leave the pre-arm window open while still reporting `DirectChildOnly`, and `ProcessError.ResourceLimit` for the cgroup launcher, the same answer the rest of that path gives when the limits cannot be enforced. (The `RLIMIT_CPU` shim, outside these chains, pins the same absolute path for the same reason.)
 
 ## Pump layer and output buffering
 

@@ -10,19 +10,22 @@ open NUnit.Framework
 open ProcessKit
 
 /// Rebuilds the committed `spec/identifiers.json` dictionary from the **live** cases of `Mechanism`,
-/// `Signal`, `Outcome`, `ProcessError`, `LimitVerdict`, and `SupervisionEventKind`.
+/// `Signal`, `Outcome`, `ProcessError`, `LimitVerdict`, `SupervisionEventKind`, and `RlimitResource`.
 ///
 /// Two independent guards keep the dictionary and the types in step, and neither can be satisfied by
 /// editing a list maintained by hand:
 ///
 ///  1. **The names come from the library.** Every identifier is read from the same function the library
 ///     itself emits that name through: `StableIdentifiers` for the five unions (wildcard free matches, so
-///     a case added without an identifier fails the library build, warnings being errors) and
-///     `SupervisionEventPayload.eventName` for the supervision event kinds. Nothing in this file spells
+///     a case added without an identifier fails the library build, warnings being errors),
+///     `SupervisionEventPayload.eventName` for the supervision event kinds, and the public
+///     `RlimitResource.Name` for the rlimit resources, which spell themselves next to their cases
+///     because that same string is what `TryFromName` parses back. Nothing in this file spells
 ///     a wire name, so the dictionary and what ProcessKit emits are one vocabulary rather than two
 ///     copies of one: `ReportJson` writes an `Outcome`'s and a `LimitEvidence` axis's identifier from
-///     those functions, `SupervisionEvent.FailureKind` is a `ProcessError`'s, and `SupervisionEvent.Name`
-///     is a kind's — each tied back to this dictionary by a test below.
+///     those functions, `SupervisionEvent.FailureKind` is a `ProcessError`'s, `SupervisionEvent.Name`
+///     is a kind's, and a resource's is the one `Rlimit.ToString` renders and `TryFromName` accepts —
+///     each tied back to this dictionary by a test below.
 ///  2. **The case list comes from reflection.** The variants of each type are enumerated with
 ///     `FSharpType.GetUnionCases` (or `Enum.GetValues` for the one enum), not from a list kept here, so a
 ///     newly added case is picked up automatically and immediately makes the generated text differ from
@@ -136,8 +139,11 @@ module internal IdentifiersManifest =
                 case.Name, FSharpValue.MakeUnion(case, fields))
 
     /// The dictionary, in manifest order: the two types a caller configures first, then the four
-    /// ProcessKit reports. This matches how the Rust crate's manifest groups the same vocabularies.
-    /// A type is appended, never inserted, so the entries a reader already parsed keep their positions.
+    /// ProcessKit reports, then every vocabulary added after that first set. This matches how the Rust
+    /// crate's manifest groups the same vocabularies.
+    /// A type is appended, never inserted, so the entries a reader already parsed keep their positions —
+    /// which is why `RlimitResource`, a `configurable` type, sits after the `report_only` ones instead of
+    /// beside the two configurable types it belongs with. Position is not part of the contract; `path` is.
     let private dictionary: EnumSpec list =
         [ { Path = "ProcessKit.Mechanism"
             Class = "configurable"
@@ -162,7 +168,15 @@ module internal IdentifiersManifest =
           { Path = "ProcessKit.SupervisionEventKind"
             Class = "report_only"
             Type = typeof<SupervisionEventKind>
-            Identifier = fun value -> Some(SupervisionEventPayload.eventName (unbox<SupervisionEventKind> value)) } ]
+            Identifier = fun value -> Some(SupervisionEventPayload.eventName (unbox<SupervisionEventKind> value)) }
+          // `RlimitResource` names itself: its stable identifier is the public `Name` member, declared
+          // next to the cases in `Limits.fs` rather than in `StableIdentifiers`, because it is also the
+          // spelling `TryFromName`/`FromName` parse back and the one `Rlimit.ToString` renders. Reading it
+          // here keeps that single point of spelling, on the same terms as `eventName` above.
+          { Path = "ProcessKit.RlimitResource"
+            Class = "configurable"
+            Type = typeof<RlimitResource>
+            Identifier = fun value -> Some (unbox<RlimitResource> value).Name } ]
 
     /// The `(path, class, [| variant, identifier |])` rows the manifest publishes — the structure the
     /// text below renders, and what the structural assertions read.
@@ -295,7 +309,14 @@ type IdentifiersManifestTests() =
             "GaveUp=gave_up"
             "Stopped=stopped"
             "SupervisionFailed=supervision_failed"
-            "EventsDropped=events_dropped" ] ]
+            "EventsDropped=events_dropped" ]
+          "ProcessKit.RlimitResource",
+          [ "Cpu=cpu"
+            "Core=core"
+            "Data=data"
+            "FileSize=file_size"
+            "NoFile=no_file"
+            "Stack=stack" ] ]
 
     /// A JSON string property, with the `string | null` the BCL declares narrowed to a plain string —
     /// every string this document carries is written by the generator and is never null.
@@ -410,6 +431,7 @@ type IdentifiersManifestTests() =
         Assert.That(classes["ProcessKit.ProcessError"], Is.EqualTo "report_only")
         Assert.That(classes["ProcessKit.LimitVerdict"], Is.EqualTo "report_only")
         Assert.That(classes["ProcessKit.SupervisionEventKind"], Is.EqualTo "report_only")
+        Assert.That(classes["ProcessKit.RlimitResource"], Is.EqualTo "configurable")
 
     /// Paths are unique across the dictionary, and identifiers are unique and lower snake case within
     /// each type — a duplicate would make the dictionary ambiguous for the consumers that key on it.
@@ -527,6 +549,22 @@ type IdentifiersManifestTests() =
 
             Assert.That(event.Name, Is.EqualTo kindIdentifiers[name])
             Assert.That(event.Kind, Is.EqualTo kind)
+
+    /// The tie for `RlimitResource`, the one published vocabulary the library **parses** as well as
+    /// spells: every identifier the manifest publishes is accepted by `TryFromName` and comes back as the
+    /// very case it was published for. That is what makes the file usable as the config layer's source of
+    /// accepted spellings — a consumer that reads a resource name out of the dictionary and feeds it to
+    /// ProcessKit cannot be handed a string the parser rejects.
+    [<Test>]
+    member _.``Every RlimitResource identifier is a name TryFromName parses back``() =
+        let resourceIdentifiers = identifiersOf "ProcessKit.RlimitResource"
+
+        for name, value in IdentifiersManifest.caseValues typeof<RlimitResource> do
+            let resource = unbox<RlimitResource> value
+            let identifier = resourceIdentifiers[name]
+
+            Assert.That(resource.Name, Is.EqualTo identifier)
+            Assert.That(RlimitResource.TryFromName identifier, Is.EqualTo(Some resource))
 
     /// The rendered form the drift guard compares is the same one the structural assertions read, so a
     /// row that renders differently from what it publishes cannot pass both.

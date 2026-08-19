@@ -11,11 +11,18 @@ namespace ProcessKit
 /// emits are one vocabulary rather than two copies of one, and a respelling cannot be made in half the
 /// places.
 ///
-/// One vocabulary is deliberately **not** here: the supervision event names (`incarnation_started`, …)
-/// are spelled by `SupervisionEventPayload.eventName`, next to the events that carry them, because
-/// `SupervisionEventKind` is declared long after this file in compile order. That function is the single
-/// spelling of those names on exactly the same terms, and `SupervisionEvent.Name` and the generator
-/// below both read it.
+/// Two published vocabularies are deliberately **not** here, each spelled in one place of its own on
+/// exactly the same terms, and read by the manifest generator from there rather than copied:
+///
+///  - The supervision event names (`incarnation_started`, …), spelled by
+///    `SupervisionEventPayload.eventName` next to the events that carry them, because
+///    `SupervisionEventKind` is declared long after this file in compile order. `SupervisionEvent.Name`
+///    and the generator both read it.
+///  - The rlimit resource names (`no_file`, …), spelled by the public `RlimitResource.Name` member in
+///    `Limits.fs`. Compile order would allow them here, but that one is not only emitted: it is the
+///    string `RlimitResource.TryFromName`/`FromName` parse back and `Rlimit.ToString` renders, so it
+///    belongs on the type a caller configures rather than in an internal dictionary the caller cannot
+///    see.
 ///
 /// Every function here is a `match` with **no wildcard arm**. Adding a case to `Outcome`, `Mechanism`,
 /// `Signal`, `ProcessError`, or `LimitVerdict` without spelling its identifier therefore fails to compile

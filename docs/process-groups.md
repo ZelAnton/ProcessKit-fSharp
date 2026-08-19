@@ -519,7 +519,6 @@ task {
 **C#**
 
 ```csharp
-using var group = created.GetValueOrThrow();
 await group.StartAsync(new Command("my-service"));
 
 var reported = await group.ShutdownReportAsync(TimeSpan.FromSeconds(5));

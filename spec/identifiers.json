@@ -83,6 +83,18 @@
         { "variant": "SupervisionFailed", "identifier": "supervision_failed" },
         { "variant": "EventsDropped", "identifier": "events_dropped" }
       ]
+    },
+    {
+      "path": "ProcessKit.RlimitResource",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Cpu", "identifier": "cpu" },
+        { "variant": "Core", "identifier": "core" },
+        { "variant": "Data", "identifier": "data" },
+        { "variant": "FileSize", "identifier": "file_size" },
+        { "variant": "NoFile", "identifier": "no_file" },
+        { "variant": "Stack", "identifier": "stack" }
+      ]
     }
   ]
 }
