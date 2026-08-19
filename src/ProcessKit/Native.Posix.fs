@@ -1514,22 +1514,56 @@ module internal Posix =
         | TrackedTarget.Group
         | TrackedTarget.LeaderPid -> true
 
-    // SIGSTOP / SIGCONT numbers differ between Linux and the BSD/macOS table (so do SIGUSR1/2);
-    // resolve them per-platform.
-    let private sigStop = if isMacOs then 17 else 19
-    let private sigCont = if isMacOs then 19 else 18
+    // SIGSTOP / SIGCONT numbers differ between Linux and the BSD table (so do SIGUSR1/2); resolve them
+    // per-platform.
+    //
+    // The selector is "does this host use the BSD signal table?", NOT "is this macOS": macOS inherits the
+    // table from 4.4BSD and shares it with every BSD, FreeBSD included (SIGSTOP 17, SIGCONT 19, SIGUSR1 30,
+    // SIGUSR2 31 — where Linux has 19/18/10/12). Keying it on `isMacOs` alone silently gave FreeBSD the
+    // LINUX numbers, so a `Suspend()` there delivered signal 19 — which on that table is SIGCONT, i.e. the
+    // exact opposite of the requested operation — and `Signal.Usr1` delivered 10 (SIGBUS). Every other
+    // curated signal (TERM/KILL/INT/HUP/QUIT) shares its number across both tables, which is why only
+    // these four rows are platform-dependent. `isMacOs` stays what it is elsewhere in this file: the gate
+    // for genuinely macOS-only APIs (libproc, kqueue, the Darwin spawn flags).
+    let private usesBsdSignalTable =
+        isMacOs || RuntimeInformation.IsOSPlatform OSPlatform.FreeBSD
 
-    /// The raw POSIX signal number for a portable `Signal`, resolved for the current platform.
-    let signalNumber (signal: Signal) : int =
+    /// SIGSTOP on the requested table — the numbers themselves, as a pure function of WHICH table, so both
+    /// halves (the platform selection above and the four numbers that differ) are pinnable by a test from
+    /// any build host rather than only on the platform in question.
+    let internal platformSuspendSignal (bsdTable: bool) = if bsdTable then 17 else 19
+
+    /// SIGCONT on the requested table — the mirror of `platformSuspendSignal`.
+    let internal platformResumeSignal (bsdTable: bool) = if bsdTable then 19 else 18
+
+    /// The raw POSIX signal number for a portable `Signal` on the requested table. Only `Usr1`/`Usr2`
+    /// diverge; every other curated signal shares its number across both tables.
+    let internal platformSignalNumber (bsdTable: bool) (signal: Signal) : int =
         match signal with
         | Signal.Term -> SIGTERM
         | Signal.Kill -> SIGKILL
         | Signal.Int -> 2
         | Signal.Hup -> 1
         | Signal.Quit -> 3
-        | Signal.Usr1 -> if isMacOs then 30 else 10
-        | Signal.Usr2 -> if isMacOs then 31 else 12
+        | Signal.Usr1 -> if bsdTable then 30 else 10
+        | Signal.Usr2 -> if bsdTable then 31 else 12
         | Signal.Other n -> n
+
+    let private sigStop = platformSuspendSignal usesBsdSignalTable
+    let private sigCont = platformResumeSignal usesBsdSignalTable
+
+    /// The raw SIGSTOP number for this platform. Exposed (rather than private like the value it reads)
+    /// because the FreeBSD reaper backend delivers a whole-tree freeze through `procctl(PROC_REAP_KILL)`
+    /// rather than through `killpg`, and must take the number from this one table instead of re-deriving
+    /// its own.
+    let suspendSignalNumber = sigStop
+
+    /// The raw SIGCONT number for this platform — the mirror of `suspendSignalNumber`.
+    let resumeSignalNumber = sigCont
+
+    /// The raw POSIX signal number for a portable `Signal`, resolved for the current platform.
+    let signalNumber (signal: Signal) : int =
+        platformSignalNumber usesBsdSignalTable signal
 
     /// Whether `signalNum` is a signal that can actually be *delivered*. A real signal is `>= 1`; the
     /// number 0 is a liveness *probe* (`kill`/`killpg` with a zero number only checks the target's

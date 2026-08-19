@@ -109,8 +109,9 @@ module internal ReadinessProbe =
             min remaining pollBackoff
 
     /// The single polling/deadline core every readiness probe funnels through: the HTTP
-    /// (`waitForHttpUsing`), port (`waitForPortUsing`), Unix domain socket (`waitForSocketUsing`), path
-    /// (`waitForPathUsing`), and custom (`waitFor`) probes each express their per-attempt check as a
+    /// (`waitForHttpUsing`), port (`waitForPortUsing`), Unix domain socket (`waitForSocketUsing`),
+    /// Windows named pipe (`waitForNamedPipeUsing`), path (`waitForPathUsing`), and custom (`waitFor`)
+    /// probes each express their per-attempt check as a
     /// `probe: CancellationToken -> Task<bool>` (true = ready) and hand it here, so the deadline
     /// mechanics live in exactly one place instead of being hand-synchronised across copies. Polls
     /// `probe` until it returns true, or fails with `NotReady` once the shared
@@ -418,6 +419,86 @@ module internal ReadinessProbe =
 
         withBackgroundDrain stdout stderr (fun () ->
             waitForSocketUsing timeProvider unixConnect program endpoint attempts timeout cancellationToken)
+
+    /// Whether this host can probe a Windows named pipe at all: the probe is a Win32 `CreateFileW`
+    /// primitive (`Native.Windows.probeNamedPipe`) with no portable equivalent, so it is available only
+    /// on Windows. Factored out as a predicate — rather than inlined as
+    /// `RuntimeInformation.IsOSPlatform OSPlatform.Windows` — so a test can force both branches
+    /// deterministically on every host, the same rationale `unixDomainSocketsSupported` gives for
+    /// `AF_UNIX`; must still fail with a typed `Unsupported`, never attempt (and unpredictably fail/hang
+    /// on) a Win32 API this platform does not have, nor silently downgrade to some other transport.
+    let internal namedPipeSupported (isSupported: unit -> bool) : Result<unit, ProcessError> =
+        if isSupported () then
+            Ok()
+        else
+            Error(ProcessError.Unsupported "WaitForNamedPipeAsync (this host has no Windows named-pipe support)")
+
+    /// Resolve a caller-supplied named-pipe `name` to the fully-qualified client path a `CreateFileW`
+    /// probe dials: an already-fully-qualified path (the local `\\.\pipe\name`, or a remote server's
+    /// `\\server\pipe\name`) is returned unchanged; a bare name (`"my-service"`) is resolved under the
+    /// local `\\.\pipe\` namespace. Mirrors the source Rust crate's `wait_for_pipe` name resolution, so
+    /// the same bare/qualified `name` argument means the same thing in both ports.
+    let internal resolveNamedPipeName (name: string) : string =
+        if name.StartsWith(@"\\", StringComparison.Ordinal) then
+            name
+        else
+            @"\\.\pipe\" + name
+
+    /// Wait until `openPipe` reports the named pipe ready, or fail with `NotReady` once the shared
+    /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). A thin adapter
+    /// over the shared `waitForCoreUsing` core, exactly like `waitForPathUsing`/`waitForPortUsing`.
+    /// `openPipe` is factored out (rather than hard-coding `Native.Windows.probeNamedPipe`) so tests can
+    /// substitute a deterministic stand-in; `waitForNamedPipe` below is the production entry point.
+    let internal waitForNamedPipeUsing
+        (timeProvider: TimeProvider)
+        (openPipe: string -> bool)
+        (program: string)
+        (pipeName: string)
+        (attempts: ReadinessAttempts)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        let probe (_ct: CancellationToken) : Task<bool> = Task.FromResult(openPipe pipeName)
+
+        waitForCoreUsing timeProvider program probe attempts timeout cancellationToken
+
+    /// Wait until the Windows named pipe `pipeName` accepts a client, or fail with `NotReady` once the
+    /// shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
+    /// `waitForNamedPipeUsing`/`waitForCoreUsing` for the full deadline contract; this wires it to the
+    /// real `CreateFileW`-based probe (`Native.Windows.probeNamedPipe`), which itself tries three client
+    /// access masks (duplex, read-only, write-only) so readiness does not depend on the server's
+    /// data-flow direction, and treats `ERROR_PIPE_BUSY` as ready (see
+    /// `Native.Windows.NamedPipeProbeOutcome` for why: it proves a server created the pipe even though
+    /// every instance is currently serving another client — genuinely different from the pipe not
+    /// existing at all, which keeps polling). `pipeName` is resolved once, before polling starts,
+    /// through `resolveNamedPipeName`. Background-drains (and discards) the child's piped stdout/stderr
+    /// for the duration of the poll, exactly like `waitForPort` — see `withBackgroundDrain`. Child-exit
+    /// detection is not done here: `RunningProcess.WaitForNamedPipeAsync` layers it on (racing this
+    /// against the handle's shared reap-once exit wait), the same early-exit contract every other probe
+    /// honours. Does NOT itself check platform support — `RunningProcess.WaitForNamedPipeAsync` gates on
+    /// `namedPipeSupported` before ever calling this, so a non-Windows host never reaches the
+    /// `CreateFileW` call below.
+    let waitForNamedPipe
+        (timeProvider: TimeProvider)
+        (program: string)
+        (stdout: Stream option)
+        (stderr: Stream option)
+        (pipeName: string)
+        (attempts: ReadinessAttempts)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        let resolvedName = resolveNamedPipeName pipeName
+
+        withBackgroundDrain stdout stderr (fun () ->
+            waitForNamedPipeUsing
+                timeProvider
+                Native.Windows.probeNamedPipe
+                program
+                resolvedName
+                attempts
+                timeout
+                cancellationToken)
 
     /// Wait until `exists` reports `path` present, or fail with `NotReady` once the shared `timeout`
     /// deadline elapses (or `Cancelled` if `cancellationToken` fires first). A thin adapter over the

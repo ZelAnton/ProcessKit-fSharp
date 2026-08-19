@@ -106,11 +106,14 @@ What this means for a ProcessKit-using app:
   it tracks the moment it exits, regardless of where in the process tree it ends up. This is not a
   `PID 1`-specific behavior — it is how the library always avoids leaving zombies behind for the
   processes it spawned.
-- **Reparenting does not let a process escape `Mechanism.JobObject` / `Mechanism.CgroupV2`
-  containment**, because those two mechanisms track membership by kernel container (the Job / the
-  cgroup), not by parent-child ancestry — reparenting a grandchild to `PID 1` doesn't remove it from
-  its Job or cgroup. The one mechanism with a real escape hatch is `Mechanism.ProcessGroup`, and only
-  via a deliberate `setsid()` inside the child — see
+- **Reparenting does not let a process escape `Mechanism.JobObject` / `Mechanism.CgroupV2` /
+  `Mechanism.ProcessReaper` containment**, because none of those three tracks membership by
+  parent-child ancestry: the first two use a kernel container (the Job / the cgroup) and the third uses
+  the kernel's per-descendant reaper subtree tag, which is fixed at fork and survives reparenting — so
+  reparenting a grandchild to `PID 1` removes it from none of them. (On FreeBSD, where ProcessKit is the
+  reaper, an orphan re-parents onto *it* rather than onto `PID 1`, and ProcessKit `wait`s for it.) The one
+  mechanism with a real escape hatch is `Mechanism.ProcessGroup`, and only via a deliberate `setsid()`
+  inside the child — see
   [POSIX process groups: a `setsid` child can escape](platform-support.md#caveats) in Platform
   support, which applies identically whether or not you're `PID 1`.
 - **Orphans outside ProcessKit's own tracking are not ProcessKit's concern.** If something else in

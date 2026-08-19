@@ -42,9 +42,9 @@ test's helper servers — survive a timeout, an exception, or a dropped task, an
 orphans.
 
 ProcessKit spawns every child into the operating system's own containment primitive — a **Job
-Object** on Windows, a **cgroup v2** on Linux (with a process-group fallback), a **POSIX process
-group** on macOS/BSD — so teardown is a kernel operation over the whole tree, not a best-effort
-signal to one pid:
+Object** on Windows, a **cgroup v2** on Linux (with a process-group fallback), the **`procctl(2)`
+process reaper** on FreeBSD, a **POSIX process group** on macOS and the other BSDs — so teardown is a
+kernel operation over the whole tree, not a best-effort signal to one pid:
 
 - **Nothing escapes silently.** Disposing the handle or group reaps every descendant,
   grandchildren included. Where a mechanism has a genuine weakness (a `setsid` child escapes a

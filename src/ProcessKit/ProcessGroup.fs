@@ -13,9 +13,10 @@ open System.Threading.Tasks
 /// Every process started into the group — and everything those processes spawn — is reaped when
 /// the group is disposed (deterministic under `use`) or, failing that, when the GC finalizes it.
 /// The OS primitive is chosen at creation and reported honestly by `Mechanism` — a Windows Job
-/// Object (`KILL_ON_JOB_CLOSE`), a Linux cgroup v2 (when resource limits are requested), or a POSIX
-/// process group (`killpg` teardown). All of that lives behind an `IContainmentBackend`; this type
-/// only orchestrates once-only teardown, the stdin/stream wiring, and the runner/disposable seams.
+/// Object (`KILL_ON_JOB_CLOSE`), a Linux cgroup v2 (when resource limits are requested), a FreeBSD
+/// `procctl(2)` process reaper (whole-tree, `setsid` escapees included), or a POSIX process group
+/// (`killpg` teardown). All of that lives behind an `IContainmentBackend`; this type only orchestrates
+/// once-only teardown, the stdin/stream wiring, and the runner/disposable seams.
 [<Sealed>]
 type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOptions) =
 
@@ -112,7 +113,8 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// resource limits). When `options.Limits` is set, the group needs a limit-capable mechanism —
     /// a Windows Job Object or a Linux cgroup v2 at the real cgroup root; otherwise creation fails
     /// fast with `ProcessError.ResourceLimit` rather than leaving the tree unbounded. Without limits
-    /// the group uses the platform's default mechanism (Job Object / POSIX process group).
+    /// the group uses the platform's default mechanism (Job Object on Windows, the `procctl(2)` process
+    /// reaper on FreeBSD when reaper status can be acquired, POSIX process group elsewhere).
     ///
     /// On the Linux cgroup v2 mechanism, a spawned child is migrated into the cgroup right after it
     /// starts, and the limits then apply to it and every descendant it forks *afterwards*. A grandchild
@@ -157,6 +159,21 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // No whole-tree limits: the POSIX group forms when children are spawned (each becomes its own
             // pgid). A CPU-time-only cap rides along per child through `RLIMIT_CPU`.
             withBackend (ProcessGroupBackend limits)
+        | MechanismChoice.Selected Mechanism.ProcessReaper ->
+            // FreeBSD: take reaper status for this process — once, permanently, process-wide — and layer
+            // the whole-tree `procctl(2)` reaper over the very same POSIX process group the branch above
+            // builds. This is the only place the acquisition is ever attempted: it is a real side effect,
+            // so the capability snapshot predicts this mechanism without performing it.
+            //
+            // A refused acquisition is NOT a creation failure and NOT a silent claim: the group is built on
+            // the plain process group instead and reports `Mechanism.ProcessGroup`, `setsid` hole included,
+            // rather than telling a caller it holds a containment guarantee this process could not take.
+            let posix = ProcessGroupBackend limits
+
+            if Native.FreeBsd.acquireReaperStatus () then
+                withBackend (ProcessReaperBackend(posix, limits))
+            else
+                withBackend posix
 
     /// What process containment can actually do on **this** host, for the default options — a
     /// side-effect-free snapshot taken WITHOUT creating a group or spawning anything. See the
@@ -643,9 +660,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     ///  * **Linux cgroup v2** — writes the pid to the group's `cgroup.procs`; available only on a group
     ///    created **with** resource limits (which is what selects the cgroup mechanism). A plain,
     ///    limit-free Linux group uses the POSIX process-group mechanism and cannot adopt (below).
-    ///  * **POSIX process group (macOS/BSD, or Linux without limits)** — `ProcessError.Unsupported`:
-    ///    `setpgid` only relocates our own children before they `exec`, so a foreign process cannot be
-    ///    moved into our group at all.
+    ///  * **POSIX process group (macOS and the other BSDs, or Linux without limits)** —
+    ///    `ProcessError.Unsupported`: `setpgid` only relocates our own children before they `exec`, so a
+    ///    foreign process cannot be moved into our group at all.
+    ///  * **FreeBSD process reaper** — `ProcessError.Unsupported`, refused by the POSIX process group it
+    ///    layers over: a reaper contains this process's own *descendants*, and no `procctl(PROC_REAP_*)`
+    ///    call turns a foreign process into one (`PROC_REAP_ACQUIRE` does not even re-attach children
+    ///    forked before it ran).
     ///
     /// **Edge cases**, each a distinct typed failure rather than a fabricated success:
     ///  * a `null` argument throws `ArgumentNullException` (a programming error, surfaced eagerly);
@@ -734,6 +755,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     ///    start-time token read here, **re-read before every later probe, signal, suspend/resume and
     ///    teardown kill**, never once at adoption and then trusted. A number whose token no longer matches
     ///    is dropped from the group and receives nothing.
+    ///  * **FreeBSD process reaper** — whatever the POSIX process group underneath answers, since this
+    ///    verb is delegated to it verbatim: a reaper is a membership mechanism for this process's own
+    ///    *descendants*, not an identity mechanism for an arbitrary number, so it adds no anchor of its
+    ///    own. In practice FreeBSD ships no start-time reader this library can verify, so the refusal
+    ///    below is what a caller gets there.
     ///
     /// So a process that recycles the number *after* this call is rejected rather than signalled. What no
     /// library can check for you is the window *before* it — whether `pid` still named the process you
@@ -842,15 +868,19 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
         this.WhenLive(fun () -> backend.KillTree())
 
     /// The pids of the processes currently in the group — a point-in-time snapshot. On Windows the
-    /// whole Job tree, on cgroup v2 the whole cgroup, on the POSIX fallback the tracked group leaders plus
-    /// any process adopted by pid (`AdoptByPid`) whose identity anchor still matches.
+    /// whole Job tree, on cgroup v2 the whole cgroup, on the FreeBSD process reaper the whole live
+    /// descendant tree (`setsid` escapees included, exited members excluded), on the POSIX fallback the
+    /// tracked group leaders plus any process adopted by pid (`AdoptByPid`) whose identity anchor still
+    /// matches.
     member this.Members() : Result<IReadOnlyList<int>, ProcessError> =
         this.WhenLive(fun () -> backend.Members())
         |> Result.map (fun pids -> List.toArray pids :> IReadOnlyList<int>)
 
     /// An enriched, point-in-time snapshot of the group's members: the same pids `Members` reports, in
-    /// the same platform matrix (the whole Job tree on Windows, the whole cgroup on cgroup v2, the tracked
-    /// group leaders and any anchor-matching `AdoptByPid` member on the POSIX fallback), each carrying its parent pid, executable image name, and
+    /// the same platform matrix (the whole Job tree on Windows, the whole cgroup on cgroup v2, the whole
+    /// live descendant tree on the FreeBSD process reaper, the tracked group leaders and any
+    /// anchor-matching `AdoptByPid` member on the POSIX fallback), each carrying its parent pid,
+    /// executable image name, and
     /// OS-reported start time **where the platform can honestly report them** — every enriching field is
     /// `option` and is `None` otherwise, never a fabricated value. A member that exits between the
     /// enumeration and its metadata read is **omitted** rather than filled with invented fields. The
@@ -934,7 +964,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// in place — while the
     /// **POSIX process-group** mechanism (macOS/BSD, or Linux without cgroup v2) has no whole-tree limit
     /// primitive and returns `ProcessError.ResourceLimit`, the same honest, typed refusal `Create` gives
-    /// for a limited group there — never a silent no-op. On Linux the CPU-affinity pin additionally needs
+    /// for a limited group there — never a silent no-op. The **FreeBSD process reaper** answers that same
+    /// `ProcessError.ResourceLimit` for its own reason: it contains a whole tree but accounts for nothing
+    /// in it, so there is no whole-tree cap to update — and never a per-process `RLIMIT_*` surrogate
+    /// presented as one. On Linux the CPU-affinity pin additionally needs
     /// the `cpuset` controller: a hierarchy that does not carry it at all cannot enforce a pin, so an
     /// update requesting one is refused with that same typed `ProcessError.ResourceLimit` — and refused
     /// before any controller file is written, so the previous caps stay in force — never a dropped pin.
@@ -979,7 +1012,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// A snapshot of the group's resource usage. On Windows this reads the Job Object's accounting
     /// (CPU + peak committed memory + I/O + active count); on cgroup v2 it reads the cgroup accounting;
     /// on the POSIX fallback only the live count (its tracked groups plus any anchor-matching `AdoptByPid`
-    /// member) is available. Errors once the group is released.
+    /// member) is available, and on the FreeBSD process reaper only the live count as well — the whole
+    /// contained tree there, since a reaper contains a tree but accounts for nothing in it. Errors once
+    /// the group is released.
     member this.Stats() : Result<ProcessGroupStats, ProcessError> =
         this.WhenLive(fun () -> backend.Stats())
 
@@ -1011,11 +1046,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// caps fired, so every axis it ever capped reads `Unknown` — not an oversight, a measured conclusion
     /// about what it actually preserves after the fact — but an axis it never capped still reads
     /// `NotTripped` (nothing was capped, so nothing could fire) without touching native at all. The POSIX
-    /// process-group fallback has no whole-tree resource-accounting apparatus whatsoever — the same reason
-    /// `Create`/`UpdateLimits` refuse any whole-tree cap on it — so it answers `Unknown` on every axis
-    /// UNCONDITIONALLY, including one this group never capped: there is no "nothing was capped" case that
-    /// lets it read `NotTripped` the way a Job Object can, because it never had any evidence apparatus to
-    /// begin with.
+    /// process-group fallback and the FreeBSD process reaper have no whole-tree resource-accounting
+    /// apparatus whatsoever — the same reason `Create`/`UpdateLimits` refuse any whole-tree cap on either
+    /// of them — so both answer `Unknown` on every axis UNCONDITIONALLY, including one this group never
+    /// capped: there is no "nothing was capped" case that lets them read `NotTripped` the way a Job Object
+    /// can, because they never had any evidence apparatus to begin with.
     member this.LimitEvidence() : Result<LimitEvidence, ProcessError> =
         lock sync (fun () ->
             match capturedLimitEvidence with

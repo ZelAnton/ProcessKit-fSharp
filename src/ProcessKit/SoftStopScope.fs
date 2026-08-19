@@ -38,15 +38,17 @@ namespace ProcessKit
 /// | Mechanism | Scope | Why |
 /// |---|---|---|
 /// | Linux cgroup v2 | `WholeTree` | `Signal(Int/Term)` writes to every process in the cgroup. |
+/// | FreeBSD process reaper | `WholeTree` | `PROC_REAP_KILL` reaches every process in every subtree the group owns, with no escapee at all — not even a child that `setsid`s away: this is the strongest form of the promise on any unix. |
 /// | POSIX process group (macOS / the other BSDs / Linux without cgroup v2) | `WholeTree` | `killpg` reaches every tracked group leader and its descendants — a child that `setsid`s away escapes, the same documented weakness the kill-on-drop guarantee already has, not new to the soft stop. |
 /// | Windows Job Object | `OptInMembers` or `Unsupported` | A Job Object has no POSIX signal; a soft stop reaches only members it can *trigger* — a console-CTRL leader (opted in via `Command.WindowsCtrlSignals()`) or any live windowed member (`WM_CLOSE`). `OptInMembers` when at least one such member is live, else `Unsupported`. |
 [<RequireQualifiedAccess; NoComparison>]
 type SoftStopScope =
 
-    /// The soft stop reaches **every** process in the tree — the Linux cgroup v2 mechanism and the POSIX
-    /// process-group mechanism (macOS / the other BSDs / Linux without cgroup v2). On the process-group
-    /// mechanism the one documented escapee is a child that `setsid`s away, the same weakening that
-    /// already applies to the kill-on-drop guarantee.
+    /// The soft stop reaches **every** process in the tree — the Linux cgroup v2 mechanism, the FreeBSD
+    /// process reaper, and the POSIX process-group mechanism (macOS / the other BSDs / Linux without
+    /// cgroup v2). On the process-group mechanism the one documented escapee is a child that `setsid`s
+    /// away, the same weakening that already applies to the kill-on-drop guarantee; on the cgroup and the
+    /// reaper there is no escapee at all.
     | WholeTree
 
     /// The soft stop reaches only the members that can *receive* it — a curated **subset** of the tree,

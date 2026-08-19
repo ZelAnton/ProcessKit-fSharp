@@ -15,7 +15,8 @@ type internal ProcessIoCounters =
 /// A snapshot of a process group's resource usage.
 ///
 /// Optional peak-process, CPU, memory, and I/O fields are `None` when the platform can't report them —
-/// the POSIX process-group mechanism (macOS and the Linux fallback) has no kernel accumulator; the
+/// the POSIX process-group mechanism (macOS and the Linux fallback) has no kernel accumulator, and
+/// neither does the FreeBSD process reaper, which contains a tree but accounts for nothing in it; the
 /// Linux cgroup v2 backend (the `limits` feature) supplies the controller metrics available to it.
 /// Sealed with an internal constructor so it can gain metrics without breaking the frozen API.
 [<Sealed>]
@@ -33,14 +34,16 @@ type ProcessGroupStats
     /// this counts live process *groups* (one per contained child) rather than individual
     /// processes — plus each individually tracked process adopted by pid (`ProcessGroup.AdoptByPid`),
     /// which is one process rather than a group; with a Job Object (or cgroup) it is the exact
-    /// process count.
+    /// process count, as it is on the FreeBSD process reaper, which counts every live process in the
+    /// whole contained tree (a member that has exited is not counted).
     member _.ActiveProcessCount = activeProcessCount
 
     /// Maximum number of kernel tasks (processes and their threads) charged to the group at once over
     /// its lifetime, if the containment mechanism exposes a native counter. Linux cgroup v2 reports
     /// `pids.peak` only when `MaxProcesses` is configured and the kernel is version 6.6 or later. This
     /// task count is not directly comparable with `ActiveProcessCount`, which counts process leaders.
-    /// Windows Job Objects and the POSIX process-group fallback return `None`.
+    /// Windows Job Objects, the FreeBSD process reaper and the POSIX process-group fallback return
+    /// `None`.
     member _.PeakProcessCount = peakProcessCount
 
     /// Total CPU time (user + kernel) accumulated by the group, if available. On Windows this is
@@ -53,7 +56,8 @@ type ProcessGroupStats
 
     /// Bytes read by the contained tree, if the containment mechanism exposes an aggregate I/O
     /// counter. Windows reports the Job Object's OS I/O total; Linux cgroup v2 reports block-device
-    /// bytes from `io.stat`; the POSIX process-group fallback returns `None`.
+    /// bytes from `io.stat`; the POSIX process-group fallback and the FreeBSD process reaper return
+    /// `None`.
     member _.IoReadBytes = ioCounters |> Option.map _.ReadBytes
 
     /// Bytes written by the contained tree, with the same platform availability as `IoReadBytes`.

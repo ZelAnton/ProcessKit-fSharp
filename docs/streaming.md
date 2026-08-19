@@ -1238,7 +1238,7 @@ peer's stdin for the usual `shutdown`/`exit` handshake. Dispose the `RunningProc
 ## Readiness probes
 
 "Start a server, then use it" needs the server to be *ready*, not merely started.
-Six probes replace the arbitrary sleep, each bounded by its own deadline and each
+Seven probes replace the arbitrary sleep, each bounded by its own deadline and each
 returning a `Result`:
 
 **F#**
@@ -1291,7 +1291,13 @@ task {
         | Ok() -> printfn "pidfile is there"
         | Error err -> eprintfn $"{err.Message}"
 
-        // 6. Any async predicate (a custom dependency check, a stronger "file is fully
+        // 6. A Windows named pipe accepting a client connection (Windows-only):
+        match! proc.WaitForNamedPipeAsync("my-service", TimeSpan.FromSeconds 10.0) with
+        | Ok() -> printfn "named pipe is open"
+        | Error(ProcessError.Unsupported detail) -> eprintfn $"this host has no named pipes: {detail}"
+        | Error err -> eprintfn $"{err.Message}"
+
+        // 7. Any async predicate (a custom dependency check, a stronger "file is fully
         //    written" check, …):
         match! proc.WaitForAsync((fun () -> healthCheck ()), TimeSpan.FromSeconds 10.0) with
         | Ok() -> printfn "healthy"
@@ -1356,7 +1362,14 @@ Console.WriteLine(await proc.WaitForPathAsync("/run/my-server.pid", TimeSpan.Fro
     { IsOk: false, ErrorValue: var err } => err.Message,
 });
 
-// 6. Any async predicate (a custom dependency check, a stronger "file is fully written" check, …):
+// 6. A Windows named pipe accepting a client connection (Windows-only):
+Console.WriteLine(await proc.WaitForNamedPipeAsync("my-service", TimeSpan.FromSeconds(10)) switch
+{
+    { IsOk: true }        => "named pipe is open",
+    { IsOk: false, ErrorValue: var err } => err.Message,
+});
+
+// 7. Any async predicate (a custom dependency check, a stronger "file is fully written" check, …):
 Console.WriteLine(await proc.WaitForAsync(() => healthCheck(), TimeSpan.FromSeconds(10)) switch
 {
     { IsOk: true }        => "healthy",
@@ -1370,28 +1383,36 @@ Probe semantics are deliberately uniform:
   distinct from `ProcessError.Timeout`, which is the run's own deadline.
 - A probe also fails *fast* once readiness can no longer happen: the child exits, or
   (for `WaitForLineAsync`) its stdout closes — no waiting out a 10s deadline on a dead
-  server. Observing the exit does not by itself discard readiness, though: the five
+  server. Observing the exit does not by itself discard readiness, though: the six
   external-condition probes (`WaitForPortAsync` / `WaitForSocketAsync` / `WaitForHttpAsync` /
-  `WaitForPathAsync` / `WaitForAsync`) check the condition exactly one more time first — bounded by
-  what is left of the deadline and by a brief grace — so a port, socket, endpoint, or sentinel path
-  published immediately before the child terminated still reports `Ok` instead of being lost to that
-  exit. Expect that one extra invocation of a `WaitForAsync` predicate; an already-cancelled token or
-  a spent deadline skips it.
+  `WaitForPathAsync` / `WaitForNamedPipeAsync` / `WaitForAsync`) check the condition exactly one more
+  time first — bounded by what is left of the deadline and by a brief grace — so a port, socket,
+  endpoint, sentinel path, or pipe published immediately before the child terminated still reports
+  `Ok` instead of being lost to that exit. Expect that one extra invocation of a `WaitForAsync`
+  predicate; an already-cancelled token or a spent deadline skips it.
 - A failed probe **never kills the child.** You decide what happens next: retry, log
   and continue, or tear down.
-- All six probes background-drain the child's piped stdout/stderr while polling, so a chatty
+- All seven probes background-drain the child's piped stdout/stderr while polling, so a chatty
   child that writes more than one OS pipe buffer of startup output (~64 KiB on Linux) before
   becoming ready can't block in `write()` and spuriously fail the probe with `NotReady`.
   `WaitForLineAsync` hands the drained stdout back to you (consumed up to and including the
   matching line — continue with `FinishAsync()` or further streaming afterwards); `WaitForPortAsync` /
-  `WaitForSocketAsync` / `WaitForHttpAsync` / `WaitForPathAsync` / `WaitForAsync` discard what they
-  drain and stop draining once the probe concludes. Either way, a capture verb called afterward
-  (`OutputStringAsync`/`OutputBytesAsync`/a fresh `StdoutLinesAsync`/`OutputEventsAsync`) only sees
-  output the child wrote *after* the probe concluded — run probes before a capturing verb if you
-  need the complete output.
+  `WaitForSocketAsync` / `WaitForHttpAsync` / `WaitForPathAsync` / `WaitForNamedPipeAsync` /
+  `WaitForAsync` discard what they drain and stop draining once the probe concludes. Either way, a
+  capture verb called afterward (`OutputStringAsync`/`OutputBytesAsync`/a fresh
+  `StdoutLinesAsync`/`OutputEventsAsync`) only sees output the child wrote *after* the probe
+  concluded — run probes before a capturing verb if you need the complete output.
 - `WaitForSocketAsync` requires the host to support `AF_UNIX` sockets (Windows 10 1809+, any current
   Linux/macOS); a host without that support fails immediately with `ProcessError.Unsupported`, before
   ever attempting to dial — never a silent downgrade or a hang.
+- `WaitForNamedPipeAsync` dials a Windows named pipe (`CreateFileW`, tried against duplex, read-only,
+  then write-only client access so readiness does not depend on the server's data-flow direction) and
+  is available **only on Windows**; every other platform fails immediately with
+  `ProcessError.Unsupported`, before ever attempting to open a pipe. A pipe name may be bare
+  (`"my-service"`, resolved under the local `\\.\pipe\` namespace) or already fully qualified
+  (`\\.\pipe\my-service`, or a remote `\\server\pipe\my-service`). A pipe reporting `ERROR_PIPE_BUSY`
+  — every instance currently serving another client — counts as **ready**: it proves a server created
+  the pipe, which genuinely differs from the pipe not existing at all (the latter keeps polling).
 - `WaitForPathAsync` checks **existence only** — a file and a directory both count, and it does not
   wait for the writer to finish. A pidfile a daemon `touch`es before it is done writing elsewhere is
   reported ready the instant it appears; probe a stronger "fully written" condition yourself with

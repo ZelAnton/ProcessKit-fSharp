@@ -1,4 +1,5 @@
 using System;
+using System.IO.Pipes;
 using System.Threading.Tasks;
 using NUnit.Framework;
 using ProcessKit;
@@ -77,5 +78,27 @@ public class StreamingAndProcessGroupTests
         // The capability snapshot answers the same question up front, and its own axis for it.
         var adoption = ProcessGroup.Capabilities().AdoptionByPid;
         Assert.That(adoption.IsAvailable || adoption.IsQualified || adoption.IsUnsupported, Is.True);
+    }
+
+    [Test]
+    public async Task WaitForNamedPipeAsync_is_usable_from_CSharp_and_reports_a_listening_pipe_as_ready()
+    {
+        // Windows-only readiness verb (T-378): every other platform refuses with a typed Unsupported
+        // before ever touching a pipe, exercised in F# (ReadinessTests.fs); this test proves the C#
+        // call shape itself — an explicit type, no F#-specific convenience — against a real pipe.
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Ignore("Windows-only: exercises the named-pipe readiness probe");
+        }
+
+        var pipeName = $"processkit-csharp-{Guid.NewGuid():N}";
+        using var server = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1);
+        _ = server.WaitForConnectionAsync();
+
+        await using var running = (await Shell.Run(Lingering()).StartAsync()).GetValueOrThrow();
+
+        var ready = await running.WaitForNamedPipeAsync(pipeName, TimeSpan.FromSeconds(5));
+
+        Assert.That(ready.IsOk, Is.True, ready.IsOk ? "" : ready.ErrorValue.Message);
     }
 }

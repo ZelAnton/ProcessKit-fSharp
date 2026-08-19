@@ -635,6 +635,98 @@ module internal Windows =
         else
             IntPtr.Zero
 
+    // ----------------------------------------------------------------------------------
+    // Windows: named-pipe readiness probe (`RunningProcess.WaitForNamedPipeAsync`)
+    // ----------------------------------------------------------------------------------
+
+    [<Literal>]
+    let private ERROR_PIPE_BUSY = 231
+
+    /// The honest, typed outcome of ONE client-side `CreateFileW` attempt at a Windows named pipe
+    /// endpoint, classified from the returned handle and (on failure) the `GetLastError` code —
+    /// factored out from the native call itself (`classifyNamedPipeOpen` below) so it is unit-testable
+    /// with synthetic inputs, without a real named-pipe server.
+    ///
+    /// `Ready`: the open succeeded outright, OR the attempt failed with `ERROR_PIPE_BUSY` — every
+    /// instance of the pipe is currently serving another client. Busy still PROVES a server created
+    /// this pipe name, so it counts as ready rather than as absent (mirrors the source Rust crate's
+    /// `named_pipe_is_ready`, which folds `ERROR_PIPE_BUSY` into its own single boolean the same way).
+    ///
+    /// `Missing`: no server has created this pipe name yet (`ERROR_FILE_NOT_FOUND`/
+    /// `ERROR_PATH_NOT_FOUND`) — genuinely absent, distinguishable from `Ready`'s busy case rather than
+    /// folded into it.
+    ///
+    /// `OpenFailed`: any other `CreateFileW` failure (access denied, a malformed name, …) — kept as its
+    /// own case (carrying the `Win32Error`) rather than silently folded into `Missing`, so nothing
+    /// INSIDE this classification step confuses "genuinely different failure" with "not created yet".
+    /// That distinction is internal only, though: `probeNamedPipe` below (the boolean seam every
+    /// `ReadinessProbe` probe closure shares) does not expose it outward, and neither does
+    /// `RunningProcess.WaitForNamedPipeAsync` — both `Missing` and `OpenFailed` keep the caller's
+    /// readiness poll going exactly like every other probe's "any failure just means not ready yet"
+    /// rule (see `ReadinessProbe.waitForSocketUsing`), and the `Win32Error` an `OpenFailed` carries is
+    /// not surfaced to a caller or a diagnostic. `NamedPipeProbeOutcome` exists to keep `Ready`'s
+    /// busy-counts-as-ready case honest against `Missing`, not to publish an open-failure taxonomy —
+    /// mirrors the source Rust crate's `named_pipe_is_ready`, which folds every non-busy failure into
+    /// the same "not ready" boolean.
+    [<RequireQualifiedAccess; NoComparison>]
+    type internal NamedPipeProbeOutcome =
+        | Ready
+        | Missing
+        | OpenFailed of Win32Error: int
+
+    /// Classifies one `CreateFileW` attempt purely from its outcome — a pure function, so it is testable
+    /// on every platform (including non-Windows CI legs) with synthetic `handle`/`lastError` values, no
+    /// real Win32 call involved. See `NamedPipeProbeOutcome` for what each case means.
+    let internal classifyNamedPipeOpen (handle: nativeint) (lastError: int) : NamedPipeProbeOutcome =
+        if isValidHandle handle || lastError = ERROR_PIPE_BUSY then
+            NamedPipeProbeOutcome.Ready
+        elif lastError = ERROR_FILE_NOT_FOUND || lastError = ERROR_PATH_NOT_FOUND then
+            NamedPipeProbeOutcome.Missing
+        else
+            NamedPipeProbeOutcome.OpenFailed lastError
+
+    /// One client-side `CreateFileW` attempt at `pipeName` with the given `access` mask, closing the
+    /// handle again immediately on success — this is a readiness PROBE, never a connection the caller
+    /// keeps open, and the handle is held only as long as it takes to classify and close it again.
+    /// `FILE_SHARE_RW` matches every other short-lived open in this file (`inheritableNul`,
+    /// `inheritableFile`); it controls whether OTHER opens of the same file/pipe object may share it
+    /// concurrently and has no bearing on named-pipe instance availability, which the server (not the
+    /// share mode) governs. A successful open here IS a real client connection from the server's point
+    /// of view — see `RunningProcess.WaitForNamedPipeAsync`'s doc for what that means for a
+    /// single-instance server racing a real client against this probe.
+    let private openNamedPipeOnce (pipeName: string) (access: uint32) : NamedPipeProbeOutcome =
+        let handle =
+            CreateFileW(pipeName, access, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, 0u, IntPtr.Zero)
+
+        let lastError =
+            if isValidHandle handle then
+                0
+            else
+                Marshal.GetLastWin32Error()
+
+        closeHandleIfValid handle
+        classifyNamedPipeOpen handle lastError
+
+    /// Whether `pipeName` (already resolved to a fully-qualified client path by
+    /// `ReadinessProbe.resolveNamedPipeName`) currently accepts a client — the real, Windows-only probe
+    /// wired to `RunningProcess.WaitForNamedPipeAsync`. Tries three client access masks in order —
+    /// duplex (read+write, the common case), read-only, then write-only — so readiness does not depend
+    /// on which single direction a one-way server exposes; stops at the first mask that is `Ready` (see
+    /// `NamedPipeProbeOutcome` for why a busy pipe counts as ready). Returns `false` (not `Missing`'s or
+    /// `OpenFailed`'s distinction) only once every mask has been tried and none succeeded — the boolean
+    /// contract every `ReadinessProbe` probe closure shares; the typed distinction lives in
+    /// `classifyNamedPipeOpen`, independently unit-tested.
+    let probeNamedPipe (pipeName: string) : bool =
+        let accessModes = [| GENERIC_READ ||| GENERIC_WRITE; GENERIC_READ; GENERIC_WRITE |]
+
+        let isReadyWith access =
+            match openNamedPipeOnce pipeName access with
+            | NamedPipeProbeOutcome.Ready -> true
+            | NamedPipeProbeOutcome.Missing
+            | NamedPipeProbeOutcome.OpenFailed _ -> false
+
+        accessModes |> Array.exists isReadyWith
+
     /// Create a Job Object that kills its whole process tree when its last handle closes
     /// (`KILL_ON_JOB_CLOSE`). This is how kill-on-drop maps to .NET: the owning
     /// `ProcessGroup` holds the only handle, and disposing it (or GC finalizing it) reaps

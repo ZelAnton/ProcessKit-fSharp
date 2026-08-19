@@ -51,7 +51,8 @@ module internal ReadinessRace =
     // Race a readiness probe against the child's own exit so a probe on a child that has already
     // exited — or that dies early on startup — resolves to `NotReady` promptly instead of burning the
     // whole `timeout` polling a condition that can never come true. Shared by all readiness probes
-    // (`WaitForHttpAsync`/`WaitForPortAsync`/`WaitForSocketAsync`/`WaitForPathAsync`/`WaitForAsync`) so
+    // (`WaitForHttpAsync`/`WaitForPortAsync`/`WaitForSocketAsync`/`WaitForNamedPipeAsync`/
+    // `WaitForPathAsync`/`WaitForAsync`) so
     // their early-exit behaviour cannot drift apart: `startProbe` builds the underlying `ReadinessProbe.*` task from the
     // snapshotted (still-`Fresh`) drain streams and a readiness token linked to the caller's `cancellationToken`;
     // everything else — the exit race, cancellation, and `NotReady`/`Cancelled` selection — lives here,

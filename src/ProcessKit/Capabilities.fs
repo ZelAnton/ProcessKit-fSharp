@@ -75,7 +75,8 @@ type PlatformHelper internal (name: string, purpose: string, availability: Capab
 type SignalCapabilities internal (kill: Capability, softStop: Capability, arbitrary: Capability) =
 
     /// `Signal.Kill` — the unblockable kill. Everywhere the mechanism's own atomic tree kill (a Job Object
-    /// terminate, `cgroup.kill`, `killpg` with `SIGKILL`).
+    /// terminate, `cgroup.kill`, `procctl(PROC_REAP_KILL)` on the FreeBSD process reaper, `killpg` with
+    /// `SIGKILL`).
     member _.Kill = kill
 
     /// `Signal.Int` / `Signal.Term` — the soft stop, and what `ProcessGroup.ShutdownAsync` sends before it
@@ -198,7 +199,9 @@ type ContainmentCapabilities
 
     /// `ProcessGroup.Adopt` — bringing an already-running external process into the container. Follows the
     /// mechanism these options select: a Windows Job Object always can, a Linux cgroup v2 group can (which
-    /// is what requesting whole-tree limits selects), and the POSIX process group cannot at all.
+    /// is what requesting whole-tree limits selects), and neither the POSIX process group nor the FreeBSD
+    /// process reaper can at all — a reaper contains this process's own descendants, which a foreign
+    /// process is not.
     member _.Adoption = adoption
 
     /// `ProcessGroup.AdoptByPid` — the same, from a **bare pid** rather than a `System.Diagnostics.Process`.
@@ -208,7 +211,9 @@ type ContainmentCapabilities
     /// membership). The POSIX process group — which cannot `Adopt` at all — can still track a foreign pid
     /// against a re-verified start-time token, so it is `Qualified` wherever this host has a reader for one
     /// (Linux `/proc`, macOS `proc_pidinfo`) and `Unsupported` where it does not (the BSDs), rather than
-    /// tracking a bare number teardown would later SIGKILL whoever holds.
+    /// tracking a bare number teardown would later SIGKILL whoever holds. The FreeBSD process reaper is
+    /// answered on that same row — it delegates this verb to the process group underneath it and adds no
+    /// anchor of its own — so in practice it reports that `Unsupported`.
     member _.AdoptionByPid = adoptionByPid
 
     /// `Command.Pty` — starting a child on a pseudo-terminal. Reported from the very host gate the spawn
@@ -265,6 +270,7 @@ module internal MechanismSelection =
     let chooseUsing
         (isWindows: bool)
         (isLinux: bool)
+        (isFreeBsd: bool)
         (cgroupV2Available: unit -> bool)
         (cgroupIoAvailable: unit -> bool)
         (options: ProcessGroupOptions)
@@ -322,12 +328,37 @@ module internal MechanismSelection =
                             ProcessError.ResourceLimit
                                 "cgroup v2 is not mounted; whole-tree resource limits need a Windows Job Object or Linux cgroup v2"
                         )
+                elif limits.WholeTreeAny && isFreeBsd then
+                    // FreeBSD refuses for the same reason but not with the same sentence: it DOES have a
+                    // whole-tree containment mechanism, so "this platform has no whole-tree primitive"
+                    // would be untrue here and would send a caller looking for the wrong thing. What it
+                    // lacks is the ACCOUNTING a cap needs, and the refusal says exactly that — never a
+                    // per-process rlimit dressed up as a whole-tree cap.
+                    MechanismChoice.Refused(
+                        ProcessError.ResourceLimit
+                            "this platform's whole-tree mechanism is the FreeBSD procctl(2) process reaper, which contains a tree but accounts for nothing in it; enforcing a whole-tree resource limit needs a Windows Job Object or Linux cgroup v2"
+                    )
                 elif limits.WholeTreeAny then
-                    // macOS / BSD, or Linux without cgroup v2 — no whole-tree limit primitive.
+                    // macOS / the other BSDs, or Linux without cgroup v2 — no whole-tree limit primitive.
                     MechanismChoice.Refused(
                         ProcessError.ResourceLimit
                             "this platform has no whole-tree resource-limit primitive (needs a Windows Job Object or Linux cgroup v2)"
                     )
+                elif isFreeBsd then
+                    // FreeBSD is the one unix outside Linux with a real whole-tree containment primitive,
+                    // so a limit-free group here PREFERS the kernel process reaper over the plain POSIX
+                    // process group: `procctl(PROC_REAP_ACQUIRE)` keeps every descendant in one tree —
+                    // including a child that `setsid`s away, the escapee `killpg` cannot reach — and lets
+                    // it be enumerated and signalled per subtree. It is a containment relationship rather
+                    // than a container, so it changes nothing above about whole-tree LIMITS: those are
+                    // refused here exactly as on any other BSD.
+                    //
+                    // This is a prediction, not a probe: acquiring reaper status is a permanent,
+                    // process-wide side effect a capability snapshot must never cause, so it is not
+                    // attempted here. `ProcessGroup.Create` acquires it for real and falls back to the
+                    // POSIX process group (reporting `Mechanism.ProcessGroup`) if the acquisition fails,
+                    // so the created group's own `Mechanism` — never this prediction — is the final word.
+                    MechanismChoice.Selected Mechanism.ProcessReaper
                 else
                     // No limits: the POSIX group forms when children are spawned (each becomes its own pgid).
                     MechanismChoice.Selected Mechanism.ProcessGroup
@@ -337,6 +368,7 @@ module internal MechanismSelection =
         chooseUsing
             (RuntimeInformation.IsOSPlatform OSPlatform.Windows)
             (RuntimeInformation.IsOSPlatform OSPlatform.Linux)
+            Native.FreeBsd.isFreeBsd
             Native.Cgroup.cgroupV2Available
             Native.Cgroup.cgroupIoAvailable
             options
@@ -359,6 +391,10 @@ module internal CapabilityProbe =
 
             /// This host is Linux (the cgroup v2 mechanism, `PR_SET_PDEATHSIG`, util-linux helpers).
             IsLinux: bool
+
+            /// This host is FreeBSD (the `procctl(2)` process-reaper mechanism). Read from the runtime's
+            /// own platform identification, exactly as the reaper's native call sites are gated.
+            IsFreeBsd: bool
 
             /// The platform-fixed scope of `Command.KillOnParentDeath` cleanup (`KillOnParentDeathScope.Current`).
             ParentDeathScope: KillOnParentDeathScope
@@ -430,6 +466,14 @@ module internal CapabilityProbe =
 
     let private noWholeTreeContainer =
         "a whole-tree container - a Windows Job Object or a usable Linux cgroup v2 hierarchy; this host has neither, so ProcessGroup.Create refuses the cap with ProcessError.ResourceLimit rather than running the tree unbounded"
+
+    /// Why the FreeBSD process reaper — a whole-tree containment mechanism this host DOES have — still
+    /// cannot enforce a resource cap. Worded apart from `noWholeTreeContainer` because "this host has no
+    /// whole-tree mechanism" would be untrue here, and the reason a caller has to act on is different: the
+    /// reaper is a containment RELATIONSHIP (which process inherits the tree's orphans), not a container,
+    /// so it carries no aggregate accounting of any kind to cap against.
+    let private reaperNoAccounting =
+        "a whole-tree container - a Windows Job Object or a usable Linux cgroup v2 hierarchy. This host contains trees with the FreeBSD procctl(2) process reaper, which enumerates and signals the whole descendant tree but keeps no aggregate memory/CPU/pids accounting at all, so ProcessGroup.Create refuses the cap with ProcessError.ResourceLimit rather than approximating it with a per-process rlimit surrogate"
 
     let private cgroupNotMounted =
         "a mounted, usable Linux cgroup v2 hierarchy (its root's cgroup.controllers must be non-empty); without one ProcessGroup.Create refuses a whole-tree cap with ProcessError.ResourceLimit"
@@ -524,15 +568,15 @@ module internal CapabilityProbe =
                     $"ProcessGroup.UpdateLimits rewrites the live cgroup's controller files in place, so it needs a group created WITH whole-tree limits (which is what selects the cgroup v2 mechanism); a limit-free Linux group uses the POSIX process group and is refused with ProcessError.ResourceLimit - and {cgroupRootQualification}"
             )
         else
-            // Linux without a usable cgroup v2 hierarchy, or macOS/BSD, which have no whole-tree primitive
-            // at all. Both refuse a whole-tree cap at creation rather than running the tree unbounded; the
-            // preconditions differ, so they are worded apart.
+            // Linux without a usable cgroup v2 hierarchy, or macOS/BSD, which have no whole-tree LIMIT
+            // primitive at all — FreeBSD included, whose process reaper contains a whole tree but accounts
+            // for nothing in it. All three refuse a whole-tree cap at creation rather than running the tree
+            // unbounded; the preconditions differ, so they are worded apart.
             let unsupported =
                 Capability.Unsupported(
-                    if facts.IsLinux then
-                        cgroupNotMounted
-                    else
-                        noWholeTreeContainer
+                    if facts.IsLinux then cgroupNotMounted
+                    elif facts.IsFreeBsd then reaperNoAccounting
+                    else noWholeTreeContainer
                 )
 
             ResourceLimitCapabilities(
@@ -559,13 +603,29 @@ module internal CapabilityProbe =
                     "a POSIX mechanism; Windows maps only Signal.Kill (the Job terminate) and the best-effort Signal.Int/Signal.Term soft stop, and refuses every other signal with ProcessError.Unsupported"
             )
         | Mechanism.CgroupV2
-        | Mechanism.ProcessGroup -> SignalCapabilities(Capability.Available, Capability.Available, Capability.Available)
+        | Mechanism.ProcessGroup
+        // The FreeBSD reaper delivers the same full POSIX signal vocabulary, only through
+        // `PROC_REAP_KILL` instead of `killpg` — so it reaches strictly MORE of the tree (a `setsid`
+        // escapee included) on the same three rows. A wider reach is not a qualification on the
+        // capability, so this stays `Available` rather than inventing a `Qualified` for being better.
+        | Mechanism.ProcessReaper ->
+            SignalCapabilities(Capability.Available, Capability.Available, Capability.Available)
 
     /// `ProcessGroup.Adopt`, per selected mechanism.
     let private adoption (facts: PlatformFacts) (mechanism: Mechanism) : Capability =
         match mechanism with
         | Mechanism.JobObject -> Capability.Available
         | Mechanism.CgroupV2 -> Capability.Available
+        | Mechanism.ProcessReaper ->
+            // The reaper contains this process's own DESCENDANTS, which a foreign process is not: it is
+            // the kernel remembering who inherits the tree's orphans, so there is no `PROC_REAP_*` call
+            // that can pull an unrelated process into that relationship. `PROC_REAP_ACQUIRE` will not even
+            // re-attach children this process forked BEFORE it ran ("we do not reattach existing
+            // children"), which is the sharpest statement of the boundary. Refused honestly, exactly as on
+            // the POSIX process group underneath it — never a root recorded for a subtree that names
+            // nothing, which teardown would then believe it had contained.
+            Capability.Unsupported
+                "a Windows Job Object or a Linux cgroup v2 group; the FreeBSD process reaper contains only this process's own descendants (procctl(PROC_REAP_ACQUIRE) does not even re-attach children forked before it), and no POSIX primitive can move a foreign process into a process group either (setpgid only relocates our own children, and only before they exec)"
         | Mechanism.ProcessGroup ->
             Capability.Unsupported(
                 if facts.IsLinux then
@@ -577,11 +637,18 @@ module internal CapabilityProbe =
     /// `ProcessGroup.AdoptByPid`, per selected mechanism. It parts company with `adoption` on exactly one
     /// row — the POSIX process group, which cannot RELOCATE a foreign process but can TRACK one against an
     /// identity anchor, so the question there is whether this host can read such an anchor at all.
+    ///
+    /// The FreeBSD reaper answers on that same row, not on a row of its own, because it delegates this verb
+    /// to the POSIX layer underneath it verbatim — and rightly so: the reaper is a MEMBERSHIP mechanism for
+    /// this process's own descendants, not an identity mechanism for an arbitrary number, so it contributes
+    /// nothing an anchor-less bare pid needs. (FreeBSD has no start-time reader this library can verify, so
+    /// in practice this row is the `Unsupported` below there.)
     let private adoptionByPid (facts: PlatformFacts) (mechanism: Mechanism) : Capability =
         match mechanism with
         | Mechanism.JobObject
         | Mechanism.CgroupV2 -> Capability.Available
-        | Mechanism.ProcessGroup ->
+        | Mechanism.ProcessGroup
+        | Mechanism.ProcessReaper ->
             if facts.ProcessIdentityReaderAvailable then
                 // A real qualification, not a footnote: the containment this mechanism gives an adopted
                 // pid is narrower than the other two mechanisms give, and both halves of that are things
@@ -681,6 +748,7 @@ module internal CapabilityProbe =
             MechanismSelection.chooseUsing
                 facts.IsWindows
                 facts.IsLinux
+                facts.IsFreeBsd
                 (fun () -> facts.CgroupV2Available)
                 (fun () -> facts.CgroupIoAvailable)
                 options
@@ -699,6 +767,15 @@ module internal CapabilityProbe =
                     | Mechanism.JobObject when options.Limits.IoMax.IsSome ->
                         Capability.Qualified
                             "the requested io.max needs a Windows build whose Job Object carries the I/O rate control API (Windows 10 1607 / Server 2016 and later); an older build fails the creation with ProcessError.Unsupported"
+                    | Mechanism.ProcessReaper ->
+                        // The one axis where this mechanism's PREDICTION is weaker than its behaviour, and
+                        // it says so instead of claiming certainty: taking reaper status is a permanent,
+                        // process-wide side effect, so no snapshot may probe it by doing it. Creation
+                        // itself always succeeds — a host whose acquisition fails silently gets the plain
+                        // POSIX process group and reports `Mechanism.ProcessGroup` from the group it
+                        // returns, which is why the group's own `Mechanism` stays the final word.
+                        Capability.Qualified
+                            "ProcessGroup.Create acquires reaper status for this process (procctl(PROC_REAP_ACQUIRE), once and permanently) when it builds the first group; a snapshot must not probe that by performing it, so this predicts the mechanism rather than proving it. Creation does not fail either way: a host where the acquisition is refused falls back to the POSIX process group and the created group reports Mechanism.ProcessGroup, never ProcessReaper"
                     | Mechanism.JobObject
                     | Mechanism.ProcessGroup -> Capability.Available
 
@@ -742,6 +819,10 @@ module internal CapabilityProbe =
         let facts =
             { IsWindows = isWindows
               IsLinux = isLinux
+              // Read from the very predicate the reaper's own call sites are gated by, so the snapshot's
+              // FreeBSD row and the backend's platform guard can never disagree. Reading the flag is not
+              // acquiring it: nothing here calls `procctl`.
+              IsFreeBsd = Native.FreeBsd.isFreeBsd
               ParentDeathScope = KillOnParentDeathScope.Current
               ConPtyAvailable = isWindows && Native.Windows.conptyAvailable ()
               CmdExeAvailable = isWindows && Native.Windows.systemCmdExeAvailable ()

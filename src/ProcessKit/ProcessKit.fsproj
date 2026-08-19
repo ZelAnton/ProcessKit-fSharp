@@ -86,6 +86,11 @@
 		<Compile Include="Native.Posix.fs" />
 		<Compile Include="ProcessLookup.fs" />
 		<Compile Include="Native.Cgroup.fs" />
+		<!-- The FreeBSD procctl(2) process reaper. Depends on nothing else in this layer (its own
+		     libc DllImports, its own ABI decoding), and sits before Capabilities.fs, which reads
+		     `Native.FreeBsd.isFreeBsd` for the mechanism decision, and before Backend.fs, which
+		     builds ProcessReaperBackend on top of it. -->
+		<Compile Include="Native.FreeBSD.fs" />
 		<Compile Include="Capabilities.fs" />
 		<Compile Include="ConsoleEncoding.fs" />
 		<Compile Include="Backend.fs" />

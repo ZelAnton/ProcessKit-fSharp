@@ -281,7 +281,11 @@ type IdentifiersManifestTests() =
     /// this list is the mechanical form of that promise: a new variant appends a line, and a rename
     /// fails here until somebody deliberately edits the expectation.
     static let published =
-        [ "ProcessKit.Mechanism", [ "JobObject=job_object"; "CgroupV2=cgroup_v2"; "ProcessGroup=process_group" ]
+        [ "ProcessKit.Mechanism",
+          [ "JobObject=job_object"
+            "CgroupV2=cgroup_v2"
+            "ProcessGroup=process_group"
+            "ProcessReaper=process_reaper" ]
           "ProcessKit.Signal",
           [ "Term=term"
             "Kill=kill"
