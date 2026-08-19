@@ -763,7 +763,13 @@ module internal Windows =
     /// its `STILL_ACTIVE` (259) sentinel collides with a legitimate `ExitProcess(259)`; a zero-timeout wait
     /// on the process object disambiguates exactly that case, because the object signals on exit and stays
     /// signalled. Any code other than 259 is already unambiguous and needs no wait.
-    let private processHasExitedWindows (hProcess: nativeint) : bool option =
+    ///
+    /// Not `private`: `JobObjectBackend.SoftStopScope()` (R-02) also calls this, side-effect-free, to
+    /// filter a registered CTRL-capable leader's still-open handle down to one that has NOT already
+    /// exited — a handle stays entered in `ctrlGroups` from `Track` until `Release`/`HardRelease` close
+    /// it, which can outlive the child's real exit, so without this check the capability query could
+    /// answer `OptInMembers` for a leader whose console process group the OS has already torn down.
+    let processHasExitedWindows (hProcess: nativeint) : bool option =
         let mutable exitCode = 0u
 
         if not (GetExitCodeProcess(hProcess, &exitCode)) then
@@ -2043,24 +2049,20 @@ module internal Windows =
         else
             false
 
-    /// Best-effort soft close for a Windows GUI tree: enumerate the caller's desktop top-level windows
-    /// ONCE, keep those owned by a process currently in `job`, then `PostMessage(WM_CLOSE)` to each window
-    /// still owned by that member at the moment of the post. Returns the number of windows a post was
-    /// accepted for — `0` means the tree has no top-level window (a no-op, NOT an error), matching how
-    /// `sendConsoleCtrlBreakWindows`/`membersWindows` honestly distinguish "nothing to signal" from "the
-    /// request failed". NEVER throws: a failed member query, a failed enumeration (e.g. a session with no
-    /// interactive desktop), or a failed post is just reported as fewer windows closed, never an exception
-    /// that could derail the graceful-kill path that calls it. TWO identity gates stand between the
-    /// enumeration and each post: the owning pid must still be a member of THIS job (`IsProcessInJob` on a
-    /// freshly opened handle — a member that exited and whose PID was recycled can never close a foreign
-    /// application's window), and the window must still be owned by that same, handle-pinned process
-    /// (`postCloseIfStillOwnedBy` — a member window that was destroyed and whose HWND value was recycled
-    /// onto a foreign window can never be closed either).
     /// Side-effect-free: whether `job` currently has at least one top-level window belonging to a live
-    /// member — the same "windowed member" test `postCloseToJobWindows` acts on, without posting anything
-    /// (no `EnumWindows` post-processing beyond membership matching, no `PostMessage`). Used by
-    /// `ProcessGroup.SoftStopScope` so asking never changes the answer a later `Signal`/`GracefulKillTree`
-    /// soft stop would get.
+    /// member, without posting anything (no `PostMessage`, only the ONE `EnumWindows` enumeration pass
+    /// filtered down to membership matching — no gate beyond that). Used by `ProcessGroup.SoftStopScope`
+    /// so asking never changes the answer a later `Signal`/`GracefulKillTree` soft stop would get.
+    ///
+    /// This runs the SAME membership filter `postCloseToJobWindows` starts from, but stops there: it does
+    /// NOT run that function's two identity gates (`IsProcessInJob` re-check, then
+    /// `postCloseIfStillOwnedBy`'s owner re-query immediately before a post), because there is no post
+    /// here for a gate to protect. That narrows what this answers: `true` means a window matching a
+    /// tracked member's pid exists RIGHT NOW, not that a later post through `postCloseToJobWindows` is
+    /// guaranteed to reach it — the member could exit, or that exact window could be destroyed, in the gap
+    /// between this call and that one, in which case the two gates below would (correctly) skip it. Same
+    /// direction every other capability query here honestly takes: it can under-promise nothing it would
+    /// deliver, but a target it reports live can still vanish before delivery is attempted.
     let hasWindowedMemberWindows (job: nativeint) : bool =
         try
             let memberPids =
@@ -2078,6 +2080,19 @@ module internal Windows =
             // usable desktop reports "no windowed member" rather than throwing into a capability query.
             false
 
+    /// Best-effort soft close for a Windows GUI tree: enumerate the caller's desktop top-level windows
+    /// ONCE, keep those owned by a process currently in `job`, then `PostMessage(WM_CLOSE)` to each window
+    /// still owned by that member at the moment of the post. Returns the number of windows a post was
+    /// accepted for — `0` means the tree has no top-level window (a no-op, NOT an error), matching how
+    /// `sendConsoleCtrlBreakWindows`/`membersWindows` honestly distinguish "nothing to signal" from "the
+    /// request failed". NEVER throws: a failed member query, a failed enumeration (e.g. a session with no
+    /// interactive desktop), or a failed post is just reported as fewer windows closed, never an exception
+    /// that could derail the graceful-kill path that calls it. TWO identity gates stand between the
+    /// enumeration and each post: the owning pid must still be a member of THIS job (`IsProcessInJob` on a
+    /// freshly opened handle — a member that exited and whose PID was recycled can never close a foreign
+    /// application's window), and the window must still be owned by that same, handle-pinned process
+    /// (`postCloseIfStillOwnedBy` — a member window that was destroyed and whose HWND value was recycled
+    /// onto a foreign window can never be closed either).
     let postCloseToJobWindows (job: nativeint) : int =
         try
             let memberPids =

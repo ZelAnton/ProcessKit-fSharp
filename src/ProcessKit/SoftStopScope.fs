@@ -24,10 +24,15 @@ namespace ProcessKit
 /// Unlike `KillOnParentDeathScope` (fixed per platform at build time), this is read from the group's
 /// **live membership** on every call, so the *same* build reports different scopes for different groups
 /// — most visibly on Windows, where a group with a live console-CTRL leader (a child started with
-/// `Command.WindowsCtrlSignals()`) or a windowed member reports `OptInMembers`, while a group with
-/// neither reports `Unsupported`. The read is side-effect-free and consults the very same live-membership
-/// primitives `Signal(Int/Term)` acts on, so what it reports cannot drift from what a real soft stop
-/// would then reach.
+/// `Command.WindowsCtrlSignals()`) or a live windowed member reports `OptInMembers`, while a group with
+/// neither reports `Unsupported`. "Live" is checked, not assumed: a CTRL-capable leader whose handle is
+/// still open (and so still registered) but has already exited does NOT count, because
+/// `GenerateConsoleCtrlEvent` on its now-torn-down console process group would then fail.
+///
+/// The read is side-effect-free — it posts no `WM_CLOSE`, sends no CTRL+BREAK, and mutates nothing — but
+/// it is a capability report, not a delivery guarantee: `OptInMembers` says a live target for the soft
+/// stop exists, not that a later `Signal(Int/Term)` is certain to reach it (`GenerateConsoleCtrlEvent` can
+/// still fail for reasons this read does not probe, such as the caller having no console to share).
 ///
 /// | Mechanism | Scope | Why |
 /// |---|---|---|

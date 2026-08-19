@@ -638,6 +638,50 @@ type ShutdownTests() =
         :> Task
 
     [<Test>]
+    member _.``Windows: SoftStopScope ignores a CTRL-capable child that already exited but is not yet released``
+        ()
+        : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The ctrlGroups staleness window (R-02) is a Windows-only concern."
+
+            use group = createGroup ()
+
+            // A console child registered for CTRL+BREAK that exits almost immediately on its own.
+            let quickExit =
+                (Command.create "cmd.exe" |> Command.args [ "/c"; "exit"; "0" ])
+                    .WindowsCtrlSignals()
+                    .Stdout(StdioMode.Null)
+
+            match! group.StartAsync quickExit with
+            | Error error -> Assert.Fail $"StartAsync failed: {error}"
+            | Ok running ->
+                match running.Pid with
+                | None -> Assert.Fail "expected a pid for a WindowsCtrlSignals() child"
+                | Some pid ->
+                    // Poll the REAL OS state directly by pid — never touching `running` (no verb, no
+                    // Dispose) — so its `ctrlGroups` entry is never released. This is exactly the
+                    // staleness window R-02 closes: the entry survives in `ctrlGroups` until
+                    // `Release`/`HardRelease`, which only fire on `running`'s own teardown, never on the
+                    // child's real exit.
+                    do!
+                        waitUntil (fun () ->
+                            match ProcessLookup.processIsAlive pid None with
+                            | Ok alive -> not alive
+                            | Error _ -> false)
+
+                    match group.SoftStopScope() with
+                    | Ok SoftStopScope.Unsupported -> ()
+                    | Ok other ->
+                        Assert.Fail
+                            $"a CTRL-capable child that already exited must not make SoftStopScope report {other}"
+                    | Error error -> Assert.Fail $"SoftStopScope failed: {error}"
+
+                    do! group.ShutdownAsync(TimeSpan.FromSeconds 5.0)
+        }
+        :> Task
+
+    [<Test>]
     member _.``SoftStopScope on an already-released group returns an honest error``() : Task =
         task {
             let group = createGroup ()

@@ -538,13 +538,19 @@ counts as *sent to* — whether the tree then drained is `DrainedWithinGrace`, n
 this), `Unsupported` when the platform had no soft-signal tier at all for this group
 (a windowless Windows Job Object with no windowed member — every Unix mechanism
 always has a real `SIGTERM` tier), or `Failed(signal)` when a soft-signal tier
-existed but delivery genuinely failed for every target (a uid-changed member that
-rejected it with `EPERM`) — the teardown still proceeds to its grace/escalation
-regardless. `MembersBefore`/`MembersAfter` count the same member set `Members()`
-reports and are `None` only if that membership read itself failed, never a
-fabricated `0`. `Escalated` is `true` only when the grace elapsed with survivors
-still alive and they were hard-killed; `Elapsed` reports the real wall-clock time,
-so an early drain reads far below the requested grace.
+existed but delivery failed for every target this teardown could still reach (a
+uid-changed member that rejected it with `EPERM`) — the teardown still proceeds to
+its grace/escalation regardless. That "every" reading is exact on the POSIX
+process-group mechanism (a partial failure among several reachable members is
+still `Sent`, since the phase genuinely reached at least one of them); on Linux
+cgroup v2 the underlying broadcast stops at its first genuine per-member failure
+even when other members went on to receive the signal, so there `Failed` means "at
+least one member's delivery failed" rather than "every member's." Windows never
+produces `Failed`. `MembersBefore`/`MembersAfter` count the same member set
+`Members()` reports and are `None` only if that membership read itself failed,
+never a fabricated `0`. `Escalated` is `true` only when the grace elapsed with
+survivors still alive and they were hard-killed; `Elapsed` reports the real
+wall-clock time, so an early drain reads far below the requested grace.
 
 This port deliberately does **not** offer ProcessKit-rs's non-escalating
 `stop(grace, escalate = false)` — a mode that leaves survivors running and keeps the

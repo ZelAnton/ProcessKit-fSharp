@@ -28,9 +28,19 @@ type SoftSignalDelivery =
     /// so this never arises there.
     | Unsupported
 
-    /// A soft-signal tier exists but the best-effort delivery **failed for every target**: a uid-changed
-    /// (`sudo`/setuid) member that rejected the signal with `EPERM` on Unix. Carries the `Signal` that
-    /// could not be delivered. The teardown proceeded to its grace/escalation regardless.
+    /// A soft-signal tier exists but the best-effort delivery **failed for every target this teardown
+    /// could still reach**: a uid-changed (`sudo`/setuid) member that rejected the signal with `EPERM` on
+    /// Unix. Carries the `Signal` that could not be delivered. The teardown proceeded to its
+    /// grace/escalation regardless.
+    ///
+    /// **Precision differs by mechanism.** On the POSIX process-group mechanism this is exact: `Failed`
+    /// fires only when NONE of the live tracked group leaders (or adopted processes) accepted the
+    /// signal — a partial failure among several still-reachable members is reported `Sent`, since the
+    /// soft phase genuinely reached at least one of them. On the Linux cgroup v2 mechanism the underlying
+    /// broadcast stops describing itself as soon as it hits its first genuine per-member failure, even
+    /// while other members of the same cgroup went on to receive the signal — so there `Failed` means "at
+    /// least one member's delivery failed," which is a narrower guarantee than the POSIX process-group
+    /// mechanism's "every" reading. Windows never produces `Failed` at all (see `Unsupported`).
     | Failed of Signal: Signal
 
     /// The soft `Signal` this fate concerns — `Some` for both `Sent` and `Failed`, `None` for
