@@ -70,27 +70,28 @@ The files currently compile in this exact order. The headings are architectural 
 50. `ConsumptionGate.fs` — consumption-claim state machine and terminal-wait ledger of one handle.
 51. `RunTerminal.fs` — one handle's shared terminal waits, bounds, tokens, and teardown.
 52. `ExpectWindow.fs` — bounded expect window and ANSI filtering for interactive sessions.
-53. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
-54. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
-55. `RunningProcess.fs` — the public live-handle facade over the six files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
+53. `StderrReadiness.fs` — stderr line and in-flight tail observation for readiness waits, its retention bounded by (and shared with) the run's own output-buffer cap.
+54. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
+55. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
+56. `RunningProcess.fs` — the public live-handle facade over the seven files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
 
 ### Runner and verbs
 
-56. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
-57. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
-58. `PtySession.fs` — expect-style interaction over a live handle.
-59. `IProcessRunner.fs` — injectable runner seam.
-60. `Runner.fs` — capture primitives and reusable verbs.
-61. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
-62. `DelegatingProcessRunner.fs` — runner decorator base.
-63. `ProcessGroup.fs` — containment owner and shared-group runner.
-64. `JobRunner.fs` — default private-group runner.
-65. `CommandVerbs.fs` — default-runner `Command` extensions.
-66. `PipelineRunner.fs` — internal pipeline execution.
-67. `Pipeline.fs` — pipeline public API.
-68. `Supervisor.fs` — restart supervision.
-69. `CliClient.fs` — configured command client.
-70. `Exec.fs` — concise execution entry points.
+57. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
+58. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
+59. `PtySession.fs` — expect-style interaction over a live handle.
+60. `IProcessRunner.fs` — injectable runner seam.
+61. `Runner.fs` — capture primitives and reusable verbs.
+62. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
+63. `DelegatingProcessRunner.fs` — runner decorator base.
+64. `ProcessGroup.fs` — containment owner and shared-group runner.
+65. `JobRunner.fs` — default private-group runner.
+66. `CommandVerbs.fs` — default-runner `Command` extensions.
+67. `PipelineRunner.fs` — internal pipeline execution.
+68. `Pipeline.fs` — pipeline public API.
+69. `Supervisor.fs` — restart supervision.
+70. `CliClient.fs` — configured command client.
+71. `Exec.fs` — concise execution entry points.
 
 When adding a file, place it after everything it consumes and before everything that consumes it. Alphabetical sorting or SDK globbing would silently destroy this ordering model.
 
