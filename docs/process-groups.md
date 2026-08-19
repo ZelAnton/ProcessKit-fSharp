@@ -698,6 +698,100 @@ supply is in [platform-support.md](platform-support.md).
 To *wait* on members rather than list them, race the started handles with
 `RunningProcess.WaitAny` — see [streaming.md](streaming.md).
 
+### Looking up a process outside any group
+
+`MembersInfo()` (above) enriches a **group's own membership**. `ProcessLookup.processInfo(pid)` /
+`processIsAlive(pid, startTime)` answer the same questions for an **arbitrary pid the caller holds
+outside any `ProcessGroup`** — one saved to disk across runs, kept in a launch registry, or watched by
+an external probe this library never itself contained. No group is created or needed; these are plain
+module functions over a bare pid.
+
+**F#**
+
+```fsharp
+let pid = 4321
+
+match ProcessLookup.processInfo pid with
+| Ok(Some info) -> printfn $"pid={info.Pid} ppid={info.Ppid} exe={info.ExeName} started={info.StartTime}"
+| Ok None -> printfn $"pid {pid} is not running"
+| Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+var pid = 4321;
+var lookup = ProcessLookup.processInfo(pid);
+
+if (lookup is { IsOk: false, ErrorValue: var err })
+{
+    Console.Error.WriteLine(err.Message);
+}
+else if (lookup.ResultValue is { } found) // a non-null FSharpOption means "Some"
+{
+    var info = found.Value;
+    Console.WriteLine($"pid={info.Pid} ppid={info.Ppid} exe={info.ExeName}");
+}
+else
+{
+    Console.WriteLine($"pid {pid} is not running");
+}
+```
+
+`processInfo` returns the same `MemberInfo` contract `MembersInfo()` gives a group member — `Ppid` /
+`ExeName` / `StartTime`, each `None` where the platform cannot honestly report it, argv/environment never
+included — with three outcomes that must not be confused: `Ok(Some info)` (the process exists), `Ok None`
+(an honest negative — no such process, never an error), and `Error` (the process may well exist but its
+state could not be determined — a denied `OpenProcess`, a `hidepid`-denied `/proc` read — **never** read
+this as "dead"). `pid <= 0` is refused up front with `Ok None`, before any native call; this process's
+own pid is an entirely ordinary target (unlike `AdoptByPid`, a read-only lookup enlists nothing into a
+group).
+
+`processIsAlive` is the reuse-safe liveness question a caller who saved a `MemberInfo.StartTime` (from an
+earlier `processInfo` or `MembersInfo()`) actually wants: is the pid **still that same process**, or has
+the OS recycled the number for a stranger?
+
+**F#**
+
+```fsharp
+let pid = 4321
+let saved: DateTime option = None // read back from wherever `processInfo`'s StartTime was saved
+
+// … later, perhaps after a restart …
+match ProcessLookup.processIsAlive pid saved with
+| Ok true -> printfn "still the original process"
+| Ok false -> printfn "gone — exited, or the pid was recycled"
+| Error err -> eprintfn $"{err.Message}"
+```
+
+**C#**
+
+```csharp
+using Microsoft.FSharp.Core;
+
+var pid = 4321;
+
+// `saved` is read back from wherever the earlier `MemberInfo.StartTime` was persisted; `null` here
+// is the `None` case FSharpOption<DateTime> compiles down to ("no token was saved").
+FSharpOption<DateTime> saved = null;
+
+// … later, perhaps after a restart …
+Console.WriteLine(ProcessLookup.processIsAlive(pid, saved) switch
+{
+    { IsOk: true, ResultValue: true }    => "still the original process",
+    { IsOk: true, ResultValue: false }   => "gone — exited, or the pid was recycled",
+    { IsOk: false, ErrorValue: var err } => err.Message,
+});
+```
+
+Pass the pid together with the `StartTime` you saved: a bare pid check would answer "alive" for a
+stranger that recycled the number after the original process exited, while pairing it with the start
+time — fixed at creation, distinct for a later occupant — tells the two apart. When no token was saved
+(or the platform reports none for the live process now), the check honestly degrades to bare-pid
+liveness rather than reporting a false "dead" it cannot prove. Both functions reuse exactly the same
+per-platform readers `MembersInfo()` uses — no second, parallel identity-reading mechanism — so the two
+APIs can never disagree about the same pid.
+
 ## Resource limits
 
 Caps are a property of the group, set once at creation through

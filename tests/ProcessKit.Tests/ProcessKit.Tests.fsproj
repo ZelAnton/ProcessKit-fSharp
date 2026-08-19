@@ -33,6 +33,7 @@
 		<Compile Include="SupervisorTests.fs" />
 		<Compile Include="ProcessControlTests.fs" />
 		<Compile Include="MemberInfoTests.fs" />
+		<Compile Include="ProcessLookupTests.fs" />
 		<Compile Include="ErgonomicsTests.fs" />
 		<Compile Include="StatsTests.fs" />
 		<Compile Include="ReportJsonTests.fs" />

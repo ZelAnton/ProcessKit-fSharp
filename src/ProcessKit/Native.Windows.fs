@@ -1426,12 +1426,21 @@ module internal Windows =
                     Some(MemberStats(pid, cpu, residentMemory, ioCounters))
                 | _ -> None
 
-    type private MemberProcessOpen =
+    /// The three-way verdict of trying to open a query handle to a pid — `ERROR_INVALID_PARAMETER` is the
+    /// one honest "no such process" answer; any other open failure means the process exists but this
+    /// caller may not inspect it. Not `private`: the standalone `ProcessLookup.processInfo` query
+    /// (`processInfo` below) reuses this SAME classification, so a group member's "gone vs inaccessible"
+    /// verdict and an arbitrary external pid's can never disagree.
+    type MemberProcessOpen =
         | Opened of nativeint
         | Inaccessible
         | Gone
 
-    let private openMemberProcess (pid: int) : MemberProcessOpen =
+    /// Open a query-only handle to `pid`, classified into `MemberProcessOpen`. Not `private`: shared by
+    /// `readMemberStatsForPidsWithIdentities` (a known Job member) and `processInfo` below (an arbitrary
+    /// external pid) — the one primitive that answers "does this pid exist, and may I inspect it" for
+    /// both.
+    let openMemberProcess (pid: int) : MemberProcessOpen =
         let openWith access =
             match openMemberProcessForTests with
             | Some opener -> opener access pid
@@ -1456,6 +1465,37 @@ module internal Windows =
             | Ok handle -> Opened handle
             | Error ERROR_INVALID_PARAMETER -> Gone
             | Error _ -> Inaccessible
+
+    /// Identity + best-effort metadata for an **arbitrary** pid — the Windows backend of the standalone
+    /// `ProcessLookup.processInfo` query (T-385), for a pid the caller holds outside any Job/group.
+    ///
+    /// `openMemberProcess` — the SAME primitive `readMemberStats` already opens each known Job member
+    /// with — is the existence-AND-permission oracle: `Gone` (`ERROR_INVALID_PARAMETER`) is the honest
+    /// "no such process" negative; `Inaccessible` (any other open failure — a protected/higher-integrity
+    /// process such as an anti-malware PPL, or the `System` process) means the pid may well exist but this
+    /// caller may not inspect it, reported as `ProcessError.Io` and never folded into "gone". Once the
+    /// handle proves the pid is queryable it is closed immediately, and the enrichment itself goes through
+    /// the SAME whole-system Toolhelp32 snapshot `readMembersInfo` uses to enrich a Job's members — no
+    /// second, parallel identity-reading mechanism for this entry point — so a pid that exits in the
+    /// narrow window between the two reads is honestly `Ok None` (it just vanished), never a fabricated
+    /// record.
+    let processInfo (pid: int) : Result<MemberInfo option, ProcessError> =
+        match openMemberProcess pid with
+        | Gone -> Ok None
+        | Inaccessible ->
+            Error(
+                ProcessError.Io
+                    $"pid {pid} could not be inspected: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) was denied — a protected/higher-integrity process, or another user's, never read this as \"gone\""
+            )
+        | Opened handle ->
+            closeWindowsHandle handle
+
+            match readMembersInfo [ pid ] with
+            | [ info ] -> Ok(Some info)
+            | _ ->
+                // Exited in the narrow window between the confirmed-open handle above and the Toolhelp32
+                // snapshot `readMembersInfo` takes — an honest "gone", not a fabricated record.
+                Ok None
 
     /// Sample a supplied Job-member snapshot with a safe query-only handle. `identities` is captured before
     /// the member PID list, so it remains the generation ledger even when a pid is reused before

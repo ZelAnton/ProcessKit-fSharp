@@ -1017,6 +1017,10 @@ module ProcessKit.ProcessKitDiagnostics+Events
   property SupervisorRestart : Microsoft.Extensions.Logging.EventId { get }
   property SupervisorStormPause : Microsoft.Extensions.Logging.EventId { get }
 
+module ProcessKit.ProcessLookup
+  static member processInfo(System.Int32) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.FSharpOption<ProcessKit.MemberInfo>, ProcessKit.ProcessError>
+  static member processIsAlive(System.Int32, Microsoft.FSharp.Core.FSharpOption<System.DateTime>) : Microsoft.FSharp.Core.FSharpResult<System.Boolean, ProcessKit.ProcessError>
+
 module ProcessKit.ProcessResult
   static member Create<T>(T, System.String, ProcessKit.Outcome, System.TimeSpan) : ProcessKit.ProcessResult<T>
   static member Failure<T>(T, System.String, System.Int32) : ProcessKit.ProcessResult<T>

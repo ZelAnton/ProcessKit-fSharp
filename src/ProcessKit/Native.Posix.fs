@@ -381,6 +381,14 @@ module internal Posix =
     /// gates can be tested without racing a real process exit or pid recycle. Production leaves it `None`.
     let mutable readMemberStatsForTests: (int -> MemberStats option) option = None
 
+    /// Test seam (internal, not public API): replaces the whole POSIX backend of the standalone
+    /// `ProcessLookup.processInfo` query (T-385) — `Ok(Some _)`/`Ok None`/`Error message` for the exact
+    /// three outcomes the real per-platform reader gives — so the honest "gone" vs "exists but could not
+    /// be inspected" (`EACCES`/`EPERM`/an unexpected `errno`) split can be driven deterministically,
+    /// without a real `hidepid` mount or another user's process in CI. Production leaves it `None`.
+    let mutable processInfoForTests: (int -> Result<MemberInfo option, string>) option =
+        None
+
     /// Test seam (internal, not public API): invoked with the target pgid/pid by every process-group
     /// delivery primitive (`killProcessGroup` / `signalProcessGroup` / `suspendProcessGroup` /
     /// `resumeProcessGroup`), the per-child raw kill (`killProcess`, the cgroup backend's `KillChild`) and
@@ -1097,6 +1105,102 @@ module internal Posix =
             readMacMemberInfo pid
         else
             Some(MemberInfo(pid, None, None, readProcessStartTime pid))
+
+    // ----------------------------------------------------------------------------------
+    // Standalone identity-safe lookup (`ProcessLookup.processInfo`, T-385): the SAME per-platform reads
+    // as `readMemberInfo` above, but for an arbitrary pid the caller holds OUTSIDE any group — so, unlike
+    // `readMemberInfo` (whose caller already knows the pid was JUST a live group member, and so folds
+    // "gone" and "permission denied" together into one safe `None`), this MUST tell the two apart: a
+    // denied read is never proof the process is gone. Each platform reader below is the same underlying
+    // read `readMemberInfo` makes (the same `/proc/<pid>/stat` line, the same `proc_pidinfo` fill), only
+    // with its failure classified rather than folded.
+    // ----------------------------------------------------------------------------------
+
+    /// Linux backend: one `/proc/<pid>/stat` read, classified. `ENOENT` (the file/directory is gone) is
+    /// the honest "no such process" negative; every other failure — notably `EACCES` under a `hidepid`
+    /// mount — means the process may well exist and is reported as a typed `ProcessError.Io`, never a
+    /// false "gone". World-readable by default (no `hidepid` restriction), so an ordinary foreign process
+    /// is reported, not denied — see `docs/platform-support.md`.
+    let private readLinuxProcessInfoChecked (pid: int) : Result<MemberInfo option, ProcessError> =
+        try
+            let stat = File.ReadAllText $"/proc/{pid}/stat"
+            let comm, ppid = parseLinuxCommAndPpid stat
+            Ok(Some(MemberInfo(pid, ppid, comm, readProcessStartTime pid)))
+        with
+        | :? FileNotFoundException
+        | :? DirectoryNotFoundException ->
+            // ENOENT: /proc/<pid> (or its stat file) does not exist — an honest negative, not an error.
+            Ok None
+        | :? UnauthorizedAccessException as ex ->
+            Error(ProcessError.Io $"pid {pid}: /proc/{pid}/stat could not be read: {ex.Message}")
+        | :? IOException as ex ->
+            // Any other read failure (a genuinely different OS error) is likewise not proof of "gone".
+            Error(ProcessError.Io $"pid {pid}: /proc/{pid}/stat could not be read: {ex.Message}")
+
+    /// macOS backend: one `proc_pidinfo(PROC_PIDTBSDINFO)` fill, classified by the errno `Marshal
+    /// .GetLastWin32Error()` captures immediately after a failed call — `ESRCH` is the honest "no such
+    /// process" negative (matching the `readMacMemberInfo` comment's "gone, EPERM" pairing above, now
+    /// told apart); any other errno (notably `EPERM`, a process this caller may not inspect) is a typed
+    /// `ProcessError.Io`, never a false "gone".
+    let private readMacProcessInfoChecked (pid: int) : Result<MemberInfo option, ProcessError> =
+        let buffer = Marshal.AllocHGlobal procBsdInfoSize
+
+        try
+            let got = proc_pidinfo (pid, PROC_PIDTBSDINFO, 0UL, buffer, procBsdInfoSize)
+
+            if got = procBsdInfoSize then
+                let ppid = Marshal.ReadInt32(buffer, 16)
+
+                let exeName =
+                    match Marshal.PtrToStringUTF8(buffer + nativeint 48) with
+                    | null
+                    | "" -> None
+                    | name -> Some name
+
+                Ok(Some(MemberInfo(pid, Some ppid, exeName, readProcessStartTime pid)))
+            else
+                let errno = Marshal.GetLastWin32Error()
+
+                if errno = ESRCH then
+                    Ok None
+                else
+                    Error(ProcessError.Io $"pid {pid}: proc_pidinfo(PROC_PIDTBSDINFO) failed (errno {errno})")
+        finally
+            Marshal.FreeHGlobal buffer
+
+    /// The bare-BSD backend (no per-pid metadata reader wired up): existence is probed with the
+    /// zero-signal `kill(pid, 0)` — delivers nothing, answers only whether the number is live — the same
+    /// probe `ensureAdoptedSignalable` uses to ask signalability, reused here purely for its EXISTENCE
+    /// verdict (never as a delivery: signal `0` sends nothing, by POSIX definition). `ESRCH` is "gone";
+    /// `EPERM` still means the process EXISTS (the caller may simply not signal it), which is a positive
+    /// answer for a read-only lookup that reads no restricted field — so it is `Ok(Some _)`, not an error,
+    /// matching `Rust`'s bare-BSD `process_info`. Any other errno is a genuine `ProcessError.Io`.
+    let private readBareProcessInfoChecked (pid: int) : Result<MemberInfo option, ProcessError> =
+        match classifySignalDelivery (kill (pid, 0)) with
+        | SignalDelivery.TargetGone -> Ok None
+        | SignalDelivery.Delivered -> Ok(Some(MemberInfo(pid, None, None, readProcessStartTime pid)))
+        | SignalDelivery.DeliveryFailed(errno, _) when errno = EPERM ->
+            Ok(Some(MemberInfo(pid, None, None, readProcessStartTime pid)))
+        | SignalDelivery.DeliveryFailed(errno, message) ->
+            Error(ProcessError.Io $"pid {pid}: existence probe (kill(pid, 0)) failed (errno {errno}, {message})")
+
+    /// Identity + best-effort metadata for an **arbitrary** pid — the POSIX backend of the standalone
+    /// `ProcessLookup.processInfo` query (T-385), for a pid the caller holds outside any group. Never
+    /// reads argv/environment, on any platform, exactly like `readMemberInfo`. See `processInfoForTests`
+    /// for how this is driven deterministically in tests.
+    let processInfo (pid: int) : Result<MemberInfo option, ProcessError> =
+        match processInfoForTests with
+        | Some hook ->
+            match hook pid with
+            | Ok result -> Ok result
+            | Error message -> Error(ProcessError.Io message)
+        | None ->
+            if RuntimeInformation.IsOSPlatform OSPlatform.Linux then
+                readLinuxProcessInfoChecked pid
+            elif isMacOs then
+                readMacProcessInfoChecked pid
+            else
+                readBareProcessInfoChecked pid
 
     // Positive proof a tracked number was recycled: the identity captured at track time and the one read
     // now are BOTH known and they differ. A `None` on either side is never proof (the caller then defers
