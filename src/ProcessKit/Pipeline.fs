@@ -37,6 +37,9 @@ module internal PipelineStageGuard =
     ///   handle through which the caller could use the kept-open pipe;
     /// - a `Stdin` source on a stage **after the first** — every stage past stage 0 reads from the
     ///   previous stage's stdout, so only stage 0 may feed a source.
+    /// - `StopSignal`, `CancelGrace`, or `CancelSignal` on a stage **after the first** — a graceful
+    ///   teardown (timeout or cancellation) broadcasts ONE soft signal and ONE grace window to the whole
+    ///   chain, so stage 0 owns the pipeline-wide control configuration.
     /// - `StdoutToFile` on **any** stage — every stage's stdout is owned by the pipeline: intermediate
     ///   output feeds the following stage and final output is captured by the pipeline itself.
     /// - `Stdout(StdioMode.Null|Inherit)` on **any** stage — the pipeline must use a pipe for that same
@@ -120,6 +123,26 @@ module internal PipelineStageGuard =
             raise (
                 ArgumentException(
                     $"pipeline stage {stageIndex} ('{command.Program}') sets StopSignal, but graceful stop broadcasts one signal to the whole chain. Set StopSignal on stage 0, which owns the pipeline-wide control configuration.",
+                    paramName
+                )
+            )
+
+        // The cancellation ladder is chain-wide for the same reason `StopSignal` is: cancelling a
+        // pipeline tears down ONE shared group with ONE soft signal and ONE grace window, so a per-stage
+        // window/signal could not be honoured. Rejected on a later stage rather than silently ignored,
+        // and read off stage 0 — the pipeline-wide control stage — when the chain is cancelled.
+        if stageIndex > 0 && config.CancelGrace.IsSome then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets CancelGrace, but a cancelled pipeline tears down the whole chain through one graceful window. Set CancelGrace on stage 0, which owns the pipeline-wide control configuration.",
+                    paramName
+                )
+            )
+
+        if stageIndex > 0 && config.CancelSignal.IsSome then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets CancelSignal, but a graceful cancellation broadcasts one signal to the whole chain. Set CancelSignal on stage 0, which owns the pipeline-wide control configuration.",
                     paramName
                 )
             )
@@ -376,7 +399,12 @@ module internal PipelineTotals =
 /// individual command by running it on its own); the `program` tag/label is a composite of every
 /// stage's name, joined `"a | b | c"` (built only from `Command.Program`, never argv/env, so the
 /// argv/env-never-logged invariant holds for a multi-stage run too). Stage 0 likewise owns
-/// `StopSignal`, because graceful shutdown broadcasts one soft signal to the whole chain.
+/// `StopSignal`, because graceful shutdown broadcasts one soft signal to the whole chain — and, for the
+/// same reason, `CancelGrace`/`CancelSignal`: a cancelled chain (`Pipeline.CancelOn` or the verb's own
+/// token) is torn down through ONE soft signal and ONE grace window over the shared group, so setting
+/// either on stage 0 makes the whole chain's cancellation graceful, and setting it on a later stage is
+/// rejected rather than ignored. The chain-level `Pipeline.Timeout` is untouched by that knob and keeps
+/// its immediate hard kill.
 ///
 /// `StreamBuffer` depends on how the pipeline is run. For buffered verbs (`RunAsync`, `OutputStringAsync`,
 /// `OutputBytesAsync`, `ExitCodeAsync`, and similar verbs used without `StartAsync`), it is inapplicable because there is

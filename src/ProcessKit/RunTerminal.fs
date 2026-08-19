@@ -314,6 +314,77 @@ type internal RunTerminal
 
         Timeouts.raceTimeout config.Logger config.Program runId total idleTimer onTimeout (boundedExitWait ())
 
+    // The teardown a fired CANCELLATION token drives on this handle — the exact mirror of
+    // `waitWithTimeout`'s `onTimeout` above, reading the cancellation knobs instead of the deadline ones.
+    //
+    // Without `Command.CancelGrace` (the default) this IS the historical immediate hard kill, call for
+    // call: `host.StartKill()` plus the post-kill reap window, exactly what `RunningProcess.Kill()` does
+    // and what every cancellation path did before this knob existed. With it, the ladder is
+    //
+    //   soft signal (`CancelSignal`, default `Signal.Term`) -> up to `grace` -> the SAME hard kill,
+    //
+    // so a child that must flush state gets the chance to, while the escalation that guarantees the tree
+    // dies is untouched. The observable answer never changes: whoever registered this still reports
+    // `ProcessError.Cancelled` whichever rung ended the child.
+    //
+    // Shape and lifetime, deliberately:
+    //  - It must NOT block. It runs inside a `CancellationToken.Register` callback, i.e. synchronously on
+    //    whichever thread called `Cancel()`, so the grace is waited out on a detached task and only the
+    //    (bounded, native) soft signal happens inline.
+    //  - The soft signal goes through `host.Signal`, this run's own lifecycle-gated delivery: a private
+    //    group signals its whole container, a shared-group run reaches only its own child (the documented
+    //    shared-group scope gap), and a run already torn down refuses instead of touching a recycled
+    //    pid/handle. A refusal is expected on the Windows soft tier (a child with neither a console group
+    //    nor a window has nothing to soft-signal) and is deliberately not fatal — the grace still runs and
+    //    the hard kill still lands, mirroring how `TimeoutGrace` behaves there.
+    //  - The escalation is cancelled by this handle's own teardown (`disposalCts`): a child that obeyed
+    //    the soft signal concludes the verb, whose reap guard cancels that token before `host.Teardown`,
+    //    so no timer, no needless kill, and nothing left running past the handle. A kill that DOES fire is
+    //    gated exactly like every other one on this handle (`killWhenLive`), so a late escalation racing
+    //    an exit can never hit a recycled target.
+    //  - `armPostKillReap` is called at the moment the hard kill is DELIVERED, never at the moment the
+    //    cancellation is merely observed: arming it up front would let the post-kill budget expire during
+    //    a legitimate grace window and resolve the exit wait to `Unobserved` for a child that was still
+    //    being asked politely.
+    let beginCancelTeardown () : unit =
+        match config.CancelGrace with
+        | None ->
+            // The unchanged default: an immediate hard kill, plus the bounded post-kill reap window that
+            // stops a kill-then-wait caller blocking forever on a tree that will not be reaped.
+            host.StartKill()
+            armPostKillReap ()
+        | Some grace ->
+            // Soft tier first, inline: bounded native work, and it must be delivered before the grace
+            // starts counting. `Signal` returns a typed refusal rather than raising, so there is nothing
+            // to catch here; the refusal is information for the caller's own `Signal` verb, not a reason
+            // to abandon the ladder (see above).
+            host.Signal(CommandConfig.cancelSignal config) |> ignore
+
+            task {
+                try
+                    // `clampArmable` keeps a misconfigured span from throwing synchronously out of
+                    // `Task.Delay` (negative is already rejected by the builder; an over-long one is
+                    // capped), the same guard every other armed delay in the library uses.
+                    do! Task.Delay(Timeouts.clampArmable grace, disposalCts.Token)
+                    // The grace elapsed with the handle still live: escalate to the ordinary hard kill.
+                    host.StartKill()
+                    armPostKillReap ()
+                with
+                | :? OperationCanceledException ->
+                    // The handle was torn down inside the grace — the child left on the soft signal (or
+                    // the run concluded some other way) and its tree has already been reaped by the
+                    // teardown that cancelled this token. There is nothing left to escalate to.
+                    ()
+                | ex ->
+                    // Nothing on this path is expected to raise: `StartKill` is the gated, fire-and-forget
+                    // native kill (it discards its own `Result`) and `armPostKillReap` only starts a
+                    // timer. Swallow anyway rather than let a fire-and-forget task carry an unobserved
+                    // fault to finalization — the tree is still reaped by the handle's own teardown, so a
+                    // failure here loses nothing the caller can act on.
+                    ignore ex
+            }
+            |> ignore
+
     // Kill the tree the moment an output pump faults, so a still-producing child can't wedge the exit
     // wait — and the pump's siblings — by blocking on a full pipe that nobody drains once the pump
     // reading it has died. Fire-and-forget and best-effort: the kill only unblocks the child so the
@@ -381,6 +452,11 @@ type internal RunTerminal
     /// Start this handle's one-shot post-kill reap window (see `postKillDeadline`). Called at the exact
     /// points a hard kill HAS been delivered, never where one is merely intended.
     member _.ArmPostKillReap() = armPostKillReap ()
+
+    /// The ONE cancellation teardown seam every cancellation path on this handle goes through (see
+    /// `beginCancelTeardown`): the unchanged immediate hard kill by default, and the
+    /// `CancelSignal` -> `CancelGrace` -> hard-kill ladder when the command opted in. Non-blocking.
+    member _.BeginCancelTeardown() = beginCancelTeardown ()
 
     /// The configured timeout duration the winning deadline recorded, for the `ProcessResult` a
     /// buffered verb builds afterwards.

@@ -169,6 +169,10 @@ hard-killed after the grace — the deadline is what fired. Windows refuses a no
 `StopSignal` at spawn rather than silently pretending to deliver it; the default preserves the
 existing best-effort WM_CLOSE phase followed by the Job Object hard-kill.
 
+`TimeoutGrace`/`StopSignal` soften a **deadline** only. To soften a **cancellation**, use the
+separate [`CancelGrace`/`CancelSignal`](#graceful-cancellation) pair — the two ladders are
+independent knobs and neither gap-fills the other.
+
 ## Idle timeout
 
 `Command.Timeout` bounds the **total** run length. The other common failure is a run
@@ -512,7 +516,7 @@ auto-unsubscribes when the child exits, and leaves output consumption to the cal
 
 | Situation | Behavior |
 |---|---|
-| Cancel during `RunAsync` / `OutputStringAsync` / `OutputBytesAsync` / `ExitCodeAsync` / `ProbeAsync` / `ParseAsync` | tree killed → `Error (ProcessError.Cancelled program)` |
+| Cancel during `RunAsync` / `OutputStringAsync` / `OutputBytesAsync` / `ExitCodeAsync` / `ProbeAsync` / `ParseAsync` | tree killed → `Error (ProcessError.Cancelled program)`. The kill is immediate unless [`CancelGrace`](#graceful-cancellation) is set, which makes it a soft signal → grace → hard kill; the reported error is the same either way |
 | Cancel on a live handle (`StdoutLinesAsync`/`FinishAsync` after `StartAsync`) | **not tracked** — the token is checked only before the spawn, and a live handle is caller-driven. Stop the handle yourself: `Kill`/dispose for an immediate hard kill, `StopAsync(gracePeriod)` for a graceful stop, or `ForwardParentSignals(gracePeriod)` for parent console/termination signals; ProcessKit does not surface `Cancelled` for you here |
 | Token already cancelled **before** the run | short-circuits before spawning — no process is ever created |
 | `FirstLineAsync` mid-run | surfaces `ProcessError.Cancelled` once the token fires (not `Ok None`) |
@@ -522,6 +526,78 @@ auto-unsubscribes when the child exits, and leaves output consumption to the cal
 Unlike a timeout — whose expiry is *captured* as `IsTimedOut` — a cancellation is
 **always an error**: the run was abandoned, so there is no result to synthesize. A
 token cancelled before the run starts short-circuits without spawning anything.
+
+## Graceful cancellation
+
+By default a fired token **hard-kills** the tree at once. `Command.CancelGrace(grace)`
+(mirror: `Command.cancelGrace`) routes that teardown through the same soft signal → wait →
+hard-kill tier `TimeoutGrace` gives a deadline: the tree is sent `Command.CancelSignal`
+(default `Signal.Term`, mirror: `Command.cancelSignal`), given up to `grace` to leave on its
+own, and only then hard-killed. This is the knob for the "one shared token, cancelled on
+Ctrl-C" shutdown, where every child would otherwise be `SIGKILL`ed outright.
+
+**F#**
+
+```fsharp
+let cmd =
+    Command.create "long-export"
+    |> Command.cancelOn shutdownToken
+    |> Command.cancelSignal Signal.Int                  // optional; Signal.Term by default
+    |> Command.cancelGrace (TimeSpan.FromSeconds 5.0)   // SIGINT, wait up to 5s, then SIGKILL
+
+let! _ = cmd.RunAsync()
+```
+
+**C#**
+
+```csharp
+var cmd = new Command("long-export")
+    .CancelOn(shutdownToken)
+    .CancelSignal(Signal.Int)                  // optional; Signal.Term by default
+    .CancelGrace(TimeSpan.FromSeconds(5));     // SIGINT, wait up to 5s, then SIGKILL
+
+await cmd.RunAsync();
+```
+
+How it differs from `Timeout`/`TimeoutGrace`/`StopSignal`:
+
+| | Graceful **timeout** | Graceful **cancellation** |
+|---|---|---|
+| Fires on | the deadline expiring (`Command.Timeout`/`IdleTimeout`) | a cancellation token firing (verb token, `Command.CancelOn`, `Pipeline.CancelOn`, a supervised incarnation) |
+| Opt in with | `Command.TimeoutGrace(grace)` | `Command.CancelGrace(grace)` |
+| Soft signal | `Command.StopSignal` (default `Signal.Term`) | `Command.CancelSignal` (default `Signal.Term`) |
+| Needs a deadline | yes — it softens a `Timeout` | no — it needs only a token |
+| Result | *captured*: `IsTimedOut` / `ProcessError.Timeout` | *always an error*: `ProcessError.Cancelled` |
+
+The two pairs are **independent**: `StopSignal` never becomes the cancellation signal and
+`CancelSignal` never becomes the timeout signal, and configuring one ladder leaves the other
+exactly as it was. Setting neither keeps the historical behaviour on both paths — an immediate
+hard kill.
+
+**The outcome never changes.** A cancelled run still reports `ProcessError.Cancelled` whether
+the child left on the soft signal or was killed after the grace; only the manner of the goodbye
+is gentler, so a child that must flush state, remove a pidfile, or finish a transaction gets the
+chance to.
+
+**Where it applies.** Every cancellation path a run has: the completion verbs
+(`RunAsync`/`Output*`/`ExitCodeAsync`/`ProbeAsync`/`ParseAsync`/`FirstLineAsync`) through any
+runner, a run through a shared `ProcessGroup`, a supervised incarnation
+([supervision.md](supervision.md)), and a whole chain cancelled through `Pipeline.CancelOn` —
+for a pipeline, set it on **stage 0**, which owns the pipeline-wide control configuration (a
+chain is torn down through one soft signal over one shared group, so `CancelGrace`/`CancelSignal`
+on a later stage is rejected with an `ArgumentException` rather than ignored). It does **not**
+reach a live `StartAsync` handle, which is caller-driven exactly as before — use
+`StopAsync(grace)` there. `LaunchDetached` refuses it with a typed `ProcessError.Unsupported`:
+a detached child has no owner left to run the ladder.
+
+**Scope and platforms** are the same as the rest of cancellation. A run that owns its group
+tears down the whole tree; a run sharing a `ProcessGroup` reaches only its own direct child (the
+documented shared-group teardown gap). **Windows** has no POSIX signal tier: as with
+`TimeoutGrace`, the soft phase is the best-effort `WM_CLOSE` to a windowed child plus a
+CTRL+BREAK to a child started with `WindowsCtrlSignals()`, and the hard kill still lands when the
+grace elapses. A non-default `CancelSignal` is refused at spawn there with
+`ProcessError.Unsupported` — exactly like `StopSignal` — never a silent downgrade to the hard
+kill.
 
 ## Pipelines and clients
 
@@ -616,6 +692,7 @@ returned an `IsTimedOut` result.
 | "Let it clean up before the kill" | `Command.Timeout` + `Command.TimeoutGrace` |
 | "This operation is flaky, try a few times" | `Command.Retry` |
 | "Stop everything when the app shuts down" | `Command.CancelOn` / a verb token + one shared token |
+| "…and let it clean up when that happens" | `Command.CancelGrace` (+ `Command.CancelSignal`) |
 | "Bound a whole multi-stage chain" | `Pipeline.Timeout` / `Pipeline.CancelOn` |
 | "Set a deadline/token once for a tool" | `CliClient.WithDefaults(fun c -> c.Timeout(...).CancelOn(...))` |
 | "Keep this service alive across crashes" | [supervision.md](supervision.md) `Supervisor` |

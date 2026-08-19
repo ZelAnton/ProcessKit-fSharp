@@ -1919,6 +1919,203 @@ type PipelineTests() =
         }
         :> Task
 
+    // ---- T-373: the chain-level graceful cancellation ladder --------------------------------------
+
+    [<Test>]
+    member _.``stage zero owns the pipeline cancellation ladder and later stages cannot override it (T-373)``() =
+        // One containment group means one soft signal and one grace window, exactly as for `StopSignal`:
+        // stage 0 owns them, and a later stage's copy is refused rather than silently ignored.
+        (emit [ "x" ]
+         |> Command.cancelGrace (TimeSpan.FromSeconds 1.0)
+         |> Command.cancelSignal Signal.Usr1)
+            .Pipe
+            sortStage
+        |> ignore
+
+        Assert.Throws<ArgumentException>(
+            Action(fun () ->
+                (emit [ "x" ]).Pipe(sortStage |> Command.cancelGrace (TimeSpan.FromSeconds 1.0))
+                |> ignore)
+        )
+        |> ignore
+
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> (emit [ "x" ]).Pipe(sortStage |> Command.cancelSignal Signal.Usr1) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``a cancelled pipeline honours stage zero's CancelGrace and still reports Cancelled (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore
+                "POSIX signal delivery: Windows has no signal tier (its soft phase is the documented best-effort WM_CLOSE/CTRL+BREAK)."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-pipeline-cancel-grace-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                use cts = new CancellationTokenSource()
+
+                // Stage 0's SIGTERM handler is the only writer of the marker, so the file proves the soft
+                // rung of the ladder actually reached the shared group. Stage 1 keeps the chain alive.
+                let producer =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do sleep 0.05; done"
+                    |> Command.cancelGrace (TimeSpan.FromSeconds 5.0)
+
+                let pipeline = producer.Pipe(sortStage).CancelOn cts.Token
+                let runTask = pipeline.RunAsync()
+                do! Task.Delay 400
+                cts.Cancel()
+
+                match! runTask with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"a cancelled pipeline must still report Cancelled, got {other}"
+
+                let mutable cleanedUp = File.Exists marker
+                let deadline = DateTime.UtcNow.AddSeconds 10.0
+
+                while not cleanedUp && DateTime.UtcNow < deadline do
+                    do! Task.Delay 20
+                    cleanedUp <- File.Exists marker
+
+                Assert.That(
+                    cleanedUp,
+                    Is.True,
+                    "the chain-level cancellation must deliver the soft signal so the stages can clean up"
+                )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cancelled pipeline without CancelGrace still hard-kills the chain at once (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore "POSIX signal delivery: Windows has no signal tier to prove the absence of."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-pipeline-cancel-hard-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                use cts = new CancellationTokenSource()
+
+                // The same chain, minus the opt-in: no SIGTERM handler can observe a hard kill, so the
+                // marker must never appear — the default chain cancellation is unchanged.
+                let producer =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do sleep 0.05; done"
+
+                let pipeline = producer.Pipe(sortStage).CancelOn cts.Token
+                let runTask = pipeline.RunAsync()
+                do! Task.Delay 400
+                cts.Cancel()
+
+                match! runTask with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+                // Give a (wrongly delivered) signal every chance to land before concluding it did not.
+                do! Task.Delay 750
+
+                Assert.That(
+                    File.Exists marker,
+                    Is.False,
+                    "the default chain cancellation must stay an immediate hard kill, with no soft signal"
+                )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cancelled streaming pipeline session honours stage zero's CancelGrace (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore
+                "POSIX signal delivery: Windows has no signal tier (its soft phase is the documented best-effort WM_CLOSE/CTRL+BREAK)."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-pipeline-stream-cancel-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                use cts = new CancellationTokenSource()
+
+                // `StartAsync` stages the chain through its own registration, so the ladder has to be
+                // wired there too — a streaming session must not quietly keep the old hard kill.
+                let producer =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do sleep 0.05; done"
+                    |> Command.cancelGrace (TimeSpan.FromSeconds 5.0)
+
+                let pipeline = producer.Pipe(sortStage).CancelOn cts.Token
+
+                match! pipeline.StartAsync() with
+                | Error error -> Assert.Fail $"the chain must start: {error}"
+                | Ok session ->
+                    use session = session
+                    do! Task.Delay 400
+                    cts.Cancel()
+
+                    match! session.FinishAsync() with
+                    | Error(ProcessError.Cancelled _) -> ()
+                    | other -> Assert.Fail $"a cancelled session must still report Cancelled, got {other}"
+
+                    let mutable cleanedUp = File.Exists marker
+                    let deadline = DateTime.UtcNow.AddSeconds 10.0
+
+                    while not cleanedUp && DateTime.UtcNow < deadline do
+                        do! Task.Delay 20
+                        cleanedUp <- File.Exists marker
+
+                    Assert.That(
+                        cleanedUp,
+                        Is.True,
+                        "a cancelled streaming session must deliver the soft signal before escalating"
+                    )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a pipeline deadline keeps its immediate hard kill even with CancelGrace set (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore "POSIX signal delivery: Windows has no signal tier to prove the absence of."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-pipeline-timeout-hard-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                // `Pipeline.Timeout` and the cancellation ladder are independent knobs: a chain whose
+                // DEADLINE fires is torn down exactly as before, so the SIGTERM handler never runs even
+                // though `CancelGrace` is configured on stage 0.
+                let producer =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do sleep 0.05; done"
+                    |> Command.cancelGrace (TimeSpan.FromSeconds 5.0)
+
+                let pipeline = producer.Pipe(sortStage).Timeout(TimeSpan.FromMilliseconds 500.0)
+
+                match! pipeline.OutputStringAsync() with
+                | Ok result -> Assert.That(result.IsTimedOut, Is.True, "the chain deadline must still fire")
+                | Error error -> Assert.Fail $"a chain timeout is captured, not raised: {error}"
+
+                do! Task.Delay 750
+
+                Assert.That(
+                    File.Exists marker,
+                    Is.False,
+                    "a chain deadline must not borrow the cancellation ladder's soft signal"
+                )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
     [<Test>]
     member _.``a Stdin source on stage 0 stays allowed and feeds the whole chain``() : Task =
         task {

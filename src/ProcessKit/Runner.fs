@@ -221,7 +221,11 @@ module internal CaptureVerbs =
                     // no child rolls its reservation back and leaves the payload intact.
                     OneShotStdin.commitLaunch command.Config.StdinSource
 
-                    use _registration = effectiveToken.Register(fun () -> running.Kill())
+                    // The cancellation teardown, through the run's own single seam: the unchanged
+                    // immediate hard kill by default, or the `CancelSignal` -> `CancelGrace` -> hard-kill
+                    // ladder when the command opted in. The RESULT is unaffected either way — the
+                    // post-consume check below still turns a fired token into `ProcessError.Cancelled`.
+                    use _registration = effectiveToken.Register(fun () -> running.BeginCancelTeardown())
                     let! result = consume running
 
                     if effectiveToken.IsCancellationRequested then
@@ -611,7 +615,10 @@ module Runner =
                 // predicate / cancellation), so a streaming verb never downgrades the kill-on-drop
                 // guarantee to GC finalization.
                 use _ = running
-                use _registration = effectiveToken.Register(fun () -> running.Kill())
+                // Same single cancellation seam as `runToCompletion`: `Command.CancelGrace` softens the
+                // teardown here too, so a completion verb cannot silently keep the old immediate hard
+                // kill just because it streams its way to the answer.
+                use _registration = effectiveToken.Register(fun () -> running.BeginCancelTeardown())
 
                 try
                     // End the child's input BEFORE streaming its stdout. This verb never hands the

@@ -447,6 +447,14 @@ Cancel the whole chain with the chain-level `Pipeline.CancelOn` (or pass a token
 instead. For the full model — captured vs. raised deadlines, and how cancellation differs from a
 timeout — see [timeouts-and-cancellation.md](timeouts-and-cancellation.md).
 
+A cancelled chain is hard-killed at once by default. To let its stages clean up first, set
+[`Command.CancelGrace`](timeouts-and-cancellation.md#graceful-cancellation) (and optionally
+`CancelSignal`) on **stage 0**, which owns the pipeline-wide control configuration alongside
+`StopSignal`: the whole chain is then sent one soft signal, given the grace window, and only then
+hard-killed. Setting either on a later stage is rejected with an `ArgumentException` — a chain has one
+shared group and therefore one broadcast soft-stop phase. The chain-level `Pipeline.Timeout` is a
+different event and keeps its immediate hard kill.
+
 ## Streaming a pipeline
 
 The buffering verbs run the whole chain to completion before handing back its folded

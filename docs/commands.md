@@ -1004,6 +1004,10 @@ Console.WriteLine(await cmd.RunAsync() switch
 - **`TimeoutGrace`** softens the kill: on timeout it terminates gracefully
   (SIGTERM), waits the grace window, then force-kills only if the child is still
   alive. On Windows this degrades to the atomic Job-object kill.
+- **`CancelGrace`** does the same for a **cancellation** (`CancelOn` or a verb
+  token), with its own soft signal (`CancelSignal`, default `Signal.Term`) and no
+  deadline required. It is independent of `TimeoutGrace`/`StopSignal`, and the
+  outcome is unchanged: a cancelled run still reports `ProcessError.Cancelled`.
 - **`Retry`** runs the command up to `maxAttempts` times **in total** (the first run
   plus up to `maxAttempts - 1` retries — so `retry 3` is one run and up to two
   retries, and `0`/`1` both mean a single run), waiting `delay` between attempts,
@@ -1418,7 +1422,7 @@ can never look applied when nothing will ever enforce it:
 | `Pty` | a pseudo-terminal is a live parent-side device that must be owned and pumped |
 | `KillOnParentDeath` | it asks the OS to kill the child with us — the opposite of detaching |
 | `Timeout` / `TimeoutGrace` / `IdleTimeout` | a deadline needs a parent watchdog that can still kill |
-| `CancelOn` | cancelling means killing, the very control this verb gives up |
+| `CancelOn` / `CancelGrace` | cancelling means killing, the very control this verb gives up (and nothing is left to run the grace) |
 | `Stdin` (a feeder source) | feeding stdin needs a parent-side pump (`InheritStdin` *is* supported) |
 | `KeepStdinOpen` | it retains the parent's end of the stdin pipe for interactive writing |
 | `OnStdoutLine` / `OnStderrLine` / `StdoutTee` / `StderrTee` | all are fed by the parent's own copy of the output |
