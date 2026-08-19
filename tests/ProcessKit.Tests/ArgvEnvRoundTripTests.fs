@@ -195,6 +195,47 @@ stdout.Flush();
 return 0;
 """
 
+    // --- Arg0: adapting the test values to the `/bin/sh` actually installed ---------------------
+
+    // `/bin/sh` is normally `dash` or `bash`, which merely REPORT argv[0] (as `$0`), so the Arg0 tests
+    // below can hand it any string. On a musl/Alpine image `/bin/sh` is instead a symlink to BusyBox, a
+    // MULTICALL binary whose entry point DISPATCHES on argv[0]: it strips one leading `-`, takes the
+    // basename, and looks the result up as an applet name before any shell — or `-c` — logic runs. An
+    // unknown name exits 127 with "<name>: applet not found" and no shell ever starts. (That refusal is
+    // itself evidence the override reached the exec'd child, but it is not an observation of it.) Which
+    // argv[0] values are observable is therefore a property of the runtime environment, derived from it
+    // here rather than hardcoded.
+    static let arg0Probe = "pk-argv0-dispatch-probe"
+
+    // Measured, not guessed from the binary's name or link target (a multicall `/bin/sh` can equally be a
+    // symlink, a hard link or a copy): spawn `/bin/sh` once with an argv[0] that is deliberately not an
+    // applet name. A byte-exact echo means an ordinary shell that only reports argv[0]; anything else
+    // means this `/bin/sh` acts on argv[0]. A misclassification cannot hide a real `Arg0` regression —
+    // the adapted values still assert exact equality, so an override that stopped reaching the child
+    // fails there rather than being absorbed here.
+    static let shellDispatchesOnArg0 =
+        lazy
+            (let probe =
+                Command.create "/bin/sh"
+                |> Command.arg0 arg0Probe
+                |> Command.args [ "-c"; "printf %s \"$0\"" ]
+                |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+             match probe.RunAsync().GetAwaiter().GetResult() with
+             | Ok observed -> observed <> arg0Probe
+             | Error _ -> true)
+
+    // Make one argv[0] value dispatchable by the `/bin/sh` in play WITHOUT shortening or simplifying it.
+    // Only the basename decides the applet, so a `/sh` suffix routes to the multicall binary's own `sh`
+    // applet — which a multicall binary installed AS `/bin/sh` necessarily provides, or nothing on the
+    // image could run `sh` at all — while the whole original string still travels in argv[0]: BusyBox
+    // massages only its private dispatch name and hands the applet the untouched argv, so `$0` still
+    // yields the value byte-for-byte. That is reproducible on any BusyBox `/bin/sh` without .NET:
+    // `sh -c 'exec -a "x/sh" /bin/sh -c "printf %s \"\$0\""'` prints `x/sh`, while the same line with
+    // `-a "x"` prints `x: applet not found`. Ordinary shells, where argv[0] is inert, get it unchanged.
+    static let dispatchableArg0 (value: string) =
+        if shellDispatchesOnArg0.Value then value + "/sh" else value
+
     let mutable helperDir = ""
     let mutable helperDll = ""
 
@@ -357,7 +398,8 @@ return 0;
     // observe (`Main(string[] args)` never includes argv[0]). `/bin/sh -c 'printf %s "$0"'` is the
     // portable POSIX way to read a process's OWN argv[0] back: with no `command_name` operand after the
     // script, POSIX sets `$0` from the shell's own `argv[0]` — exactly the element our native marshalling
-    // overrides — so this observes the real `posix_spawnp` argv, not a re-quoted proxy.
+    // overrides — so this observes the real `posix_spawnp` argv, not a re-quoted proxy. On a multicall
+    // `/bin/sh` argv[0] is not inert, so the values are adapted to it — see `dispatchableArg0` above.
     [<Test>]
     member _.``Arg0 overrides the observed argv[0] of a real POSIX child (ASCII and non-ASCII)``() =
         if isWindows then
@@ -368,6 +410,13 @@ return 0;
                   "-bash" // the login-shell leading-dash convention
                   "bmp-é-中-€" // BMP Unicode
                   "nonbmp-" + Char.ConvertFromUtf32 0x1F600 ] // a surrogate-pair code point
+                // A leading dash is the one shape a multicall `/bin/sh` cannot report cleanly: the
+                // dispatcher strips it, and the shell it then dispatches to reads the surviving dash as
+                // "login shell" and sources /etc/profile (and $HOME/.profile) BEFORE running `-c`, so any
+                // output of those files would arrive ahead of the value under test. Ordinary shells —
+                // every non-musl leg — keep the case and cover the convention there.
+                |> List.filter (fun case -> not (shellDispatchesOnArg0.Value && case.StartsWith '-'))
+                |> List.map dispatchableArg0
 
             for case in cases do
                 let command =
@@ -391,15 +440,17 @@ return 0;
         if isWindows then
             Assert.Ignore "Arg0/Setsid are both POSIX-only"
         else
+            let case = dispatchableArg0 "multicall-name"
+
             let command =
                 Command.create "/bin/sh"
-                |> Command.arg0 "multicall-name"
+                |> Command.arg0 case
                 |> Command.setsid
                 |> Command.args [ "-c"; "printf %s \"$0\"" ]
 
             match command.RunAsync().GetAwaiter().GetResult() with
             | Error error -> Assert.Fail $"Arg0+Setsid round-trip failed: {error.Message}"
-            | Ok observed -> Assert.That(observed, Is.EqualTo "multicall-name")
+            | Ok observed -> Assert.That(observed, Is.EqualTo case)
 
     [<Test>]
     member _.``Arg0 on Windows is a typed Unsupported, never a silent fallback to Program``() =
