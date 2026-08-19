@@ -64,7 +64,7 @@ a conformance test, or a log pipeline can read one file instead of scraping docu
   "variants": [ { "variant": "Exited", "identifier": "exited" } ] }
 ```
 
-Seven types are published today:
+Eight types are published today:
 
 | Type | `class` | Where the identifier is used |
 |---|---|---|
@@ -74,7 +74,8 @@ Seven types are published today:
 | `ProcessError` | `report_only` | `SupervisionEvent.FailureKind` |
 | `LimitVerdict` | `report_only` | each axis of a `limit_evidence` line, above |
 | `SupervisionEventKind` | `report_only` | `SupervisionEvent.Name` |
-| `RlimitResource` | `configurable` | the resource name a config-driven caller supplies, which ProcessKit **parses back** through `RlimitResource.TryFromName`/`FromName`; also what `Rlimit.ToString()` renders (`no_file=64:128`). The one published vocabulary the library reads as well as writes — see [Commands → per-process resource limits](commands.md#per-process-resource-limits-rlimit) |
+| `RlimitResource` | `configurable` | the resource name a config-driven caller supplies, which ProcessKit **parses back** through `RlimitResource.TryFromName`/`FromName`; also what `Rlimit.ToString()` renders (`no_file=64:128`). One of the two published vocabularies the library reads as well as writes — see [Commands → per-process resource limits](commands.md#per-process-resource-limits-rlimit) |
+| `IoPriorityClass` | `configurable` | the Linux I/O scheduling class a config-driven caller supplies, likewise **parsed back** through `IoPriorityClass.TryFromName`/`FromName`; also what `IoPriority.ToString()` renders (`best_effort:7`). The *level* within a class is a number the caller supplies rather than a case, so it is not part of this vocabulary — see [Commands → Linux I/O scheduling priority](commands.md#linux-io-scheduling-priority-iopriority) |
 
 `Signal.Other` is deliberately absent: it carries a raw signal number, whose meaning is the number
 itself rather than a name this library could publish.
@@ -94,10 +95,13 @@ Two properties make the file worth pinning:
   from the live cases themselves. For the four types ProcessKit does emit as text, that is the very
   function the emitting code calls — so the `kind` this serializer writes, a `FailureKind`, an event
   `Name`, and the dictionary entry cannot disagree, and a test ties each published identifier back to
-  the string a consumer actually receives. `RlimitResource` is tied the other way round, being the one
-  vocabulary ProcessKit *reads*: a test feeds every published identifier back through
-  `RlimitResource.TryFromName` and asserts it returns the case it was published for, so a name taken from
-  this file is always one the builder accepts. Adding a union case without an identifier fails the build.
+  the string a consumer actually receives. `RlimitResource` and `IoPriorityClass` are tied the other way
+  round, being the vocabularies ProcessKit *reads*: a test feeds every published identifier back through
+  `RlimitResource.TryFromName` / `IoPriorityClass.TryFromName` and asserts it returns the case it was
+  published for, so a name taken from this file is always one the builder accepts. One thing this file
+  cannot catch on its own is a brand-new public vocabulary that was never added to it — no match goes
+  non-exhaustive for a type the dictionary has never heard of — so introducing one is a deliberate step in
+  the change that adds it. Adding a union case without an identifier fails the build.
   Adding a `SupervisionEventKind` fails the manifest test instead, since F# requires a wildcard arm when
   matching a .NET enum and the compiler therefore cannot refuse it. Adding any case without regenerating
   the file fails the test that rebuilds it and compares text, which CI runs as its own step.

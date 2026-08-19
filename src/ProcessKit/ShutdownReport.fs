@@ -64,9 +64,10 @@ type SoftSignalDelivery =
 /// # Point-in-time member counts
 ///
 /// `MembersBefore`/`MembersAfter` count the same member set `ProcessGroup.Members` reports — the whole
-/// tree on the Windows Job Object and Linux cgroup v2 mechanisms, the tracked group **leaders** on the
-/// POSIX process-group fallback (macOS / the other BSDs / Linux without cgroup v2). Each is `None` only
-/// if that membership read failed (an unreadable `cgroup.procs`, a failed Job Object query), never a
+/// tree on the Windows Job Object and Linux cgroup v2 mechanisms and on the FreeBSD process reaper
+/// (which reads the live tree from `PROC_REAP_GETPIDS`, zombies excluded), the tracked group **leaders**
+/// on the POSIX process-group fallback (macOS / the other BSDs / Linux without cgroup v2). Each is `None`
+/// only if that membership read failed (an unreadable `cgroup.procs`, a failed Job Object query), never a
 /// fabricated `0`.
 ///
 /// # Unconditional teardown — same guarantee as `ShutdownAsync`

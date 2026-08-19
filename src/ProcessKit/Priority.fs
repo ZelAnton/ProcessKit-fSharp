@@ -30,8 +30,11 @@ namespace ProcessKit
 ///   on the immediate child for all five levels — only its inheritance by grandchildren is the
 ///   platform limit, and it is never a silent downgrade of the child you launched.
 ///
-/// Only ordinary (non-real-time) priorities are exposed; `Priority` never raises a real-time class,
-/// and I/O scheduling is out of scope.
+/// Only ordinary (non-real-time) CPU priorities are exposed here: `Priority` never raises a real-time
+/// scheduling class. And it is the CPU axis alone — `Priority` itself never touches **I/O** scheduling.
+/// How a child's block-device requests are ordered against everyone else's is the separate
+/// `Command.IoPriority` axis (Linux-only; see `IoPriority`). Neither axis implies the other, and
+/// background work usually wants both.
 [<RequireQualifiedAccess; NoComparison>]
 type Priority =
 

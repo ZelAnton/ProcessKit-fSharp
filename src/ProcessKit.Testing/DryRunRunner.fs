@@ -56,14 +56,16 @@ type DryRunRunner() =
     /// Render `command` deterministically: the program, ordinarily quoted arguments, Windows raw fragments
     /// verbatim, then `(argv0: <value>)` when `Command.Arg0` overrode the child's `argv[0]`, then
     /// `(rlimits: <resource>=<soft>:<hard>, ...)` when `Command.Rlimit` capped any per-process resource,
-    /// then `(cwd: <directory>)` when the command set a working directory. Two commands built the same way
-    /// always render identically.
+    /// then `(io_priority: <class>[:<level>])` when `Command.IoPriority` set the child's Linux
+    /// I/O-scheduling priority, then `(cwd: <directory>)` when the command set a working directory. Two
+    /// commands built the same way always render identically.
     ///
-    /// The rlimits are part of the render on purpose: a dry run is what a consumer inspects INSTEAD of
-    /// launching anything, so a cap that would have been applied to the real child has to be visible here
-    /// too — a preview that silently omitted it would report a weaker command than the one that would
-    /// actually run. Each entry is `Rlimit.ToString()`, so the render carries the same stable resource
-    /// names the builder accepts, in the order they were configured, and no argv or environment value.
+    /// The rlimits and the I/O priority are part of the render on purpose: a dry run is what a consumer
+    /// inspects INSTEAD of launching anything, so a cap or a scheduling class that would have been applied
+    /// to the real child has to be visible here too — a preview that silently omitted it would report a
+    /// weaker command than the one that would actually run. Each entry is `Rlimit.ToString()` /
+    /// `IoPriority.ToString()`, so the render carries the same stable identifiers the builders accept, in
+    /// the order they were configured, and no argv or environment value.
     static member Render(command: Command) : string =
         ArgumentNullException.ThrowIfNull command
 
@@ -85,6 +87,11 @@ type DryRunRunner() =
                 let rendered = command.Config.Rlimits |> Seq.map string |> String.concat ", "
 
                 $"{line} (rlimits: {rendered})"
+
+        let line =
+            match command.Config.IoPriority with
+            | Some priority -> $"{line} (io_priority: {priority})"
+            | None -> line
 
         match command.WorkingDirectory with
         | Some dir -> $"{line} (cwd: {dir})"

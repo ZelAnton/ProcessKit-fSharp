@@ -30,7 +30,8 @@ module internal DetachedLaunch =
     /// Deliberately NOT refused, because a detached child can honour them at the OS level with no parent
     /// involvement: `CurrentDir`, `Env`/`EnvClear`/`PreferLocal`, `StdoutToFile`/`StderrToFile`,
     /// `MergeStderr`, `Stdout`/`Stderr` `Null`/`Inherit`, `InheritStdin`, `CreateNoWindow`,
-    /// `WindowsCtrlSignals`, `WindowsRestrictedToken`, `WindowsIntegrityLevel`, `Priority`, `Umask`,
+    /// `WindowsCtrlSignals`, `WindowsRestrictedToken`, `WindowsIntegrityLevel`, `Priority` (the CPU axis,
+    /// unlike the owner-applied `IoPriority` refused below), `Umask`,
     /// `Uid`/`Gid`/`Groups`, `Setsid` (which a POSIX detached launch performs anyway), and `Arg0` (applied
     /// directly on the POSIX detached spawn path; refused there only if paired with a `Uid`/`Gid`/`Groups`
     /// drop, exactly as on the contained path — see `Native.Posix.arg0HelperConflict`). The Windows
@@ -63,6 +64,18 @@ module internal DetachedLaunch =
                 refuse
                     "KillOnParentDeath"
                     "it asks the OS to kill the child when this process dies, the exact opposite of detaching a child so it survives us"
+            )
+        elif config.IoPriority.IsSome then
+            // The one knob here refused for OWNERSHIP rather than for a missing parent-side mechanism.
+            // Applying it means this process carrying the requested Linux I/O priority across the spawn
+            // window so the kernel copies it into the child (`Native.Posix.withIoPriority`) — an
+            // owner-applied setting, and this verb's whole purpose is to hand the child to the OS and stop
+            // being its owner. Refused loudly here so it can never look applied, exactly as ProcessKit-rs
+            // refuses `io_priority` under `spawn_detached`.
+            Some(
+                refuse
+                    "IoPriority"
+                    "the child's Linux I/O scheduling priority is applied by the owner across the spawn itself, and a detached launch deliberately gives that ownership up"
             )
         elif config.Timeout.IsSome then
             Some(refuse "Timeout" "enforcing a deadline needs a parent-side watchdog that can still kill the child")
@@ -312,6 +325,7 @@ type CommandVerbs =
     /// ignored here but unreachable: they live on the container this verb refuses to create.
     ///
     /// **Every incompatible builder knob is refused, not ignored** — `Pty`, `KillOnParentDeath`,
+    /// `IoPriority` (owner-applied, unlike the CPU-axis `Priority`, which is honoured),
     /// `Timeout`/`TimeoutGrace`/`IdleTimeout`, `CancelOn`/`CancelGrace`, a feeder `Stdin` source, `KeepStdinOpen`, the
     /// line handlers and tees, `StreamBuffer`, and an active `Retry` policy each come back as a typed
     /// `ProcessError.Unsupported` naming the knob, before anything is spawned. `StdioMode.Piped` (the

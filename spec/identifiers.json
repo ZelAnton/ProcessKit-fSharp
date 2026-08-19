@@ -8,7 +8,8 @@
       "variants": [
         { "variant": "JobObject", "identifier": "job_object" },
         { "variant": "CgroupV2", "identifier": "cgroup_v2" },
-        { "variant": "ProcessGroup", "identifier": "process_group" }
+        { "variant": "ProcessGroup", "identifier": "process_group" },
+        { "variant": "ProcessReaper", "identifier": "process_reaper" }
       ]
     },
     {
@@ -94,6 +95,15 @@
         { "variant": "FileSize", "identifier": "file_size" },
         { "variant": "NoFile", "identifier": "no_file" },
         { "variant": "Stack", "identifier": "stack" }
+      ]
+    },
+    {
+      "path": "ProcessKit.IoPriorityClass",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Idle", "identifier": "idle" },
+        { "variant": "BestEffort", "identifier": "best_effort" },
+        { "variant": "RealTime", "identifier": "real_time" }
       ]
     }
   ]

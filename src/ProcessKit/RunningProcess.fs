@@ -450,6 +450,22 @@ type RunningProcess
                 budget
                 readinessToken)
 
+    let waitForNamedPipe
+        (pipeName: string)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        raceReadinessAgainstExit timeout cancellationToken (fun attempts stdout stderr budget readinessToken ->
+            ReadinessProbe.waitForNamedPipe
+                config.TimeProvider
+                config.Program
+                stdout
+                stderr
+                pipeName
+                attempts
+                budget
+                readinessToken)
+
     let waitForCustom
         (probe: Func<Task<bool>>)
         (timeout: TimeSpan)
@@ -1665,6 +1681,41 @@ type RunningProcess
         | Ok() ->
             let endpoint = UnixDomainSocketEndPoint path
             waitForSocket endpoint timeout cancellationToken
+
+    /// Wait until the Windows named pipe `pipeName` accepts a client connection, or fail with
+    /// `NotReady` once the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken`
+    /// fires first). Behaves like `WaitForSocketAsync` (same deadline mechanics, same
+    /// early-exit-on-child-death contract, same background stdout/stderr draining), but dials a
+    /// Windows named pipe through `CreateFileW` instead of a socket — see
+    /// `ReadinessProbe.waitForNamedPipe`/`waitForCoreUsing` for the full deadline contract.
+    ///
+    /// `pipeName` may be a bare name (`"my-service"`, resolved under the local `\\.\pipe\` namespace)
+    /// or an already-fully-qualified path (`\\.\pipe\my-service`, or a remote
+    /// `\\server\pipe\my-service`). `ERROR_PIPE_BUSY` counts as ready: it proves a server created the
+    /// pipe even though every instance is currently serving another client, which genuinely differs
+    /// from the pipe not existing at all — the latter keeps polling until `pipeName`'s server creates
+    /// it or the deadline elapses. Each poll is a real, if momentary, client connection: a successful
+    /// `CreateFileW` is indistinguishable from any other client's open, so the server sees an accepted
+    /// connection that immediately disconnects again once the poll closes the handle (this is what the
+    /// test `WaitForNamedPipe connects to a listening named pipe` observes from the server side, and it
+    /// matches the source Rust crate's `named_pipe_is_ready`, which opens and drops a client the same
+    /// way). For a single-instance server this can briefly leave the pipe genuinely busy for a real
+    /// client racing the same poll, until the probe closes its handle and the server re-posts its
+    /// listen; a multi-instance server is unaffected. This is never a connection the caller keeps open
+    /// or that the caller can observe directly — only its side effect on the server's own accept state.
+    ///
+    /// This probe is available only on Windows: requires the host to support Windows named pipes
+    /// (`RuntimeInformation.IsOSPlatform OSPlatform.Windows`); on any other platform this returns
+    /// `Error(ProcessError.Unsupported ...)` immediately, before ever attempting to open a pipe — never
+    /// a silent downgrade or an inevitable hang, symmetric with `WaitForSocketAsync`'s `AF_UNIX` gate.
+    member _.WaitForNamedPipeAsync
+        (pipeName: string, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        ArgumentNullException.ThrowIfNull pipeName
+
+        match ReadinessProbe.namedPipeSupported (fun () -> RuntimeInformation.IsOSPlatform OSPlatform.Windows) with
+        | Error err -> Task.FromResult(Error err)
+        | Ok() -> waitForNamedPipe pipeName timeout cancellationToken
 
     /// Poll `uri` with HTTP GET until a response passes the default 2xx check, or fail with `NotReady`
     /// once `timeout` expires (or `Cancelled` if `cancellationToken` fires first). Connection failures,

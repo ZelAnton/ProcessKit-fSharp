@@ -17,6 +17,7 @@ module private CapabilityFacts =
     let windows: CapabilityProbe.PlatformFacts =
         { IsWindows = true
           IsLinux = false
+          IsFreeBsd = false
           ParentDeathScope = KillOnParentDeathScope.WholeTree
           ConPtyAvailable = true
           CmdExeAvailable = true
@@ -36,6 +37,7 @@ module private CapabilityFacts =
     let linux: CapabilityProbe.PlatformFacts =
         { IsWindows = false
           IsLinux = true
+          IsFreeBsd = false
           ParentDeathScope = KillOnParentDeathScope.DirectChildOnly
           ConPtyAvailable = false
           CmdExeAvailable = false
@@ -63,6 +65,7 @@ module private CapabilityFacts =
     let macOs: CapabilityProbe.PlatformFacts =
         { IsWindows = false
           IsLinux = false
+          IsFreeBsd = false
           ParentDeathScope = KillOnParentDeathScope.Nothing
           ConPtyAvailable = false
           CmdExeAvailable = false
@@ -82,12 +85,18 @@ module private CapabilityFacts =
           ProcessIdentityReaderAvailable = true
           AffinityMaskWidth = 64 }
 
-    /// FreeBSD and the other BSDs: the same absent whole-tree primitive as macOS, plus the one fact that
+    /// The BSDs OTHER than FreeBSD: the same absent whole-tree primitive as macOS, plus the one fact that
     /// separates them for bare-pid adoption — no start-time identity reader this library can verify, so
     /// there is no anchor to take for a foreign number.
     let bsd =
         { macOs with
             ProcessIdentityReaderAvailable = false }
+
+    /// FreeBSD: everything the other BSDs report, except that this one host HAS a whole-tree containment
+    /// primitive — the `procctl(2)` process reaper — which is what selects `Mechanism.ProcessReaper` for a
+    /// limit-free group here. It is still not a limit primitive, so the resource-limit row does not move
+    /// with it; only its precondition text says so in the reaper's own terms.
+    let freeBsd = { bsd with IsFreeBsd = true }
 
     let noLimits () = ProcessGroupOptions()
 
@@ -328,6 +337,62 @@ type CapabilityTests() =
         available "Signals.Arbitrary" caps.Signals.Arbitrary
 
     [<Test>]
+    member _.``FreeBSD selects the process reaper for a limit-free group and predicts it honestly``() =
+        let caps =
+            CapabilityProbe.snapshot CapabilityFacts.freeBsd (CapabilityFacts.noLimits ())
+
+        Assert.That(
+            caps.Mechanism,
+            Is.EqualTo(Some Mechanism.ProcessReaper),
+            "a limit-free group on FreeBSD must prefer the whole-tree procctl reaper over the plain process group"
+        )
+
+        // The one axis where this mechanism's prediction is weaker than its behaviour, and says so:
+        // acquiring reaper status is a permanent process-wide side effect a snapshot must not perform.
+        qualified "Creation" "PROC_REAP_ACQUIRE" caps.Creation
+        qualified "Creation" "falls back to the POSIX process group" caps.Creation
+
+        // The full POSIX signal vocabulary, delivered through PROC_REAP_KILL instead of killpg — a wider
+        // reach on the same three rows, so no row is qualified for being better.
+        available "Signals.Kill" caps.Signals.Kill
+        available "Signals.SoftStop" caps.Signals.SoftStop
+        available "Signals.Arbitrary" caps.Signals.Arbitrary
+
+        // Containment is not adoption: the reaper holds this process's own descendants, and there is no
+        // procctl call that pulls a foreign process into that relationship.
+        unsupported "Adoption" "contains only this process's own descendants" caps.Adoption
+        unsupported "AdoptionByPid" "start-time identity reader" caps.AdoptionByPid
+
+        // A whole-tree CONTAINER is exactly what the reaper is not, and the precondition says why in the
+        // reaper's own terms rather than claiming this host has no whole-tree mechanism at all.
+        unsupported "MemoryMax" "keeps no aggregate memory/CPU/pids accounting" caps.ResourceLimits.MemoryMax
+        unsupported "MaxProcesses" "process reaper" caps.ResourceLimits.MaxProcesses
+        unsupported "LiveUpdate" "process reaper" caps.ResourceLimits.LiveUpdate
+        unsupported "UiRestrictions" "Windows Job Object" caps.ResourceLimits.UiRestrictions
+
+        // The CPU-time rlimit is the deliberate POSIX exception and survives the absent container here too.
+        available "CpuTimeMax" caps.ResourceLimits.CpuTimeMax
+
+    [<Test>]
+    member _.``FreeBSD refuses whole-tree limits exactly as the other BSDs do - the reaper is not a container``() =
+        let caps =
+            CapabilityProbe.snapshot CapabilityFacts.freeBsd (CapabilityFacts.wholeTreeLimits ())
+
+        Assert.That(
+            caps.Mechanism,
+            Is.EqualTo None,
+            "asking for a cap this host cannot enforce must report no mechanism at all, not the reaper"
+        )
+
+        unsupported "Creation" "process reaper" caps.Creation
+
+        // The mechanism-dependent axes carry the creation precondition rather than another mechanism's
+        // answer; the host-level ones are unaffected.
+        refused "Adoption" caps.Adoption
+        refused "Signals.Kill" caps.Signals.Kill
+        available "CpuTimeMax" caps.ResourceLimits.CpuTimeMax
+
+    [<Test>]
     member _.``a missing POSIX helper degrades exactly the axes that need it``() =
         let withoutSetpriv =
             CapabilityProbe.snapshot
@@ -385,7 +450,8 @@ type CapabilityTests() =
                   ProcessLimitHelperAvailable = false
                   SystemShellAvailable = false }
               "macos", CapabilityFacts.macOs
-              "bsd", CapabilityFacts.bsd ]
+              "bsd", CapabilityFacts.bsd
+              "freebsd", CapabilityFacts.freeBsd ]
 
         let optionSets =
             [ "no limits", CapabilityFacts.noLimits ()

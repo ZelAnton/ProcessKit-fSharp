@@ -1393,6 +1393,35 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
 
     new() = ProcessGroupBackend(ResourceLimits.None)
 
+    /// Kill and reap every leader this backend currently tracks, and SIGKILL every adopted foreign pid —
+    /// the escalation half of `GracefulKillTree`, taken as a fresh snapshot at the moment of the call.
+    ///
+    /// Not on `IContainmentBackend` (so no implementor fan-out, K-055): its one external caller is
+    /// `ProcessReaperBackend`, which LAYERS over this backend on FreeBSD and needs exactly this — the
+    /// reaper's own `PROC_REAP_KILL` reaches the whole tree, but only the ledger here knows which of those
+    /// processes are OUR children and therefore ours to `waitpid`. Without it a reaper escalation would
+    /// SIGKILL the tree and leave our own leaders as zombies nobody waits for until final teardown (R-01 /
+    /// K-179: the kill and the reap belong together wherever something reads membership right behind
+    /// them).
+    ///
+    /// Reentrant by `PosixReap`'s own contract: a pgid a previous pass already reaped probes `Gone` on the
+    /// next one, so the kill is skipped and the reap probe is a harmless no-op. Nothing is untracked here
+    /// — this is the escalation, not the teardown; `HardRelease` still owns the take-and-clear drain.
+    member internal _.HardKillAndReapTracked() : unit =
+        children.Snapshot()
+        |> List.map (fun pgid ->
+            pgid,
+            match identities.TryGetValue pgid with
+            | true, token -> token
+            | false, _ -> None)
+        |> PosixReap.drain
+
+        // Adopted foreign pids: killed by their exact pid while the anchor still matches, never reaped
+        // (they are not our children) and never `killpg`ed (that group is not ours) — the same asymmetry
+        // `GracefulKillTree`'s own escalation and `HardRelease` both observe.
+        for pid, anchor in adoptedSnapshot () do
+            Native.Posix.killAdopted pid anchor |> ignore
+
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.ProcessGroup
 
@@ -1832,3 +1861,453 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                 match adopted.TryRemove pid with
                 | true, _ -> Native.Posix.killAdopted pid anchor |> ignore
                 | false, _ -> ()
+
+/// FreeBSD kernel **process-reaper** backend (`Mechanism.ProcessReaper`): `procctl(2)`'s `PROC_REAP_*`
+/// commands layered over the POSIX process-group backend.
+///
+/// # What this layer adds, and what it reuses
+///
+/// Everything about *starting* and *reaping a child* stays with `ProcessGroupBackend`: the `posix_spawn`
+/// into its own pgid, the per-child `RLIMIT_CPU` rewrite, the tracked-leader ledger and its captured
+/// start-time identities, the single-waiter discipline (K-016), the adopted-pid ledger. This backend adds
+/// exactly the whole-tree semantics on top:
+///
+///  - **membership** comes from `PROC_REAP_GETPIDS` — the real tree — instead of the tracked group leaders,
+///  - **delivery** (`KillTree`/`Signal`/`Suspend`/`Resume`/the graceful tiers) goes through
+///    `PROC_REAP_KILL`, which reaches the `setsid` escapees `killpg` cannot.
+///
+/// That composition is deliberate, and it is not "silently reusing the process group as the FreeBSD
+/// mechanism": the two layers answer different questions, and the reaper genuinely cannot answer the first
+/// one — it has no spawn primitive, no exit-status channel, and no way to know which of the processes it
+/// enumerates are OUR children and therefore ours to `waitpid`. Re-implementing that half here would
+/// duplicate the invariants this codebase has already paid for (single waiter per child, identity-gated
+/// by-number kills, snapshot-then-work under teardown races) as a second, divergent copy. What the
+/// mechanism REPORTS is honest either way: a group backed by this type reports `Mechanism.ProcessReaper`
+/// and really does contain the whole descendant tree, while a FreeBSD host where `PROC_REAP_ACQUIRE` failed
+/// never gets this type at all — it gets the plain `ProcessGroupBackend` and says `Mechanism.ProcessGroup`
+/// (see `ProcessGroup.Create`).
+///
+/// # Scoping one group inside a process-wide reaper
+///
+/// Reaper status is a property of the PROCESS, so several live groups share one reaper tree. Each group is
+/// scoped by the kernel's own subtree tag instead: every child this process forks roots a subtree named by
+/// its own pid, and every descendant of that child carries that pid in `pi_subtree` for life. This backend
+/// records the pids of the children *it* tracked and addresses only those subtrees, so one group can never
+/// enumerate, signal or kill another group's tree — nor a child the embedding application started for
+/// itself.
+///
+/// A root is released only on the kernel's own positive answer that nothing is left under it (an empty
+/// descendant listing, or an `ESRCH` from `PROC_REAP_KILL`), never merely because its process group drained
+/// or because a child was `Release`d. That asymmetry with `ProcessGroupBackend` is the whole point: a pgid
+/// empties at exactly the moment a `setsid` escapee stops being reachable through `killpg`, which is the
+/// moment the reaper is the ONLY thing that can still reach into that subtree.
+type internal ProcessReaperBackend
+    (group: ProcessGroupBackend, ops: Native.FreeBsd.ReaperOps, initialLimits: ResourceLimits) =
+
+    let contained = group :> IContainmentBackend
+
+    // The subtree roots this group owns, behind one lock — the same single-gate discipline
+    // `TrackedChildren` applies to the POSIX ledger, and for the same reason: a spawn racing a teardown
+    // must serialize on record / prune / snapshot so a root can never be missed by teardown or aliased
+    // after it is dropped. `nextSeq` stamps each root so `pruneRoots` can tell a root recorded by a
+    // concurrent spawn (which the listing being judged could not have contained) from one the kernel
+    // really reports as empty.
+    let sync = obj ()
+    let items = List<Native.FreeBsd.Root>()
+    let mutable nextSeq = 0UL
+
+    // The stamp a root recorded from now on will carry. Read BEFORE a listing, always, so the prune that
+    // listing drives keeps anything recorded after it.
+    let seqMark () = lock sync (fun () -> nextSeq)
+
+    let rootSnapshot () : Native.FreeBsd.Root list = lock sync (fun () -> List.ofSeq items)
+
+    let rootPids () : Set<int> =
+        lock sync (fun () -> items |> Seq.map (fun root -> root.Pid) |> Set.ofSeq)
+
+    let pruneWith (listing: Native.FreeBsd.Listing) (since: uint64) =
+        lock sync (fun () ->
+            let kept = Native.FreeBsd.pruneRoots listing since (List.ofSeq items)
+            items.Clear()
+            items.AddRange kept)
+
+    // Forget one specific root, matched by its STAMP as well as its pid: if a concurrent `Track` replaced
+    // the entry in between — a new child that inherited the recycled number — the replacement stays.
+    let forget (root: Native.FreeBsd.Root) =
+        lock sync (fun () -> items.RemoveAll(fun item -> item = root) |> ignore)
+
+    // Record a freshly-tracked child as a subtree root, AFTER forgetting the roots the kernel reports as
+    // empty — the "prune, then track" order the POSIX ledger uses, and for the same reason: a spawn is
+    // precisely the moment a pid this group still remembers can be handed out again, so it is the moment a
+    // stale root is most expensive to keep. An unreadable listing prunes nothing (under-pruning keeps a
+    // stale root; over-pruning drops containment). A new entry always REPLACES an existing one for the same
+    // pid with a FRESH stamp, which is what tells a concurrent membership read "recorded after your
+    // listing; keep it".
+    let recordRoot (pid: int) =
+        if pid > 0 then
+            let since = seqMark ()
+            let listing = ops.Descendants() |> Result.toOption
+
+            lock sync (fun () ->
+                match listing with
+                | Some listing ->
+                    let kept = Native.FreeBsd.pruneRoots listing since (List.ofSeq items)
+                    items.Clear()
+                    items.AddRange kept
+                | None -> ()
+
+                items.RemoveAll(fun root -> root.Pid = pid) |> ignore
+                items.Add { Pid = pid; Seq = nextSeq }
+                nextSeq <- nextSeq + 1UL)
+
+    // One reaper read: collect the re-parented corpses it exposes (the duty that being the reaper takes
+    // on) and, unless the caller is bound by a probe-only contract, prune the roots it proves empty.
+    let readListing (prune: bool) : Result<Native.FreeBsd.Listing, string> =
+        let since = seqMark ()
+
+        match ops.Descendants() with
+        | Error message -> Error message
+        | Ok listing ->
+            Native.FreeBsd.sweepStrayZombies ops listing
+
+            if prune then
+                pruneWith listing since
+
+            Ok listing
+
+    let readMembers (prune: bool) : Result<int list, string> =
+        readListing prune
+        |> Result.map (fun listing -> Native.FreeBsd.membersOf (rootPids ()) listing.Entries)
+
+    let membershipError (message: string) =
+        ProcessError.Io $"could not read the process reaper's descendant tree (procctl(PROC_REAP_GETPIDS)): {message}"
+
+    // Deliver `signalNum` to every root this group owns, bracketed by the pruning that makes a stale root
+    // safe: the root set is refreshed against the kernel immediately BEFORE the sweep and the targets are
+    // taken from it AFTERWARDS, and a root the kernel answers `ESRCH` for during the sweep is released
+    // there and then. Delivery is the one operation where a stale root is actually dangerous — a recycled
+    // number would aim `PROC_REAP_KILL` at a subtree this group does not own — so it is the one operation
+    // that pays for a fresh read.
+    //
+    // Note the deliberate DIFFERENCE from `ProcessGroupBackend.GracefulKillTree`, which snapshots its
+    // pgids and identity tokens up front and works from that copy for every phase (K-086). The two are not
+    // the same kind of state. There, the snapshot preserves the identity TOKEN that makes a by-number kill
+    // safe, and a concurrent teardown clearing `identities` would leave the poll unable to prove a target
+    // is still ours. Here the root set IS the target list, and a stale entry is precisely the wrong-target
+    // hazard — so re-reading it after a prune is what makes the delivery safe, not what endangers it.
+    // Re-reading can only ever NARROW the list, and only for one of two reasons: the kernel positively
+    // reported that subtree empty (nothing left to signal), or a concurrent teardown cleared the set — and
+    // that teardown is itself SIGKILLing the same tree.
+    let deliver (signalNum: int) : Native.FreeBsd.SweepOutcome =
+        readListing true |> ignore
+        let outcome = Native.FreeBsd.deliverToRoots ops signalNum (rootSnapshot ())
+
+        for drained in outcome.Drained do
+            forget drained
+
+        outcome
+
+    let deliverResult (signalNum: int) (describe: int -> string -> string) : Result<unit, ProcessError> =
+        match (deliver signalNum).Failure with
+        | None -> Ok()
+        | Some(errno, message) -> Error(ProcessError.Io(describe errno message))
+
+    // The whole-tree hard kill, shared by `KillTree` and `Signal(Signal.Kill)`. BOTH layers sweep,
+    // deliberately: the reaper kill is the one that reaches the whole tree, while the process-group sweep
+    // keeps the shared ledger's own bookkeeping (liveness pruning, the adopted-pid kills) and its honest
+    // per-pgid verdict. Doubling delivery is harmless HERE AND ONLY HERE — `SIGKILL` cannot be handled,
+    // blocked or counted, so a process the first sweep killed simply is not there for the second.
+    // `Signal(Int/Term)`, whose signal a child can observe, never does this.
+    let killWholeTree () : Result<unit, ProcessError> =
+        let reaper =
+            deliverResult (Native.Posix.signalNumber Signal.Kill) (fun errno message ->
+                $"failed to SIGKILL the process reaper's tree (procctl(PROC_REAP_KILL)): {message} (errno {errno})")
+
+        let posix = contained.KillTree()
+
+        match reaper with
+        | Error error -> Error error
+        | Ok() -> posix
+
+    new(group: ProcessGroupBackend, initialLimits: ResourceLimits) =
+        ProcessReaperBackend(group, Native.FreeBsd.native, initialLimits)
+
+    /// Internal diagnostic (the `Native.Posix.pidfdActive` convention, not public API): the subtree roots
+    /// this group currently owns. Lets a test assert the record/prune/forget lifecycle without a live tree.
+    member _.Roots = rootSnapshot ()
+
+    /// Test seam: record `pid` as a subtree root WITHOUT going through `Track`, which would also enter it
+    /// in the POSIX layer's ledger and so drag that layer's real `killpg`/`waitpid` primitives into a test
+    /// that only means to exercise the reaper half (they are libc calls, unavailable on a Windows build
+    /// host). Production always goes through `Track`; nothing here bypasses a check that path makes — this
+    /// IS the second half of `Track`, called on its own.
+    member internal _.RecordRootForTests(pid: int) = recordRoot pid
+
+    interface IContainmentBackend with
+        member _.Mechanism = Mechanism.ProcessReaper
+
+        member _.Spawn(command) = contained.Spawn command
+
+        member _.Track(spawned) =
+            // Track through the POSIX ledger FIRST (it owns the child's wait/reap and its identity token),
+            // then record the same pid as a reaper subtree root. There is no fallible step between the two,
+            // so the window in which a child exists but belongs to no subtree is the same instruction-wide
+            // one the spawn's own guard already covers.
+            match contained.Track spawned with
+            | Error error -> Error error
+            | Ok() ->
+                match contained.PidOf spawned with
+                | Some pid -> recordRoot pid
+                | None -> ()
+
+                Ok()
+
+        member _.Adopt(pid) =
+            // The reaper contains this process's own DESCENDANTS; a foreign process is not one, and no
+            // `PROC_REAP_*` call can make it one. `PROC_REAP_ACQUIRE` deliberately does not even re-attach
+            // children this process forked BEFORE it ran ("we do not reattach existing children"), which is
+            // the sharpest statement of that boundary. So this verb is exactly as impossible here as on the
+            // POSIX process group underneath, and is refused by it — never a root recorded for a subtree
+            // that names nothing, which teardown would then believe it had contained.
+            contained.Adopt pid
+
+        member _.AdoptByPid(pid) =
+            // Delegated verbatim, and the reaper does not change the answer: it is a MEMBERSHIP mechanism
+            // for this process's own descendants, not an identity mechanism for an arbitrary number. A
+            // process an outside supervisor started is not a descendant at all, so no `PROC_REAP_*` call of
+            // ours reaches it; what would be left is the POSIX layer tracking a bare number with no
+            // start-time token behind it, which is precisely what it refuses to do (FreeBSD ships no
+            // start-time reader this library can verify).
+            contained.AdoptByPid pid
+
+        member _.Release(spawned) =
+            // The POSIX ledger stops tracking a reaped child; the reaper root deliberately does NOT go with
+            // it. A root is released only on the kernel's own positive answer that its subtree is empty
+            // (the ordinary prune, or an `ESRCH` from a delivery) — dropping it here would forget the
+            // subtree at exactly the moment a `setsid` escapee under it stops being reachable any other way.
+            contained.Release spawned
+
+        member _.Wait(handle) = contained.Wait handle
+        member _.PidOf(spawned) = contained.PidOf spawned
+
+        member _.KillChild(spawned) =
+            // This one child's whole SUBTREE, which is what "its own containment unit" means on this
+            // mechanism — `setsid` escapees included, where the POSIX layer's `killpg` would miss them. The
+            // POSIX kill still runs behind it: it is identity-gated, it prunes the tracked ledger, and it is
+            // the layer that reaps. A doubled `SIGKILL` is invisible to the target (see `killWholeTree`).
+            match contained.PidOf spawned with
+            | Some pid -> ops.SignalSubtree pid (Native.Posix.signalNumber Signal.Kill) |> ignore
+            | None -> ()
+
+            contained.KillChild spawned
+
+        member _.KillTree() = killWholeTree ()
+
+        member _.GracefulKillTree (signal) (grace) =
+            let signalNum = Native.Posix.signalNumber signal
+
+            // Every phase reads the LIVE root set rather than a copy snapshotted up front, which is the
+            // deliberate difference from `ProcessGroupBackend.GracefulKillTree` — see `deliver`'s own
+            // comment for why the two kinds of state pull in opposite directions here. The poll still runs
+            // OFF the group's lifecycle lock; what a concurrent teardown can do to this set is remove
+            // roots, and every phase fails safe on that: a delivery signals fewer subtrees (the teardown
+            // that removed them is SIGKILLing the same tree), and the liveness probe below can only report
+            // "drained" for a group whose roots that teardown has already killed.
+            GracefulTeardown.poll
+                (fun () ->
+                    // The soft sweep, through the reaper ONLY — never also the process-group sweep
+                    // underneath. A soft `Term`/`Int` is a signal the child OBSERVES, and delivering it
+                    // twice would make a child that treats the second request as "force quit now" skip its
+                    // own graceful path. The reaper already covers every process `killpg` would reach, plus
+                    // the escapees, each exactly once.
+                    //
+                    // `SoftDelivery.Failed` means the delivery failed for EVERY target, so it fires only
+                    // when there was an honest failure AND nothing was delivered to anyone. A vacuous sweep
+                    // (every subtree already drained, including an empty group) has neither, so it is
+                    // `Sent` — the same rule the POSIX backend applies.
+                    let outcome = deliver signalNum
+
+                    if outcome.Failure.IsSome && not outcome.AnyDelivered then
+                        SoftDelivery.Failed
+                    else
+                        SoftDelivery.Sent)
+                (fun () ->
+                    // Probe-only: this is the drain check, so it must not prune the tracked root set. An
+                    // unreadable listing NEVER guesses "drained" (that would end the grace early and hand
+                    // the tree an unearned hard kill) — it falls back to the containment still in force
+                    // underneath, the POSIX layer's own liveness answer.
+                    match readListing false with
+                    | Ok listing -> not (List.isEmpty (Native.FreeBsd.membersOf (rootPids ()) listing.Entries))
+                    | Error _ ->
+                        match contained.Members() with
+                        | Ok members -> not (List.isEmpty members)
+                        | Error _ -> true)
+                (fun () ->
+                    // The escalation: SIGKILL every subtree this group still owns — the reaper's maximum
+                    // reach — then run the POSIX layer's kill-AND-REAP over its tracked leaders. The reap
+                    // half is load-bearing, not tidiness: `ShutdownReportAsync` samples `MembersAfter` behind
+                    // this call (R-01 / K-179). The reaper's own membership already excludes zombies by
+                    // construction, so an unreaped corpse could not be counted there anyway; what the reap
+                    // prevents is our own leaders lingering as zombies after a NON-terminal graceful stop,
+                    // where nothing else would collect them until final teardown.
+                    deliver (Native.Posix.signalNumber Signal.Kill) |> ignore
+                    group.HardKillAndReapTracked())
+                grace
+
+        member _.SoftStopScope() =
+            // `PROC_REAP_KILL` reaches every process in every subtree this group owns, unconditionally and
+            // on every live membership — so this needs no native read at all. It is the STRONGEST form of
+            // `WholeTree` available on any unix: unlike the POSIX process group, whose one documented
+            // escapee is a child that `setsid`s away, nothing here escapes the tree.
+            SoftStopScope.WholeTree
+
+        member _.SignalChild(spawned, signal) =
+            let signalNum = Native.Posix.signalNumber signal
+
+            match Native.Posix.ensureDeliverable signalNum with
+            | Error error -> Error error
+            | Ok() ->
+                match contained.PidOf spawned with
+                | None -> Ok()
+                | Some pid ->
+                    // This child's whole subtree, once — the reaper's reach rather than `killpg`'s, and
+                    // deliberately NOT also the POSIX per-child delivery: an observable signal must not be
+                    // delivered twice to the same child.
+                    match ops.SignalSubtree pid signalNum with
+                    | Native.FreeBsd.SubtreeDelivery.Delivered
+                    | Native.FreeBsd.SubtreeDelivery.SubtreeGone -> Ok()
+                    | Native.FreeBsd.SubtreeDelivery.DeliveryFailed(errno, message, firstFailingPid) ->
+                        if Native.FreeBsd.isHonestFailure ops errno firstFailingPid then
+                            Error(
+                                ProcessError.Io
+                                    $"failed to deliver signal {signalNum} to this run's subtree (procctl(PROC_REAP_KILL)): {message} (errno {errno})"
+                            )
+                        else
+                            // An `EPERM` against a target that is not a positively live member is the
+                            // "already dead" case every unix backend here keeps as a best-effort success.
+                            Ok()
+
+        member _.Members() =
+            // The WHOLE TREE, not just the tracked group leaders: every live descendant of every child this
+            // group started, read from the kernel's own reaper listing. This is the headline difference from
+            // the POSIX process group, which can only report the leaders it tracks and is blind to anything
+            // that `setsid`ed away. Zombies are excluded — a member that has exited is not a member — which
+            // is also what keeps a membership read taken right after a kill honest.
+            match readMembers true with
+            | Ok members -> Ok members
+            | Error message -> Error(membershipError message)
+
+        member _.Signal(signal) =
+            let signalNum = Native.Posix.signalNumber signal
+
+            // Refuse a non-deliverable number (signal 0 — a liveness probe — or a negative) at the API
+            // boundary, before any delivery, so a probe can never masquerade as a delivered signal. It is
+            // also what keeps this backend clear of `PROC_REAP_KILL`'s own refusal of any number below 1
+            // (`EINVAL`): such a request never reaches the kernel here.
+            match Native.Posix.ensureDeliverable signalNum with
+            | Error error -> Error error
+            | Ok() ->
+                match signal with
+                | Signal.Kill -> killWholeTree ()
+                | _ ->
+                    deliverResult signalNum (fun errno message ->
+                        $"failed to deliver signal {signalNum} to the process reaper's tree (procctl(PROC_REAP_KILL)): {message} (errno {errno})")
+
+        member _.Suspend() =
+            deliverResult Native.Posix.suspendSignalNumber (fun errno message ->
+                $"failed to suspend the process reaper's tree (procctl(PROC_REAP_KILL)): {message} (errno {errno})")
+
+        member _.Resume() =
+            deliverResult Native.Posix.resumeSignalNumber (fun errno message ->
+                $"failed to resume the process reaper's tree (procctl(PROC_REAP_KILL)): {message} (errno {errno})")
+
+        member _.Stats() =
+            // The active count is the WHOLE tree — the exact process count a cgroup or a Job Object would
+            // report, not the POSIX backend's live-leader tally. Every MEASUREMENT stays absent, and the
+            // reaper changes nothing about that: it is a containment relationship, not a container, and
+            // carries no CPU/memory accumulator, no I/O counter, and no peak record at all. Reporting the
+            // one thing it genuinely knows — who is in the tree right now — and leaving the rest `None` is
+            // the honest answer; zeroes would not be.
+            match readMembers true with
+            | Ok members -> Ok(ProcessGroupStats(List.length members, None, None, None, None))
+            | Error message -> Error(membershipError message)
+
+        member _.MemberStats() =
+            // Membership from the reaper (the whole tree), metrics from the shared POSIX reader — which on
+            // FreeBSD honestly reports a member with every metric absent: there is no `/proc` here by
+            // default and this port carries no `sysctl(KERN_PROC)` reader, so a CPU/memory figure would have
+            // to be invented. A member that vanished between the enumeration and its read is omitted rather
+            // than fabricated, exactly as on the other POSIX backends.
+            match readMembers true with
+            | Ok members -> Ok(members |> List.choose Native.Posix.readMemberStats)
+            | Error message -> Error(membershipError message)
+
+        member _.UpdateLimits(limits) =
+            // A reaper accounts for nothing (see `Stats`), so there is no whole-tree cap to update — the
+            // exact reason `ProcessGroup.Create` already refuses to build a limited group on this mechanism.
+            // Refuse the update the same honest, typed way rather than pretending to have applied caps no
+            // kernel container is enforcing, and never through an `RLIMIT_*` surrogate: a per-process rlimit
+            // bounds each process separately and is not a whole-tree cap, so presenting one as the answer
+            // here would be exactly the silent downgrade this library rules out. The classification mirrors
+            // the POSIX process group's, because the reasons are the same class of reason: `Unsupported`
+            // where the concept has no counterpart on this platform at all, `ResourceLimit` where the cap
+            // exists as a concept but nothing here can enforce it.
+            if limits.CpuTimeMax <> initialLimits.CpuTimeMax then
+                Error(
+                    ProcessError.ResourceLimit
+                        "CPU-time is applied with RLIMIT_CPU before each child exec and cannot be changed for processes already running; create a new group for a different CpuTimeMax"
+                )
+            elif limits.OomGroupKill then
+                Error(
+                    ProcessError.Unsupported "whole-tree OOM kill requires a Linux cgroup v2 memory.oom.group mechanism"
+                )
+            elif limits.IoMax.IsSome then
+                Error(
+                    ProcessError.Unsupported
+                        "whole-tree disk I/O rate limits require Linux cgroup v2 io.max or a Windows Job Object I/O rate controller"
+                )
+            elif not limits.WholeTreeAny then
+                Ok()
+            else
+                match limits.UiRestrictionsUnsupported with
+                | Some error -> Error error
+                | None ->
+                    Error(
+                        ProcessError.ResourceLimit
+                            "the FreeBSD process reaper contains a whole tree but accounts for nothing in it, so it has no whole-tree resource-limit primitive to update (needs a Windows Job Object or Linux cgroup v2)"
+                    )
+
+        member _.LimitEvidence(_capped: CappedAxes) : LimitEvidence =
+            // No whole-tree accounting means no post-mortem counters either, so every axis is `Unknown`
+            // UNCONDITIONALLY — deliberately ignoring `capped`, exactly as the POSIX process group does and
+            // for the same reason. `Unknown` here means "there is no evidence apparatus on this mechanism at
+            // all", never "a cap may have fired unseen": this mechanism refuses to carry a cap in the first
+            // place.
+            LimitEvidence(LimitVerdict.Unknown, LimitVerdict.Unknown, LimitVerdict.Unknown)
+
+        member _.HardRelease() =
+            // The order matters, and it is the reverse of the layering. First the reaper's own SIGKILL,
+            // whose reach is the whole tree including anything that `setsid`ed out of every process group
+            // this backend knows about. Then a BOUNDED drain: an orphan the reaper inherited becomes a
+            // zombie OF THIS PROCESS when it dies, and after this call there is no later reaper read to
+            // sweep it — so this is the one moment that must wait for the corpses it just created (see
+            // `Native.FreeBsd.DrainBudget` for why the wait is bounded and why only teardown pays it).
+            // Finally the POSIX layer's own teardown, which kills and REAPS our own tracked leaders (the
+            // reaper cannot: `waitpid` is the ledger's job) and clears both of its ledgers.
+            deliver (Native.Posix.signalNumber Signal.Kill) |> ignore
+
+            Native.FreeBsd.drainDeadUsing
+                (fun () ->
+                    let stopwatch = Stopwatch.StartNew()
+                    fun () -> stopwatch.Elapsed)
+                (fun duration -> System.Threading.Thread.Sleep duration)
+                (fun () -> readListing true)
+                rootPids
+                Native.FreeBsd.DrainBudget
+
+            contained.HardRelease()
+
+            // The roots are dropped only now, after the kill, the drain and the POSIX teardown have all run:
+            // until then each one is this group's only handle on a `setsid` escapee under it, and a set
+            // cleared early would put such a process beyond every sweep this backend owns.
+            lock sync (fun () -> items.Clear())

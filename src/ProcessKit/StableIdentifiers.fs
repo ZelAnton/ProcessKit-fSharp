@@ -23,6 +23,9 @@ namespace ProcessKit
 ///    string `RlimitResource.TryFromName`/`FromName` parse back and `Rlimit.ToString` renders, so it
 ///    belongs on the type a caller configures rather than in an internal dictionary the caller cannot
 ///    see.
+///  - The I/O scheduling class names (`best_effort`, …), spelled by the public `IoPriorityClass.Name`
+///    member in `IoPriority.fs`, on exactly the same terms as the rlimit resources: that string is what
+///    `IoPriorityClass.TryFromName`/`FromName` parse back and what `IoPriority.ToString` renders.
 ///
 /// Every function here is a `match` with **no wildcard arm**. Adding a case to `Outcome`, `Mechanism`,
 /// `Signal`, `ProcessError`, or `LimitVerdict` without spelling its identifier therefore fails to compile
@@ -65,6 +68,7 @@ module internal StableIdentifiers =
         | Mechanism.JobObject -> "job_object"
         | Mechanism.CgroupV2 -> "cgroup_v2"
         | Mechanism.ProcessGroup -> "process_group"
+        | Mechanism.ProcessReaper -> "process_reaper"
 
     /// A curated signal's identifier, or `None` for `Signal.Other`.
     ///

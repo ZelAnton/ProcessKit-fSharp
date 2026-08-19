@@ -40,55 +40,56 @@ The files currently compile in this exact order. The headings are architectural 
 26. `Timeouts.fs` — timeout normalization.
 27. `Backoff.fs` — exponential-backoff and jitter math for retries and supervision.
 28. `Priority.fs` — priority model and native mapping.
-29. `LineTerminator.fs` — line-ending rules.
-30. `RotatingFileSink.fs` — size-rotating tee sink for long-lived logs.
-31. `Command.fs` — immutable command configuration and builder API.
-32. `MemberInfo.fs` — per-member identity snapshot of a contained tree.
-33. `ReportJson.fs` — write-only JSON projection of results, stats, run profiles, and member snapshots.
-34. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
+29. `IoPriority.fs` — Linux I/O-scheduling class/level model and its `ioprio_set(2)` encoding.
+30. `LineTerminator.fs` — line-ending rules.
+31. `RotatingFileSink.fs` — size-rotating tee sink for long-lived logs.
+32. `Command.fs` — immutable command configuration and builder API.
+33. `MemberInfo.fs` — per-member identity snapshot of a contained tree.
+34. `ReportJson.fs` — write-only JSON projection of results, stats, run profiles, and member snapshots.
+35. `DetachedProcess.fs` — pid + start-time descriptor of a launch made outside containment.
 
 ### Native and platform layer
 
-35. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
-36. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, console code page, limits, and accounting calls.
-37. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
-38. `ProcessLookup.fs` — standalone identity-safe lookup and reuse-safe liveness for a bare pid held outside any group, over the two per-pid readers above.
-39. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
-40. `Capabilities.fs` — containment mechanism selection and the three-valued capability snapshot probed from it.
-41. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
+36. `Native.Common.fs` — shared spawned-process representation and signal-delivery result.
+37. `Native.Windows.fs` — Win32 process, pipe, Job Object, console-control, console code page, limits, and accounting calls.
+38. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
+39. `ProcessLookup.fs` — standalone identity-safe lookup and reuse-safe liveness for a bare pid held outside any group, over the two per-pid readers above.
+40. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
+41. `Capabilities.fs` — containment mechanism selection and the three-valued capability snapshot probed from it.
+42. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
 
 ### Backend, pump, and channels
 
-42. `Backend.fs` — containment interface and its three implementations.
-43. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
-44. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
-45. `ProcessStdin.fs` — interactive stdin handle.
-46. `ReadinessProbe.fs` — readiness polling.
-47. `RunningHost.fs` — the spawned-host contract a live handle is built from.
-48. `ConsumptionGate.fs` — consumption-claim state machine and terminal-wait ledger of one handle.
-49. `RunTerminal.fs` — one handle's shared terminal waits, bounds, tokens, and teardown.
-50. `ExpectWindow.fs` — bounded expect window and ANSI filtering for interactive sessions.
-51. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
-52. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
-53. `RunningProcess.fs` — the public live-handle facade over the six files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
+43. `Backend.fs` — containment interface and its three implementations.
+44. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
+45. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
+46. `ProcessStdin.fs` — interactive stdin handle.
+47. `ReadinessProbe.fs` — readiness polling.
+48. `RunningHost.fs` — the spawned-host contract a live handle is built from.
+49. `ConsumptionGate.fs` — consumption-claim state machine and terminal-wait ledger of one handle.
+50. `RunTerminal.fs` — one handle's shared terminal waits, bounds, tokens, and teardown.
+51. `ExpectWindow.fs` — bounded expect window and ANSI filtering for interactive sessions.
+52. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
+53. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
+54. `RunningProcess.fs` — the public live-handle facade over the six files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
 
 ### Runner and verbs
 
-54. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
-55. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
-56. `PtySession.fs` — expect-style interaction over a live handle.
-57. `IProcessRunner.fs` — injectable runner seam.
-58. `Runner.fs` — capture primitives and reusable verbs.
-59. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
-60. `DelegatingProcessRunner.fs` — runner decorator base.
-61. `ProcessGroup.fs` — containment owner and shared-group runner.
-62. `JobRunner.fs` — default private-group runner.
-63. `CommandVerbs.fs` — default-runner `Command` extensions.
-64. `PipelineRunner.fs` — internal pipeline execution.
-65. `Pipeline.fs` — pipeline public API.
-66. `Supervisor.fs` — restart supervision.
-67. `CliClient.fs` — configured command client.
-68. `Exec.fs` — concise execution entry points.
+55. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
+56. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
+57. `PtySession.fs` — expect-style interaction over a live handle.
+58. `IProcessRunner.fs` — injectable runner seam.
+59. `Runner.fs` — capture primitives and reusable verbs.
+60. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
+61. `DelegatingProcessRunner.fs` — runner decorator base.
+62. `ProcessGroup.fs` — containment owner and shared-group runner.
+63. `JobRunner.fs` — default private-group runner.
+64. `CommandVerbs.fs` — default-runner `Command` extensions.
+65. `PipelineRunner.fs` — internal pipeline execution.
+66. `Pipeline.fs` — pipeline public API.
+67. `Supervisor.fs` — restart supervision.
+68. `CliClient.fs` — configured command client.
+69. `Exec.fs` — concise execution entry points.
 
 When adding a file, place it after everything it consumes and before everything that consumes it. Alphabetical sorting or SDK globbing would silently destroy this ordering model.
 
@@ -200,9 +201,9 @@ The current interface has 22 abstract members:
 
 `TrackedChildren<'T>` serializes `Add`, `Remove`, `Snapshot`, and `Drain` behind one lock. `Drain` is essential during teardown: it atomically transfers ownership of every recorded child to the teardown path. A mere snapshot would allow a racing cleanup to act twice on a recycled PID or handle.
 
-`GracefulTeardown.poll` supplies the graceful-stop shape shared by all three backends: post the soft stop (reporting its `SoftDelivery` fate — `Sent`/`Unsupported`/`Failed`), poll with each delay bounded by the lesser of 50 ms and the remaining grace budget until empty or the grace period expires, then force-kill survivors, returning a `GracefulOutcome` (soft-signal fate, drained-within-grace, escalated) rather than a bare `Task` (T-384). POSIX/cgroup delivery uses the command or group's configured `StopSignal` (default `Signal.Term`); Windows posts `WM_CLOSE` to members' top-level windows for its default soft phase. The poll-then-unconditional-hard-kill escalation is otherwise identical. `PosixReap.leader` pairs `killpg` with `waitpid`; killing a process group does not reap the direct child that ProcessKit owns.
+`GracefulTeardown.poll` supplies the graceful-stop shape shared by all four backends: post the soft stop (reporting its `SoftDelivery` fate — `Sent`/`Unsupported`/`Failed`), poll with each delay bounded by the lesser of 50 ms and the remaining grace budget until empty or the grace period expires, then force-kill survivors, returning a `GracefulOutcome` (soft-signal fate, drained-within-grace, escalated) rather than a bare `Task` (T-384). POSIX/cgroup delivery uses the command or group's configured `StopSignal` (default `Signal.Term`); Windows posts `WM_CLOSE` to members' top-level windows for its default soft phase. The poll-then-unconditional-hard-kill escalation is otherwise identical. `PosixReap.leader` pairs `killpg` with `waitpid`; killing a process group does not reap the direct child that ProcessKit owns.
 
-The implementation is split across four files. `Native.Windows.fs`, `Native.Posix.fs`, and `Native.Cgroup.fs` provide the OS-specific operations; `Backend.fs` composes them into `JobObjectBackend`, `ProcessGroupBackend`, and `CgroupBackend`, respectively, behind `IContainmentBackend`.
+The implementation is split across five files. `Native.Windows.fs`, `Native.Posix.fs`, `Native.Cgroup.fs`, and `Native.FreeBSD.fs` provide the OS-specific operations; `Backend.fs` composes them into `JobObjectBackend`, `ProcessGroupBackend`, `CgroupBackend`, and `ProcessReaperBackend`, respectively, behind `IContainmentBackend`. The fourth is the one that is not a peer of the others: `ProcessReaperBackend` wraps `ProcessGroupBackend` rather than replacing it (see below).
 
 ### Windows Job Object
 
@@ -226,7 +227,7 @@ Tracked process handles pin PID identity until release, preventing a stored cons
 
 ### POSIX process groups
 
-`ProcessGroupBackend` is used on macOS/BSD and on Linux when whole-tree limits are not requested. Every `posix_spawn` child becomes leader of its own process group (`pgid = pid`); one ProcessKit group may therefore track several pgids. `killpg` reaches descendants that remain in each group. Signals, `SIGSTOP`, and `SIGCONT` are broadcast per tracked pgid. Tracking records each leader's start-time identity so a recycled pgid is never signalled; graceful shutdown snapshots both the pgids and those identity tokens before its off-lock configured-soft-signal → poll → `SIGKILL` sequence, preserving that guard if concurrent teardown removes the live tracking entry. One liveness + identity choke (`Native.Posix.trackedTarget`) answers *where* every operation goes rather than only whether the target is still ours, because a `Command.Pty` child is not yet a process-group leader when its spawn returns — its `setsid --ctty` helper calls `setsid()` after `exec`, so `killpg(pid, 0)` reports `ESRCH` for that window. An `ESRCH` from the group probe alone is therefore not proof the child is gone: the exact pid is probed too, and while it is still our identity-matched child the pgid stays tracked and the operation reaches that pid. Because the verdict is probed a moment *before* the delivery, the child may win the race to `setsid()` in between, so the delivery still considers the group as well: a hard kill in that window SIGKILLs the pid **and** sweeps `killpg` behind it (so a subtree forked in between cannot be orphaned by a teardown that erases the record immediately afterwards), while an observable signal tries the group first and falls back to the pid only on its `ESRCH`, so nothing is ever signalled twice. A group numbered `pid` can only be created by the process `pid` itself, which the probe just proved is our own live, identity-matched child, so that sweep cannot reach a stranger. Once the group exists every delivery goes back through `killpg` so the whole subtree is reached.
+`ProcessGroupBackend` is used on macOS and the BSDs other than FreeBSD, on Linux when whole-tree limits are not requested, and underneath the FreeBSD reaper backend (see below). Every `posix_spawn` child becomes leader of its own process group (`pgid = pid`); one ProcessKit group may therefore track several pgids. `killpg` reaches descendants that remain in each group. Signals, `SIGSTOP`, and `SIGCONT` are broadcast per tracked pgid. Tracking records each leader's start-time identity so a recycled pgid is never signalled; graceful shutdown snapshots both the pgids and those identity tokens before its off-lock configured-soft-signal → poll → `SIGKILL` sequence, preserving that guard if concurrent teardown removes the live tracking entry. One liveness + identity choke (`Native.Posix.trackedTarget`) answers *where* every operation goes rather than only whether the target is still ours, because a `Command.Pty` child is not yet a process-group leader when its spawn returns — its `setsid --ctty` helper calls `setsid()` after `exec`, so `killpg(pid, 0)` reports `ESRCH` for that window. An `ESRCH` from the group probe alone is therefore not proof the child is gone: the exact pid is probed too, and while it is still our identity-matched child the pgid stays tracked and the operation reaches that pid. Because the verdict is probed a moment *before* the delivery, the child may win the race to `setsid()` in between, so the delivery still considers the group as well: a hard kill in that window SIGKILLs the pid **and** sweeps `killpg` behind it (so a subtree forked in between cannot be orphaned by a teardown that erases the record immediately afterwards), while an observable signal tries the group first and falls back to the pid only on its `ESRCH`, so nothing is ever signalled twice. A group numbered `pid` can only be created by the process `pid` itself, which the probe just proved is our own live, identity-matched child, so that sweep cannot reach a stranger. Once the group exists every delivery goes back through `killpg` so the whole subtree is reached.
 
 Three things drop the entry, not two: `ESRCH` from **both** probes, a positive recycle proof, and a live pid whose start-time token is missing or unreadable on either side. The exact-pid route accepts nothing weaker than a known, matching token on both sides — never a bare pid number — so it cannot widen the recycled-target window it sits inside; the price of that strictness is the third case, where a host that cannot read an identity at all keeps the pre-`setsid()` window's old behaviour and drops a live child from tracking. That is deliberate and fail-closed: delivering on the strength of a bare number would be the wrong-target kill itself.
 
@@ -237,6 +238,20 @@ A CPU-time-only limit also uses this backend and wraps each spawn with `RLIMIT_C
 `Native.Posix` maintains a process-wide pending-wait registry keyed by PID. Linux 5.4+ registers per-child pidfds with one shared epoll reaper, while macOS registers `EVFILT_PROC` / `NOTE_EXIT` filters with one shared kqueue reaper. Older Linux and other POSIX hosts lazily install one managed `SIGCHLD` registration whose handler performs non-blocking `waitpid(..., WNOHANG)` scans. Every path resolves the exact pending-wait generation once; `reapLeader` uses a short bounded non-blocking retry loop for teardown, avoiding a permanently blocked teardown thread if a child is stuck in uninterruptible kernel sleep.
 
 The fallback has no kernel tree resource limits and its `Stats` can report only live group count, not CPU or memory. Reaping a leader does not prove its backgrounded group is empty, so `Release` retains the pgid while group members remain.
+
+### FreeBSD process reaper
+
+`ProcessReaperBackend` is selected on FreeBSD for a limit-free group, and it is the only backend that *layers over* another rather than standing beside it: it holds a `ProcessGroupBackend` and delegates `Spawn`/`Track`/`Wait`/`PidOf`/`Release`/`Adopt`/`AdoptByPid` to it verbatim. That split is not incidental. Starting and REAPING a child needs a spawn primitive, an exit-status channel, and the knowledge of which processes are ours to `waitpid` — none of which the reaper has. What the reaper adds is exactly the whole-tree half: membership from `PROC_REAP_GETPIDS` instead of the tracked leaders, and delivery through `PROC_REAP_KILL` instead of `killpg`.
+
+`Native.FreeBSD.fs` mirrors the four `procctl(2)` reaper structs from `<sys/procctl.h>` and reads/writes them through explicit byte offsets into an unmanaged buffer, the same style `Native.Posix` uses for macOS's `proc_pidinfo`; `ReaperAbiTests` pins every size and offset. Everything above the four syscalls is pure and driven through an injected `ReaperOps` seam (`Descendants`/`SignalSubtree`/`ReapZombie`), so membership, root pruning, the zombie sweep's selection rule, the `EPERM` discrimination, the listing's growth/truncation loop, and the backend's verb wiring are all exercised from any build host — the same seam convention `GracefulTeardown.pollUsing` and `CgroupMemberStats.sample` follow, and the reason a backend whose native path runs only on FreeBSD is reviewable elsewhere.
+
+Reaper status is a property of the **process**, not of a container object, so it is acquired once (lazily, in `ProcessGroup.Create`) and never released — several live groups share one reaper tree, and the application may hold the status already (`EBUSY`, treated as success and confirmed by reading `PROC_REAP_STATUS` back rather than inferred from the return code). Each group is scoped by the kernel's own subtree tag instead: every process this one forks roots a subtree named by its own pid, and every descendant carries that pid in `pi_subtree` for life — fixed at fork and never rewritten, which is what makes it, and *not* the kernel's `REAPER_PIDINFO_CHILD` flag, the reliable "did we fork this ourselves?" test. `ProcessReaperBackend` records the pids it tracked as roots and addresses only those subtrees, so one group can never enumerate or kill another's tree.
+
+A root is released only on the kernel's own positive answer that nothing is left under it — an empty descendant listing, or an `ESRCH` from `PROC_REAP_KILL` — never because its process group drained or a child was `Release`d. That asymmetry with `ProcessGroupBackend` is the point: a pgid empties at exactly the moment a `setsid` escapee stops being reachable through `killpg`, which is the moment the reaper is the only thing that can still reach into that subtree. Prompt pruning is also this platform's *whole* recycled-number defence, since `Native.Posix.readProcessIdentity` has no reader on the BSDs, so it runs at every point that could make a root stale or act on one: each `Track`, each membership read, immediately before each delivery sweep (targets are taken from the root set **after** that prune, not before), and throughout the teardown drain. Two things deliberately never prune — a listing the kernel truncated, which proves nothing about the roots it did not reach, and a root stamped at or after the sequence mark taken *before* the listing, which a concurrent `Track` recorded and the listing could not have contained.
+
+Being the reaper is an obligation as well as a capability: an orphaned descendant re-parents onto this process instead of `init`, so when it exits it becomes a zombie *of this process* and nothing else will `wait` for it. `sweepStrayZombies` discharges that on every reaper read, and only for entries with `pi_subtree <> pi_pid` — never for a process this one forked, whose exit status belongs to the run verb waiting on it (K-016). Teardown adds a short bounded drain (100 ms in 2 ms polls, the same ceiling the cgroup backend's `cgroup.procs` drain uses) because it is the one moment after which no later read will come; the verbs reachable from async code deliberately do not drain at all. The escalation of a graceful stop pairs the reaper's whole-subtree `SIGKILL` with `ProcessGroupBackend.HardKillAndReapTracked()`, because only the POSIX ledger knows which of the killed processes are ours to reap.
+
+A reaper accounts for nothing, so `UpdateLimits` refuses a whole-tree cap with the same typed error the process group gives (never an `RLIMIT_*` surrogate presented as a whole-tree cap), `LimitEvidence` is `Unknown` on every axis unconditionally, and `MemberStats` reports each member with no metrics — FreeBSD has no `/proc` by default and this port carries no `sysctl(KERN_PROC)` reader. `Adopt`/`AdoptByPid` stay refused by the delegate: the reaper contains this process's own descendants, and `PROC_REAP_ACQUIRE` does not re-attach even children forked before it.
 
 ### Linux cgroup v2
 

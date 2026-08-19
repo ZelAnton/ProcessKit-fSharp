@@ -674,3 +674,69 @@ jobs:
           name: interleaving-test-results
           path: ./TestResults/*.trx
           if-no-files-found: ignore
+
+  # FreeBSD process-reaper smoke (Mechanism.ProcessReaper, src/ProcessKit/Native.FreeBSD.fs). This is the
+  # only place the reaper's four procctl(2) syscalls execute at all: everything ABOVE them — the ABI
+  # decoding, membership, root pruning, the zombie sweep's selection rule, the EPERM discrimination, the
+  # listing growth/truncation loop, and the backend's verb wiring — is driven through an injected seam by
+  # tests/ProcessKit.Tests/FreeBsdReaperTests.fs, which is hermetic and therefore already runs on every
+  # leg of the `test` matrix above. What this leg adds is the kernel's own behaviour behind those calls.
+  #
+  # It is ADVISORY and manual, and the reason is a hard blocker rather than a preference: this repository
+  # pins a .NET 10 SDK in global.json (rollForward: latestFeature), and .NET has no official FreeBSD
+  # support — FreeBSD's own `dotnet` port lags well behind that band, so a FreeBSD runner usually cannot
+  # even restore this solution. Making that a required leg would mean a permanently red gate that says
+  # nothing about the code. So the job runs only on `workflow_dispatch`, probes for an SDK that actually
+  # satisfies global.json, and reports honestly when the host cannot supply one instead of failing or, worse,
+  # silently passing as if the reaper had been exercised. When FreeBSD's port reaches the pinned band this
+  # becomes a real leg by deleting the guard.
+  freebsd-reaper-smoke:
+    name: FreeBSD reaper smoke (advisory)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Deliberately tag-pinned, unlike every other action in this workflow: a commit SHA is a claim
+      # about upstream that has to be verified against the upstream repository before it is written
+      # down, and writing an unverified one down would be worse than a tag. This leg is manual-only
+      # and advisory, so an unpinned third-party action never runs on a PR or a push. Pin it to a
+      # verified SHA at the same time the guard below is removed.
+      - name: Exercise the procctl reaper backend in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.2'
+          usesh: true
+          copyback: false
+          prepare: pkg install -y dotnet || true
+          run: |
+            set -e
+            if ! command -v dotnet >/dev/null 2>&1; then
+              echo "SKIPPED: this FreeBSD image has no dotnet package."
+              echo "The reaper backend was NOT executed here; its hermetic tests still ran on every"
+              echo "other CI leg. See the comment above this job in .github/workflows/ci.yml."
+              exit 0
+            fi
+            dotnet --info || true
+            # global.json pins the SDK band; a lower one makes every dotnet command in this repo fail
+            # with "compatible SDK not found", which is a fact about the port, not about this change.
+            if ! dotnet --list-sdks | awk -F. '{ print $1 }' | grep -qx 10; then
+              echo "SKIPPED: no .NET 10 SDK on this FreeBSD host (global.json pins 10.0.300+)."
+              echo "Installed SDKs:"
+              dotnet --list-sdks
+              exit 0
+            fi
+            dotnet build --configuration Release -p:TargetFrameworks=net10.0
+            # The reaper's own suite plus the real containment/control probes that exercise it end to
+            # end: a whole tree torn down, a setsid escapee, whole-tree signals, the graceful shutdown
+            # tiers, and the capability snapshot's agreement with the group actually created here.
+            filter='FullyQualifiedName~FreeBsdReaper'
+            filter="$filter|FullyQualifiedName~ReaperAbiTests"
+            filter="$filter|FullyQualifiedName~ContainmentBugTests"
+            filter="$filter|FullyQualifiedName~MemberInfoTests"
+            filter="$filter|FullyQualifiedName~ProcessControlTests"
+            filter="$filter|FullyQualifiedName~ShutdownTests"
+            filter="$filter|FullyQualifiedName~CapabilityTests"
+            dotnet test --no-build --configuration Release --framework net10.0 \
+              tests/ProcessKit.Tests/ProcessKit.Tests.fsproj --filter "$filter"

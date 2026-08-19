@@ -39,6 +39,7 @@
 		<Compile Include="ReportJsonTests.fs" />
 		<Compile Include="IdentifiersManifestTests.fs" />
 		<Compile Include="LimitsTests.fs" />
+		<Compile Include="IoPriorityTests.fs" />
 		<Compile Include="CapabilityTests.fs" />
 		<Compile Include="CassetteTests.fs" />
 		<Compile Include="CassetteRobustnessTests.fs" />
@@ -48,6 +49,7 @@
 		<Compile Include="ContainmentBugTests.fs" />
 		<Compile Include="PosixSpawnCleanupTests.fs" />
 		<Compile Include="PosixIdentityReuseTests.fs" />
+		<Compile Include="FreeBsdReaperTests.fs" />
 		<Compile Include="MergeStderrTests.fs" />
 		<Compile Include="RedirectToFileTests.fs" />
 		<Compile Include="PtyTests.fs" />
