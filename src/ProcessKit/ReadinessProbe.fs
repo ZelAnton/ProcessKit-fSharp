@@ -109,8 +109,9 @@ module internal ReadinessProbe =
             min remaining pollBackoff
 
     /// The single polling/deadline core every readiness probe funnels through: the HTTP
-    /// (`waitForHttpUsing`), port (`waitForPortUsing`), Unix domain socket (`waitForSocketUsing`), path
-    /// (`waitForPathUsing`), and custom (`waitFor`) probes each express their per-attempt check as a
+    /// (`waitForHttpUsing`), port (`waitForPortUsing`), Unix domain socket (`waitForSocketUsing`),
+    /// Windows named pipe (`waitForNamedPipeUsing`), path (`waitForPathUsing`), and custom (`waitFor`)
+    /// probes each express their per-attempt check as a
     /// `probe: CancellationToken -> Task<bool>` (true = ready) and hand it here, so the deadline
     /// mechanics live in exactly one place instead of being hand-synchronised across copies. Polls
     /// `probe` until it returns true, or fails with `NotReady` once the shared

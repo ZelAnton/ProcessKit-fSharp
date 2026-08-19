@@ -591,9 +591,9 @@ is launched, and normal supervision teardown still runs.
 
 ## Waiting for a child to be ready
 
-"Start a server, then use it" needs the server to be *ready*, not merely started. Six probes —
-a stdout line, a TCP port, a Unix socket, an HTTP endpoint, a filesystem path, or any async
-predicate of your own — replace the arbitrary sleep:
+"Start a server, then use it" needs the server to be *ready*, not merely started. Seven probes —
+a stdout line, a TCP port, a Unix socket, a Windows named pipe, an HTTP endpoint, a filesystem
+path, or any async predicate of your own — replace the arbitrary sleep:
 
 **F#**
 

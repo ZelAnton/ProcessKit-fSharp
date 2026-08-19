@@ -284,7 +284,8 @@ type ProcessError =
     | Cancelled of Program: string
 
     /// A readiness probe (`WaitForLineAsync` / `WaitForPortAsync` / `WaitForSocketAsync` /
-    /// `WaitForHttpAsync` / `WaitForPathAsync` / `WaitForAsync`) did not succeed within its timeout.
+    /// `WaitForNamedPipeAsync` / `WaitForHttpAsync` / `WaitForPathAsync` / `WaitForAsync`) did not
+    /// succeed within its timeout.
     | NotReady of Program: string * Timeout: TimeSpan
 
     /// Parsing the captured output into a typed value failed.

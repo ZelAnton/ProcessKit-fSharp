@@ -656,12 +656,18 @@ module internal Windows =
     /// `ERROR_PATH_NOT_FOUND`) — genuinely absent, distinguishable from `Ready`'s busy case rather than
     /// folded into it.
     ///
-    /// `OpenFailed`: any other `CreateFileW` failure (access denied, a malformed name, …) — classified
-    /// explicitly by its own `Win32Error` rather than silently collapsed into `Missing`. Both `Missing`
-    /// and `OpenFailed` currently keep the caller's readiness poll going (only `Ready` stops it, exactly
-    /// like every other probe's "any failure just means not ready yet" rule — see
-    /// `ReadinessProbe.waitForSocketUsing`), but a genuinely different failure is never MISCLASSIFIED as
-    /// "not created yet": the distinct `Win32Error` stays available to a caller/diagnostic that needs it.
+    /// `OpenFailed`: any other `CreateFileW` failure (access denied, a malformed name, …) — kept as its
+    /// own case (carrying the `Win32Error`) rather than silently folded into `Missing`, so nothing
+    /// INSIDE this classification step confuses "genuinely different failure" with "not created yet".
+    /// That distinction is internal only, though: `probeNamedPipe` below (the boolean seam every
+    /// `ReadinessProbe` probe closure shares) does not expose it outward, and neither does
+    /// `RunningProcess.WaitForNamedPipeAsync` — both `Missing` and `OpenFailed` keep the caller's
+    /// readiness poll going exactly like every other probe's "any failure just means not ready yet"
+    /// rule (see `ReadinessProbe.waitForSocketUsing`), and the `Win32Error` an `OpenFailed` carries is
+    /// not surfaced to a caller or a diagnostic. `NamedPipeProbeOutcome` exists to keep `Ready`'s
+    /// busy-counts-as-ready case honest against `Missing`, not to publish an open-failure taxonomy —
+    /// mirrors the source Rust crate's `named_pipe_is_ready`, which folds every non-busy failure into
+    /// the same "not ready" boolean.
     [<RequireQualifiedAccess; NoComparison>]
     type internal NamedPipeProbeOutcome =
         | Ready
@@ -681,8 +687,13 @@ module internal Windows =
 
     /// One client-side `CreateFileW` attempt at `pipeName` with the given `access` mask, closing the
     /// handle again immediately on success — this is a readiness PROBE, never a connection the caller
-    /// keeps open. `FILE_SHARE_RW` matches every other short-lived open in this file (`inheritableNul`,
-    /// `inheritableFile`), so the probe itself can never block the eventual real client's own open.
+    /// keeps open, and the handle is held only as long as it takes to classify and close it again.
+    /// `FILE_SHARE_RW` matches every other short-lived open in this file (`inheritableNul`,
+    /// `inheritableFile`); it controls whether OTHER opens of the same file/pipe object may share it
+    /// concurrently and has no bearing on named-pipe instance availability, which the server (not the
+    /// share mode) governs. A successful open here IS a real client connection from the server's point
+    /// of view — see `RunningProcess.WaitForNamedPipeAsync`'s doc for what that means for a
+    /// single-instance server racing a real client against this probe.
     let private openNamedPipeOnce (pipeName: string) (access: uint32) : NamedPipeProbeOutcome =
         let handle =
             CreateFileW(pipeName, access, FILE_SHARE_RW, IntPtr.Zero, OPEN_EXISTING, 0u, IntPtr.Zero)

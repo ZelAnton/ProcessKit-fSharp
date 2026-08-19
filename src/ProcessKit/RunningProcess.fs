@@ -1694,8 +1694,15 @@ type RunningProcess
     /// `\\server\pipe\my-service`). `ERROR_PIPE_BUSY` counts as ready: it proves a server created the
     /// pipe even though every instance is currently serving another client, which genuinely differs
     /// from the pipe not existing at all — the latter keeps polling until `pipeName`'s server creates
-    /// it or the deadline elapses. A readiness probe never claims a connection of its own: each poll
-    /// opens, classifies, and immediately closes the pipe handle again.
+    /// it or the deadline elapses. Each poll is a real, if momentary, client connection: a successful
+    /// `CreateFileW` is indistinguishable from any other client's open, so the server sees an accepted
+    /// connection that immediately disconnects again once the poll closes the handle (this is what the
+    /// test `WaitForNamedPipe connects to a listening named pipe` observes from the server side, and it
+    /// matches the source Rust crate's `named_pipe_is_ready`, which opens and drops a client the same
+    /// way). For a single-instance server this can briefly leave the pipe genuinely busy for a real
+    /// client racing the same poll, until the probe closes its handle and the server re-posts its
+    /// listen; a multi-instance server is unaffected. This is never a connection the caller keeps open
+    /// or that the caller can observe directly — only its side effect on the server's own accept state.
     ///
     /// This probe is available only on Windows: requires the host to support Windows named pipes
     /// (`RuntimeInformation.IsOSPlatform OSPlatform.Windows`); on any other platform this returns
