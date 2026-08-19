@@ -660,6 +660,12 @@ of `SupervisionOutcome.Restarts`), and `HealthCheckFailed.IsTerminal` separates 
 tripped, the ordinary policy decides what happens next" (`false`) from "the probe itself failed and
 supervision is ending" (`true`).
 
+The `Name` identifiers above and the `FailureKind` values (a `ProcessError`'s own case identifier:
+`not_found`, `resource_limit`, …) are published in the generated dictionary `spec/identifiers.json`, so
+a log pipeline or a port in another language reads them from one file instead of this table — see
+[Stable identifiers](jsonl-reports.md#stable-identifiers). Both sets are additive: a new kind or error
+case appends a name, and a name that has shipped is never renamed.
+
 **Bounded, and honest about it.** A supervisor must never pace itself against its observer, so the
 stream does **not** apply backpressure. The session retains at most `capacity` unread events; a
 consumer that keeps up loses nothing, and one that falls behind (or never reads) makes the supervisor

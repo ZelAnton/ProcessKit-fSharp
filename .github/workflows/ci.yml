@@ -248,11 +248,13 @@ jobs:
         run: dotnet build --no-restore --configuration Release
 
       # The committed spec/identifiers.json is the language-neutral form of the same stable names the
-      # F# unions carry, and sibling implementations and conformance harnesses read it instead of
-      # copying strings out of the docs. IdentifiersManifestTests rebuilds it from the live union cases
-      # (reflection over the cases, identifiers from ProcessKit's own StableIdentifiers functions) and
-      # compares text, so a variant added or an identifier respelled without regenerating the manifest
-      # fails here. Run as its own named step, and only on the Linux leg: the full Test step below would
+      # F# types carry, and sibling implementations and conformance harnesses read it instead of
+      # copying strings out of the docs. IdentifiersManifestTests rebuilds it from the live cases
+      # (reflection over the cases, identifiers from the library's own naming functions — the same ones
+      # the emitting code calls) and compares text, so a variant added or an identifier respelled
+      # without regenerating the manifest fails here. This step is also the completeness guard for
+      # SupervisionEventKind, which the compiler cannot give: an F# match over a .NET enum needs a
+      # wildcard arm, so a kind added without a name fails this test rather than the build. Run as its own named step, and only on the Linux leg: the full Test step below would
       # also catch it, but a dedicated fast gate names the contract that broke instead of burying it in
       # a matrix-wide test log. The filter is a space-free substring on purpose (the vstest filter
       # parser rejects unescaped spaces).

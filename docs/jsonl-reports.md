@@ -53,29 +53,50 @@ Example: a run whose exit code `3` is in its own accepted-code set, as one line 
 
 ## Stable identifiers
 
-The `kind` names above are not the only stable strings ProcessKit publishes, and none of them are
-meant to be transcribed out of this page by hand. The canonical list lives in the repository as
-`spec/identifiers.json` — a generated, machine readable dictionary of every stable identifier, in the
-same shape as the ProcessKit-rs crate's own `spec/identifiers.json`, so a sibling implementation, a
-conformance test, or a log pipeline can read one file instead of scraping documentation:
+The `kind` names above are not the only stable strings ProcessKit publishes, and the ones that name a
+case of a type are not meant to be transcribed out of this page by hand. Those live in the repository as
+`spec/identifiers.json` — a generated, machine readable dictionary of ProcessKit's **enum vocabularies**,
+in the same shape as the ProcessKit-rs crate's own `spec/identifiers.json`, so a sibling implementation,
+a conformance test, or a log pipeline can read one file instead of scraping documentation:
 
 ```json
 { "path": "ProcessKit.Outcome", "class": "report_only",
   "variants": [ { "variant": "Exited", "identifier": "exited" } ] }
 ```
 
-Four types are published today: `Mechanism` and `Signal` (`class: "configurable"` — values a caller
-supplies) and `Outcome` and `ProcessError` (`class: "report_only"` — values ProcessKit reports).
+Six types are published today:
+
+| Type | `class` | Where the identifier is used |
+|---|---|---|
+| `Mechanism` | `configurable` | a name for the case in a configuration file, a log field, or another language's port; the .NET API takes the value itself, so ProcessKit neither writes nor parses this string |
+| `Signal` | `configurable` | the same |
+| `Outcome` | `report_only` | an outcome object's `kind`, above |
+| `ProcessError` | `report_only` | `SupervisionEvent.FailureKind` |
+| `LimitVerdict` | `report_only` | each axis of a `limit_evidence` line, above |
+| `SupervisionEventKind` | `report_only` | `SupervisionEvent.Name` |
+
 `Signal.Other` is deliberately absent: it carries a raw signal number, whose meaning is the number
 itself rather than a name this library could publish.
 
+Two kinds of stable string are deliberately **not** in the file, because neither names an enum case:
+
+- **The report envelope tags** — `process_result`, `process_group_stats`, `run_profile`, `member_info`,
+  `limit_evidence`. Each names one *shape* of report line rather than a case of a type; they belong to
+  this schema, are listed in [The schema](#the-schema) above, and are frozen on the same terms.
+- **The `processkit.outcome` span and metric labels**, an older set with its own spelling of
+  `Outcome.TimedOut` (`timedout`, not `timed_out`); see [Observability](observability.md#tracing).
+
 Two properties make the file worth pinning:
 
-- **It is generated from the live types, and cannot go stale.** Every identifier is read from the
-  library function that also spells the `kind` this serializer writes, and the variant list is
-  enumerated from the union cases themselves. Adding a case without an identifier fails the build;
-  adding one without regenerating the file fails the test that rebuilds it and compares text, which
-  CI runs as its own step.
+- **It is generated from the live types, and cannot go stale.** No identifier is copied into the file:
+  each is read from the library's own naming function for that type, and the variant list is enumerated
+  from the live cases themselves. For the four types ProcessKit does emit as text, that is the very
+  function the emitting code calls — so the `kind` this serializer writes, a `FailureKind`, an event
+  `Name`, and the dictionary entry cannot disagree, and a test ties each published identifier back to
+  the string a consumer actually receives. Adding a union case without an identifier fails the build.
+  Adding a `SupervisionEventKind` fails the manifest test instead, since F# requires a wildcard arm when
+  matching a .NET enum and the compiler therefore cannot refuse it. Adding any case without regenerating
+  the file fails the test that rebuilds it and compares text, which CI runs as its own step.
 - **Identifiers are additive and frozen.** A new variant appends an entry. An identifier that has
   shipped is never renamed, respelled, or reused for a different variant — that is what makes it safe
   for a reader in another language to key on, and it is the same promise the field names in the

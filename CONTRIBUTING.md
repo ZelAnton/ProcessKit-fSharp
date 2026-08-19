@@ -91,14 +91,17 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
   `*.approved.txt`. An unreviewed API change fails the build.
 - **The stable identifiers are locked too.** [`spec/identifiers.json`](spec/identifiers.json)
   is the machine readable dictionary of the wire names for `Mechanism`, `Signal`,
-  `Outcome`, and `ProcessError`. It is generated, never hand edited:
-  `IdentifiersManifestTests` rebuilds it from the live union cases and fails on any
-  difference. Adding a union case to one of those four types is a compile error until
-  it is named in `src/ProcessKit/StableIdentifiers.fs`; after naming it, run the tests
-  and copy the generated `identifiers.received.json` (written next to the test
-  assembly) over `spec/identifiers.json`. **New identifiers are appended; a shipped
-  one is never renamed or reused** — readers in other languages pin these strings, so
-  a rename breaks them even when the .NET API is untouched.
+  `Outcome`, `ProcessError`, `LimitVerdict`, and `SupervisionEventKind`. It is
+  generated, never hand edited: `IdentifiersManifestTests` rebuilds it from the live
+  cases and fails on any difference. Adding a case to one of the five unions is a
+  compile error until it is named in `src/ProcessKit/StableIdentifiers.fs`; adding a
+  `SupervisionEventKind` compiles (F# enum matches carry a wildcard arm) but fails that
+  test until it is named in `SupervisionEventPayload.eventName`, next to the events
+  that carry it. Name it in the one place the emitting code already reads — never in a
+  second list — then run the tests and copy the generated `identifiers.received.json`
+  (written next to the test assembly) over `spec/identifiers.json`. **New identifiers
+  are appended; a shipped one is never renamed or reused** — readers in other languages
+  pin these strings, so a rename breaks them even when the .NET API is untouched.
 
 ## API reference site
 

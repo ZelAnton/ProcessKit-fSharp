@@ -1,17 +1,30 @@
 namespace ProcessKit
 
-/// The one place a union case's **stable machine identifier** is spelled — the short, lower snake case
-/// name a report line, a structured log field, or a sibling implementation in another language uses to
-/// refer to that case without depending on .NET's own `.ToString()` rendering or on a union tag ordinal.
+/// Where a union case's **stable machine identifier** is spelled — the short, lower snake case name a
+/// report line, a structured log field, or a sibling implementation in another language uses to refer to
+/// that case without depending on .NET's own `.ToString()` rendering or on a union tag ordinal.
 ///
-/// Every function below is a `match` with **no wildcard arm**. Adding a case to `Outcome`, `Mechanism`,
-/// `Signal`, or `ProcessError` without spelling its identifier here therefore fails to compile
+/// **An identifier is spelled exactly once, and the code that emits it reads that spelling rather than
+/// repeating it.** `ReportJson` writes an `Outcome`'s identifier as its `"kind"` and each `LimitEvidence`
+/// axis from `limitVerdict`; `SupervisionEvent.FailureKind` is `processError` applied to the failure it
+/// reports. So the dictionary a reader in another language pins and the strings this library actually
+/// emits are one vocabulary rather than two copies of one, and a respelling cannot be made in half the
+/// places.
+///
+/// One vocabulary is deliberately **not** here: the supervision event names (`incarnation_started`, …)
+/// are spelled by `SupervisionEventPayload.eventName`, next to the events that carry them, because
+/// `SupervisionEventKind` is declared long after this file in compile order. That function is the single
+/// spelling of those names on exactly the same terms, and `SupervisionEvent.Name` and the generator
+/// below both read it.
+///
+/// Every function here is a `match` with **no wildcard arm**. Adding a case to `Outcome`, `Mechanism`,
+/// `Signal`, `ProcessError`, or `LimitVerdict` without spelling its identifier therefore fails to compile
 /// (incomplete matches are warnings, and this repository builds with `TreatWarningsAsErrors`), so the
 /// dictionary cannot fall behind the type it claims to describe. The companion machine readable
 /// dictionary `spec/identifiers.json` is generated from these very functions by
-/// `tests/ProcessKit.Tests/IdentifiersManifestTests.fs`, which enumerates the union cases by reflection
-/// rather than from a second hand written list: a case that is added and named here but forgotten there
-/// is impossible, and a stale committed manifest fails that test.
+/// `tests/ProcessKit.Tests/IdentifiersManifestTests.fs`, which enumerates the cases by reflection rather
+/// than from a second hand written list: a case that is added and named here but forgotten there is
+/// impossible, and a stale committed manifest fails that test.
 ///
 /// **Stability invariant (load bearing).** An identifier that has shipped is frozen: it is never
 /// renamed, respelled, or reused for a different case. A new case gets a new identifier appended to the
@@ -63,9 +76,10 @@ module internal StableIdentifiers =
         | Signal.Usr2 -> Some "usr2"
         | Signal.Other _ -> None
 
-    /// Which failure a `ProcessError` is, as a stable identifier — the case, never its fields. A
-    /// consumer that classifies failures across languages keys on this; the human readable
-    /// `ProcessError.Message` is for logs and is free to be reworded.
+    /// Which failure a `ProcessError` is, as a stable identifier — the case, never its fields. This is
+    /// the string `SupervisionEvent.FailureKind` carries, the one path by which a failure's class
+    /// leaves this library as text; the human readable `ProcessError.Message` is for logs and is free to
+    /// be reworded.
     let processError (value: ProcessError) : string =
         match value with
         | ProcessError.Spawn _ -> "spawn"
@@ -87,3 +101,13 @@ module internal StableIdentifiers =
         | ProcessError.CassetteMiss _ -> "cassette_miss"
         | ProcessError.Io _ -> "io"
         | ProcessError.Unsupported _ -> "unsupported"
+
+    /// Whether a resource cap engaged, as a stable identifier — the same string `ReportJson` writes for
+    /// each axis of a `limit_evidence` line, so that wire form and the dictionary cannot disagree.
+    /// `not_tripped` and `unknown` stay distinct here for the reason they are distinct on the type: "the
+    /// cap did not fire" and "nothing authoritative to read" are different answers.
+    let limitVerdict (value: LimitVerdict) : string =
+        match value with
+        | LimitVerdict.Tripped -> "tripped"
+        | LimitVerdict.NotTripped -> "not_tripped"
+        | LimitVerdict.Unknown -> "unknown"

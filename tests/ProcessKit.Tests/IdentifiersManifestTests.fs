@@ -9,23 +9,28 @@ open FSharp.Reflection
 open NUnit.Framework
 open ProcessKit
 
-/// Rebuilds the committed `spec/identifiers.json` dictionary from the **live** union cases of
-/// `Mechanism`, `Signal`, `Outcome`, and `ProcessError`.
+/// Rebuilds the committed `spec/identifiers.json` dictionary from the **live** cases of `Mechanism`,
+/// `Signal`, `Outcome`, `ProcessError`, `LimitVerdict`, and `SupervisionEventKind`.
 ///
 /// Two independent guards keep the dictionary and the types in step, and neither can be satisfied by
 /// editing a list maintained by hand:
 ///
-///  1. **The names come from the library.** Every identifier is read from `StableIdentifiers`, whose
-///     functions are wildcard free matches over the four unions. A case added without an identifier
-///     fails the library build (warnings are errors), so it cannot reach this generator unnamed — and
-///     `ReportJson` reads an `Outcome`'s identifier from the same function, so the report wire form and
-///     this dictionary are one vocabulary rather than two copies of one.
+///  1. **The names come from the library.** Every identifier is read from the same function the library
+///     itself emits that name through: `StableIdentifiers` for the five unions (wildcard free matches, so
+///     a case added without an identifier fails the library build, warnings being errors) and
+///     `SupervisionEventPayload.eventName` for the supervision event kinds. Nothing in this file spells
+///     a wire name, so the dictionary and what ProcessKit emits are one vocabulary rather than two
+///     copies of one: `ReportJson` writes an `Outcome`'s and a `LimitEvidence` axis's identifier from
+///     those functions, `SupervisionEvent.FailureKind` is a `ProcessError`'s, and `SupervisionEvent.Name`
+///     is a kind's — each tied back to this dictionary by a test below.
 ///  2. **The case list comes from reflection.** The variants of each type are enumerated with
-///     `FSharpType.GetUnionCases`, not from a list kept here, so a newly added case is picked up
-///     automatically and immediately makes the generated text differ from the committed file — which is
-///     what the drift test below fails on. A generator carrying its own copy of the case list is
-///     precisely how a manifest and its generator go stale together and keep a drift test green while
-///     comparing two equally stale artifacts.
+///     `FSharpType.GetUnionCases` (or `Enum.GetValues` for the one enum), not from a list kept here, so a
+///     newly added case is picked up automatically and immediately makes the generated text differ from
+///     the committed file — which is what the drift test below fails on. A generator carrying its own
+///     copy of the case list is precisely how a manifest and its generator go stale together and keep a
+///     drift test green while comparing two equally stale artifacts. It is also the completeness guard
+///     for `SupervisionEventKind`, where the compiler cannot be one: F# requires a wildcard arm when
+///     matching a .NET enum, so a kind added without a name reaches this generator and fails here.
 ///
 /// A case's fields never reach the manifest: a representative value is built only so that a naming
 /// function can be applied to it, and only the case *name* and its identifier are written out.
@@ -46,9 +51,9 @@ module internal IdentifiersManifest =
     /// opens it without this test file at hand.
     [<Literal>]
     let private Maintenance =
-        "Canonical dictionary of ProcessKit's stable machine identifiers, generated from the live union cases by tests/ProcessKit.Tests/IdentifiersManifestTests.fs; never edited by hand. A shipped identifier is frozen: new variants are appended, existing ones are never renamed or reused. Update docs/jsonl-reports.md together with this file."
+        "Canonical dictionary of ProcessKit's stable machine identifiers, generated from the live union cases and enum values by tests/ProcessKit.Tests/IdentifiersManifestTests.fs; never edited by hand. A shipped identifier is frozen: new variants are appended, existing ones are never renamed or reused. Update docs/jsonl-reports.md together with this file."
 
-    /// One dictionary entry: a union type, how a consumer meets it, and how one of its values is named.
+    /// One dictionary entry: a type, how a consumer meets it, and how one of its values is named.
     type private EnumSpec =
         {
             /// The type's F# path, the cross language counterpart of the Rust crate's `processkit::Name`.
@@ -59,7 +64,7 @@ module internal IdentifiersManifest =
             /// crate's own `spec/identifiers.json`.
             Class: string
 
-            /// The union type whose cases are enumerated.
+            /// The union or enum type whose cases are enumerated.
             Type: Type
 
             /// The case's stable identifier, or `None` for a case deliberately left out of the
@@ -103,17 +108,36 @@ module internal IdentifiersManifest =
                     $"IdentifiersManifest has no representative value for the field type '{fieldType.FullName}'; add one so that the new union case can be named."
             )
 
-    /// Every case of `unionType`, in declaration order, as `(case name, representative value)`.
-    let caseValues (unionType: Type) : (string * objnull)[] =
-        FSharpType.GetUnionCases unionType
-        |> Array.map (fun case ->
-            let fields =
-                case.GetFields() |> Array.map (fun field -> representative field.PropertyType)
+    /// Every case of `vocabularyType`, in declaration order, as `(case name, representative value)`.
+    ///
+    /// A union case is constructed from representative field values; an enum value is itself, so
+    /// `SupervisionEventKind` needs no representative machinery. Enum values come back ordered by their
+    /// underlying number, which is declaration order for an enum whose cases are numbered in the order
+    /// they are written — the discipline `SupervisionEventKind` documents on itself.
+    let caseValues (vocabularyType: Type) : (string * objnull)[] =
+        if vocabularyType.IsEnum then
+            Enum.GetValues vocabularyType
+            |> Seq.cast<obj>
+            |> Seq.map (fun value ->
+                match Enum.GetName(vocabularyType, value) with
+                | null ->
+                    raise (
+                        NotSupportedException
+                            $"'{vocabularyType.FullName}' has an unnamed value; the manifest publishes named cases only."
+                    )
+                | name -> name, (value: objnull))
+            |> Seq.toArray
+        else
+            FSharpType.GetUnionCases vocabularyType
+            |> Array.map (fun case ->
+                let fields =
+                    case.GetFields() |> Array.map (fun field -> representative field.PropertyType)
 
-            case.Name, FSharpValue.MakeUnion(case, fields))
+                case.Name, FSharpValue.MakeUnion(case, fields))
 
-    /// The dictionary, in manifest order: the two types a caller configures first, then the two
-    /// ProcessKit reports. This matches how the Rust crate's manifest groups the same four types.
+    /// The dictionary, in manifest order: the two types a caller configures first, then the four
+    /// ProcessKit reports. This matches how the Rust crate's manifest groups the same vocabularies.
+    /// A type is appended, never inserted, so the entries a reader already parsed keep their positions.
     let private dictionary: EnumSpec list =
         [ { Path = "ProcessKit.Mechanism"
             Class = "configurable"
@@ -130,7 +154,15 @@ module internal IdentifiersManifest =
           { Path = "ProcessKit.ProcessError"
             Class = "report_only"
             Type = typeof<ProcessError>
-            Identifier = fun value -> Some(StableIdentifiers.processError (unbox<ProcessError> value)) } ]
+            Identifier = fun value -> Some(StableIdentifiers.processError (unbox<ProcessError> value)) }
+          { Path = "ProcessKit.LimitVerdict"
+            Class = "report_only"
+            Type = typeof<LimitVerdict>
+            Identifier = fun value -> Some(StableIdentifiers.limitVerdict (unbox<LimitVerdict> value)) }
+          { Path = "ProcessKit.SupervisionEventKind"
+            Class = "report_only"
+            Type = typeof<SupervisionEventKind>
+            Identifier = fun value -> Some(SupervisionEventPayload.eventName (unbox<SupervisionEventKind> value)) } ]
 
     /// The `(path, class, [| variant, identifier |])` rows the manifest publishes — the structure the
     /// text below renders, and what the structural assertions read.
@@ -213,10 +245,10 @@ module internal IdentifiersManifest =
 [<TestFixture>]
 type IdentifiersManifestTests() =
 
-    /// The identifiers already published for each of the four types, spelled out here rather than read
-    /// back from the code that produced them. Renaming a shipped identifier breaks every consumer that
-    /// pinned it, so this list is the mechanical form of that promise: a new variant appends a line, and
-    /// a rename fails here until somebody deliberately edits the expectation.
+    /// The identifiers already published for each type, spelled out here rather than read back from the
+    /// code that produced them. Renaming a shipped identifier breaks every consumer that pinned it, so
+    /// this list is the mechanical form of that promise: a new variant appends a line, and a rename
+    /// fails here until somebody deliberately edits the expectation.
     static let published =
         [ "ProcessKit.Mechanism", [ "JobObject=job_object"; "CgroupV2=cgroup_v2"; "ProcessGroup=process_group" ]
           "ProcessKit.Signal",
@@ -251,7 +283,19 @@ type IdentifiersManifestTests() =
             "Adopt=adopt"
             "CassetteMiss=cassette_miss"
             "Io=io"
-            "Unsupported=unsupported" ] ]
+            "Unsupported=unsupported" ]
+          "ProcessKit.LimitVerdict", [ "Tripped=tripped"; "NotTripped=not_tripped"; "Unknown=unknown" ]
+          "ProcessKit.SupervisionEventKind",
+          [ "IncarnationStarted=incarnation_started"
+            "IncarnationFinished=incarnation_finished"
+            "IncarnationFailed=incarnation_failed"
+            "RestartScheduled=restart_scheduled"
+            "StormPaused=storm_paused"
+            "HealthCheckFailed=health_check_failed"
+            "GaveUp=gave_up"
+            "Stopped=stopped"
+            "SupervisionFailed=supervision_failed"
+            "EventsDropped=events_dropped" ] ]
 
     /// A JSON string property, with the `string | null` the BCL declares narrowed to a plain string —
     /// every string this document carries is written by the generator and is never null.
@@ -267,6 +311,16 @@ type IdentifiersManifestTests() =
         |> Seq.map (fun property -> property.Name)
         |> Seq.sort
         |> String.concat ","
+
+    /// The `case name -> identifier` map the dictionary publishes for one type, for the tests that tie a
+    /// published identifier to the string the library actually emits.
+    static let identifiersOf (path: string) : Map<string, string> =
+        IdentifiersManifest.rows ()
+        |> List.pick (fun (candidate, _, variants) ->
+            if candidate = path then
+                Some(Map.ofArray variants)
+            else
+                None)
 
     static let enumsOf (document: JsonDocument) =
         document.RootElement.GetProperty("enums").EnumerateArray() |> Seq.toList
@@ -313,7 +367,7 @@ type IdentifiersManifestTests() =
             )
 
     /// The cross language consumer's view: the generated document is valid JSON and still publishes the
-    /// exact wire names each of the four types shipped with.
+    /// exact wire names each type shipped with.
     [<Test>]
     member _.``The generated manifest parses and publishes the expected wire names``() =
         use document = JsonDocument.Parse(IdentifiersManifest.generate ())
@@ -339,8 +393,8 @@ type IdentifiersManifestTests() =
             Assert.That(byPath.ContainsKey path, Is.True)
             Assert.That(byPath[path], Is.EqualTo(String.concat ", " expected))
 
-    /// The classes are the ones the Rust crate uses for the same four types, so a conformance harness can
-    /// read either manifest with one rule.
+    /// The classes are the ones the Rust crate uses for the same vocabularies, so a conformance harness
+    /// can read either manifest with one rule.
     [<Test>]
     member _.``Each type is classified as configurable or report only``() =
         use document = JsonDocument.Parse(IdentifiersManifest.generate ())
@@ -354,6 +408,8 @@ type IdentifiersManifestTests() =
         Assert.That(classes["ProcessKit.Signal"], Is.EqualTo "configurable")
         Assert.That(classes["ProcessKit.Outcome"], Is.EqualTo "report_only")
         Assert.That(classes["ProcessKit.ProcessError"], Is.EqualTo "report_only")
+        Assert.That(classes["ProcessKit.LimitVerdict"], Is.EqualTo "report_only")
+        Assert.That(classes["ProcessKit.SupervisionEventKind"], Is.EqualTo "report_only")
 
     /// Paths are unique across the dictionary, and identifiers are unique and lower snake case within
     /// each type — a duplicate would make the dictionary ambiguous for the consumers that key on it.
@@ -416,13 +472,7 @@ type IdentifiersManifestTests() =
     /// the moment it exists rather than when somebody remembers to extend a list here.
     [<Test>]
     member _.``Every Outcome identifier is the kind ReportJson writes``() =
-        let outcomeIdentifiers =
-            IdentifiersManifest.rows ()
-            |> List.pick (fun (path, _, variants) ->
-                if path = "ProcessKit.Outcome" then
-                    Some(Map.ofArray variants)
-                else
-                    None)
+        let outcomeIdentifiers = identifiersOf "ProcessKit.Outcome"
 
         for name, value in IdentifiersManifest.caseValues typeof<Outcome> do
             let outcome = unbox<Outcome> value
@@ -431,6 +481,52 @@ type IdentifiersManifestTests() =
                 JsonDocument.Parse(JsonSerializer.Serialize(outcome, ReportJson.OutcomeTypeInfo))
 
             Assert.That(document.RootElement.GetProperty("kind").GetString(), Is.EqualTo outcomeIdentifiers[name])
+
+    /// The same tie for `LimitVerdict`: every axis of a `limit_evidence` line is written as the exact
+    /// identifier the manifest publishes for that verdict. All three axes are checked, so a converter
+    /// that spelled one of them by hand would fail here rather than pass on the other two.
+    [<Test>]
+    member _.``Every LimitVerdict identifier is the verdict ReportJson writes``() =
+        let verdictIdentifiers = identifiersOf "ProcessKit.LimitVerdict"
+
+        for name, value in IdentifiersManifest.caseValues typeof<LimitVerdict> do
+            let verdict = unbox<LimitVerdict> value
+
+            use document =
+                JsonDocument.Parse(LimitEvidence(verdict, verdict, verdict).ToReportJson())
+
+            for axis in [ "memory"; "processes"; "cpu" ] do
+                Assert.That(document.RootElement.GetProperty(axis).GetString(), Is.EqualTo verdictIdentifiers[name])
+
+    /// The tie for `ProcessError`: the identifier the manifest publishes is the string a consumer
+    /// actually receives, on the one path by which a failure's class leaves the library as text —
+    /// `SupervisionEvent.FailureKind`. This is what makes the dictionary a description of what
+    /// ProcessKit emits rather than of a naming function nothing reads.
+    [<Test>]
+    member _.``Every ProcessError identifier is the FailureKind a supervision event carries``() =
+        let errorIdentifiers = identifiersOf "ProcessKit.ProcessError"
+
+        for name, value in IdentifiersManifest.caseValues typeof<ProcessError> do
+            let error = unbox<ProcessError> value
+            let failed = SupervisionEvent.IncarnationFailed("tool", 1, error)
+            let terminal = SupervisionEvent.SupervisionFailed("tool", error)
+
+            Assert.That(failed.FailureKind, Is.EqualTo(Some errorIdentifiers[name]))
+            Assert.That(terminal.FailureKind, Is.EqualTo(Some errorIdentifiers[name]))
+
+    /// The tie for `SupervisionEventKind`: the identifier the manifest publishes for a kind is the
+    /// `SupervisionEvent.Name` an event of that kind carries. Enumerated over the live enum values, so a
+    /// kind added without a name fails here — the guard the compiler cannot give an enum match.
+    [<Test>]
+    member _.``Every SupervisionEventKind identifier is the Name an event carries``() =
+        let kindIdentifiers = identifiersOf "ProcessKit.SupervisionEventKind"
+
+        for name, value in IdentifiersManifest.caseValues typeof<SupervisionEventKind> do
+            let kind = unbox<SupervisionEventKind> value
+            let event = SupervisionEvent(SupervisionEventPayload.create kind "tool")
+
+            Assert.That(event.Name, Is.EqualTo kindIdentifiers[name])
+            Assert.That(event.Kind, Is.EqualTo kind)
 
     /// The rendered form the drift guard compares is the same one the structural assertions read, so a
     /// row that renders differently from what it publishes cannot pass both.

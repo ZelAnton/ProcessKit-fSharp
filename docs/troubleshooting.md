@@ -7,13 +7,17 @@ contract and platform details. Preserve the complete `ProcessError.Message` or
 `Outcome.Unobserved` reason when collecting diagnostics.
 
 A `ProcessError.Message` is written for a human and may be reworded between
-releases, so do not match on it. When a triage script or a log pipeline has to
-classify a failure or an outcome mechanically, key on the stable identifier of
-its case instead — `not_found`, `resource_limit`, `timed_out`, and the rest. The
-canonical list of those identifiers is the generated dictionary
-`spec/identifiers.json` in the repository, described under
-[Stable identifiers](jsonl-reports.md#stable-identifiers); it is the source of
-truth, and the names in it are additive and never renamed.
+releases, so do not match on it. In code, classify a failure by its case —
+pattern match the union, or read `IsNotFound` / `IsTimeout` / `IsResourceLimit`
+from C#. Where the classification has to leave the process as text, ProcessKit
+spells the case itself with a stable lower snake case identifier that is additive
+and never renamed: `SupervisionEvent.FailureKind` (`not_found`,
+`resource_limit`, …) for a supervised run's failure, `SupervisionEvent.Name` for
+the event itself, and a JSONL report line's `kind` for an `Outcome` (`timed_out`,
+…) or a `limit_evidence` axis. The canonical list of those names — for a triage
+script that keys on them, or a port in another language — is the generated
+dictionary `spec/identifiers.json` in the repository, described under
+[Stable identifiers](jsonl-reports.md#stable-identifiers).
 
 ## Mojibake or garbled captured output
 

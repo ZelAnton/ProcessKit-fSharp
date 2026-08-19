@@ -69,7 +69,8 @@ when the run started, so a run inside an HTTP request appears under that request
 These four span and metric labels are frozen as spelled here, and they are a different set from the
 report identifiers published in the generated dictionary `spec/identifiers.json` (see
 [Stable identifiers](jsonl-reports.md#stable-identifiers)), which is the source of truth whenever a
-consumer needs the identifier of an `Outcome`, a `ProcessError`, a `Mechanism`, or a `Signal`. Three of
+consumer needs the identifier of an `Outcome`, a `ProcessError`, a `Mechanism`, a `Signal`, a
+`LimitVerdict`, or a `SupervisionEventKind`. Three of
 the four labels are spelled identically in both; the one exception is `Outcome.TimedOut`, whose span and
 metric label has always been `timedout` while its report identifier is `timed_out`. Neither is being
 respelled to match the other: both shipped, and a dashboard or an alert keyed on either would break.

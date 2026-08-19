@@ -397,7 +397,6 @@ type SupervisionEventKind =
 /// instead of another argument on every construction site.
 type internal SupervisionEventPayload =
     { Kind: SupervisionEventKind
-      Name: string
       Program: string
       Attempt: int option
       Pid: int option
@@ -415,10 +414,40 @@ type internal SupervisionEventPayload =
 
 module internal SupervisionEventPayload =
 
+    /// The stable machine identifier of an event kind (`incarnation_started`, `restart_scheduled`, …) —
+    /// the single spelling of the supervision event vocabulary, read by `SupervisionEvent.Name` and by
+    /// the generator behind `spec/identifiers.json`. It lives here rather than in `StableIdentifiers`
+    /// because `SupervisionEventKind` is declared in this file, long after that one in compile order.
+    ///
+    /// A .NET enum can hold a value outside its declared cases, so F# requires the final arm even when
+    /// every declared kind is covered; that arm is unreachable for any kind this library constructs.
+    /// The completeness guard for this vocabulary is therefore not the compiler but
+    /// `IdentifiersManifestTests`, which enumerates the declared values by reflection and asks this
+    /// function for each: a kind added without a name here fails that test rather than passing silently.
+    let eventName (kind: SupervisionEventKind) : string =
+        match kind with
+        | SupervisionEventKind.IncarnationStarted -> "incarnation_started"
+        | SupervisionEventKind.IncarnationFinished -> "incarnation_finished"
+        | SupervisionEventKind.IncarnationFailed -> "incarnation_failed"
+        | SupervisionEventKind.RestartScheduled -> "restart_scheduled"
+        | SupervisionEventKind.StormPaused -> "storm_paused"
+        | SupervisionEventKind.HealthCheckFailed -> "health_check_failed"
+        | SupervisionEventKind.GaveUp -> "gave_up"
+        | SupervisionEventKind.Stopped -> "stopped"
+        | SupervisionEventKind.SupervisionFailed -> "supervision_failed"
+        | SupervisionEventKind.EventsDropped -> "events_dropped"
+        | unnamed ->
+            raise (
+                ArgumentOutOfRangeException(
+                    nameof kind,
+                    int unnamed,
+                    "SupervisionEventKind has no stable identifier for this value; name it in SupervisionEventPayload.eventName and regenerate spec/identifiers.json."
+                )
+            )
+
     /// A payload carrying only what every event carries; each factory fills in its own fields.
-    let create (kind: SupervisionEventKind) (name: string) (program: string) =
+    let create (kind: SupervisionEventKind) (program: string) =
         { Kind = kind
-          Name = name
           Program = program
           Attempt = None
           Pid = None
@@ -438,27 +467,12 @@ module internal SupervisionEventPayload =
     /// Deliberately not `ProcessError.Message` and never the error value itself: several cases carry
     /// the child's captured stdout/stderr (`Exit`/`Signalled`/`Timeout`) or a detail string built from
     /// an OS message, none of which belongs in a fan-out event stream a consumer may log wholesale.
-    let failureKind (error: ProcessError) : string =
-        match error with
-        | ProcessError.Spawn _ -> "spawn"
-        | ProcessError.NotFound _ -> "not_found"
-        | ProcessError.Exit _ -> "exit"
-        | ProcessError.Signalled _ -> "signalled"
-        | ProcessError.Timeout _ -> "timeout"
-        | ProcessError.Unobserved _ -> "unobserved"
-        | ProcessError.Cancelled _ -> "cancelled"
-        | ProcessError.NotReady _ -> "not_ready"
-        | ProcessError.Parse _ -> "parse"
-        | ProcessError.RetryPredicate _ -> "retry_predicate"
-        | ProcessError.JsonRpc _ -> "json_rpc"
-        | ProcessError.OutputTooLarge _ -> "output_too_large"
-        | ProcessError.OutputIncomplete _ -> "output_incomplete"
-        | ProcessError.Stdin _ -> "stdin"
-        | ProcessError.ResourceLimit _ -> "resource_limit"
-        | ProcessError.Adopt _ -> "adopt"
-        | ProcessError.CassetteMiss _ -> "cassette_miss"
-        | ProcessError.Io _ -> "io"
-        | ProcessError.Unsupported _ -> "unsupported"
+    ///
+    /// The identifier itself is `StableIdentifiers.processError`, the single place those names are
+    /// spelled and the source `spec/identifiers.json` is generated from — never a second copy of that
+    /// list, which nothing would keep equal to the first. This function stays as the name of the
+    /// *decision* (an event reports the class, not the error), not as a second vocabulary.
+    let failureKind (error: ProcessError) : string = StableIdentifiers.processError error
 
 /// One typed transition of a live supervision, delivered by `SupervisionSession.EventsAsync` — the
 /// stream counterpart of the `OnRestart`/`OnStormPause` callbacks and the `Status` snapshot, which it
@@ -485,8 +499,10 @@ type SupervisionEvent internal (payload: SupervisionEventPayload) =
 
     /// This event's stable machine identifier (`incarnation_started`, `restart_scheduled`, …): the
     /// same information as `Kind`, in the lowercase form a structured log or metric label wants.
-    /// Existing identifiers are never renamed; a new kind gets a new one.
-    member _.Name = payload.Name
+    /// Derived from `Kind` through the one function that spells these names, so the two can never
+    /// disagree, and published in `spec/identifiers.json` for readers in other languages. Existing
+    /// identifiers are never renamed; a new kind gets a new one.
+    member _.Name = SupervisionEventPayload.eventName payload.Kind
 
     /// The supervised command's program name — on every event, so a stream merged across supervisors
     /// stays attributable.
@@ -547,14 +563,14 @@ type SupervisionEvent internal (payload: SupervisionEventPayload) =
 
     static member internal IncarnationStarted(program: string, attempt: int, pid: int option) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.IncarnationStarted "incarnation_started" program with
+            { SupervisionEventPayload.create SupervisionEventKind.IncarnationStarted program with
                 Attempt = Some attempt
                 Pid = pid }
         )
 
     static member internal IncarnationFinished(program: string, attempt: int, result: ProcessResult<string>) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.IncarnationFinished "incarnation_finished" program with
+            { SupervisionEventPayload.create SupervisionEventKind.IncarnationFinished program with
                 Attempt = Some attempt
                 Outcome = Some result.Outcome
                 Duration = Some result.Duration
@@ -563,14 +579,14 @@ type SupervisionEvent internal (payload: SupervisionEventPayload) =
 
     static member internal IncarnationFailed(program: string, attempt: int, error: ProcessError) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.IncarnationFailed "incarnation_failed" program with
+            { SupervisionEventPayload.create SupervisionEventKind.IncarnationFailed program with
                 Attempt = Some attempt
                 FailureKind = Some(SupervisionEventPayload.failureKind error) }
         )
 
     static member internal RestartScheduled(program: string, restart: int, delay: TimeSpan, cause: RestartCause) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.RestartScheduled "restart_scheduled" program with
+            { SupervisionEventPayload.create SupervisionEventKind.RestartScheduled program with
                 Restart = Some restart
                 Delay = Some delay
                 Cause = Some cause }
@@ -578,39 +594,39 @@ type SupervisionEvent internal (payload: SupervisionEventPayload) =
 
     static member internal StormPaused(program: string, stormPause: int, delay: TimeSpan) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.StormPaused "storm_paused" program with
+            { SupervisionEventPayload.create SupervisionEventKind.StormPaused program with
                 StormPause = Some stormPause
                 Delay = Some delay }
         )
 
     static member internal HealthCheckFailed(program: string, attempt: int, isTerminal: bool) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.HealthCheckFailed "health_check_failed" program with
+            { SupervisionEventPayload.create SupervisionEventKind.HealthCheckFailed program with
                 Attempt = Some attempt
                 IsTerminal = Some isTerminal }
         )
 
     static member internal GaveUp(program: string, attempt: int) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.GaveUp "gave_up" program with
+            { SupervisionEventPayload.create SupervisionEventKind.GaveUp program with
                 Attempt = Some attempt }
         )
 
     static member internal Stopped(program: string, reason: StopReason) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.Stopped "stopped" program with
+            { SupervisionEventPayload.create SupervisionEventKind.Stopped program with
                 Reason = Some reason }
         )
 
     static member internal SupervisionFailed(program: string, error: ProcessError) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.SupervisionFailed "supervision_failed" program with
+            { SupervisionEventPayload.create SupervisionEventKind.SupervisionFailed program with
                 FailureKind = Some(SupervisionEventPayload.failureKind error) }
         )
 
     static member internal EventsDropped(program: string, dropped: int64) =
         SupervisionEvent(
-            { SupervisionEventPayload.create SupervisionEventKind.EventsDropped "events_dropped" program with
+            { SupervisionEventPayload.create SupervisionEventKind.EventsDropped program with
                 DroppedEvents = Some dropped }
         )
 

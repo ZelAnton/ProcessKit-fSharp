@@ -6,11 +6,12 @@ open System.Text.Json
 open System.Text.Json.Serialization
 open System.Text.Json.Serialization.Metadata
 
-/// The write-only wire form shared by every `ReportJson` converter: how a value that has NO curated
-/// machine name (there is none of those here — `Outcome` is the only enum-shaped payload this feature
-/// serializes) would be spelled, and the one helper every converter shares, so a measurement a platform
+/// The write-only wire form shared by every `ReportJson` converter: the `Outcome` writer two report
+/// shapes embed, and the optional-metric helpers every converter shares, so a measurement a platform
 /// cannot report reaches the wire as an explicit `null` on every single field, never a silently omitted
-/// key and never a fabricated `0`.
+/// key and never a fabricated `0`. Every enum-shaped value this feature writes — an `Outcome`, a
+/// `LimitEvidence` axis's `LimitVerdict` — is spelled by its curated identifier from
+/// `StableIdentifiers`, never by a `.ToString()` rendering.
 ///
 /// Ports the shape (not the code) of ProcessKit-rs's `report_serde` feature: `Serialize`-only, one stable
 /// `"kind"` identifier per tagged shape, one time unit (`*_secs`, fractional seconds), and no captured
@@ -232,6 +233,8 @@ type internal MemberInfoJsonConverter() =
 /// Serializes a `LimitEvidence` report: one `LimitVerdict` per axis (`memory`/`processes`/`cpu`), each
 /// written as its stable machine identifier — `"tripped"` / `"not_tripped"` / `"unknown"` — never a raw
 /// union-case ordinal or a BCL `.ToString()` spelling, matching every other converter in this schema.
+/// The three names are read from `StableIdentifiers.limitVerdict`, the single place they are spelled and
+/// the same source the committed `spec/identifiers.json` dictionary is generated from.
 [<Sealed>]
 type internal LimitEvidenceJsonConverter() =
     inherit JsonConverter<LimitEvidence>()
@@ -245,17 +248,11 @@ type internal LimitEvidenceJsonConverter() =
         )
 
     override _.Write(writer: Utf8JsonWriter, value: LimitEvidence, _options: JsonSerializerOptions) : unit =
-        let verdictName (verdict: LimitVerdict) : string =
-            match verdict with
-            | LimitVerdict.Tripped -> "tripped"
-            | LimitVerdict.NotTripped -> "not_tripped"
-            | LimitVerdict.Unknown -> "unknown"
-
         writer.WriteStartObject()
         writer.WriteString("kind", "limit_evidence")
-        writer.WriteString("memory", verdictName value.Memory)
-        writer.WriteString("processes", verdictName value.Processes)
-        writer.WriteString("cpu", verdictName value.Cpu)
+        writer.WriteString("memory", StableIdentifiers.limitVerdict value.Memory)
+        writer.WriteString("processes", StableIdentifiers.limitVerdict value.Processes)
+        writer.WriteString("cpu", StableIdentifiers.limitVerdict value.Cpu)
         writer.WriteEndObject()
 
 /// AOT-safe `System.Text.Json` metadata for the opt-in JSONL report serializer: one self-describing JSON
