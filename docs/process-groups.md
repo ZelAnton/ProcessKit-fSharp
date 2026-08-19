@@ -952,6 +952,9 @@ Per-process rlimits are **Unix-only** and need util-linux's `prlimit` in a trust
 directory. Windows refuses them with `ProcessError.Unsupported` (its whole-tree Job Object
 caps above are the Windows answer); a POSIX host without the helper refuses with
 `ProcessError.ResourceLimit`. Neither ever runs the child with the caps silently dropped.
+Whether this host holds the helper is readable before any spawn: `prlimit` is one of the
+entries in [`ProcessGroup.Capabilities().Helpers`](platform-support.md#what-each-axis-answers),
+carrying the same precondition the refusal would state.
 
 ### Disk I/O rate limits
 

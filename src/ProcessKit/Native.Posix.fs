@@ -5470,6 +5470,12 @@ module internal Posix =
     /// helper's presence alone; `ptyHostSupport` is the full `Command.Pty` gate.
     let controllingTerminalHelperAvailable () : bool = (trustedHelperPath cttyHelper).IsSome
 
+    /// Whether the `prlimit` per-process resource-limit helper resolves in a trusted system directory — the
+    /// very resolution `withProcessLimits` performs, so what this reports and what a `Command.Rlimit` spawn
+    /// would really do here cannot drift apart. `false` is what turns any `Command.Rlimit` into a typed
+    /// `ProcessError.ResourceLimit` (macOS/BSD, which ship no util-linux, and minimal images).
+    let processLimitHelperAvailable () : bool = (trustedHelperPath rlimitHelper).IsSome
+
     /// Whether `/bin/sh` is present and directly executable — the interpreter the cgroup v2 self-migrating
     /// launcher, the `CpuTimeMax` (`RLIMIT_CPU`) shim, and the `KillOnParentDeath` pre-arm guard all `exec`
     /// by absolute path.

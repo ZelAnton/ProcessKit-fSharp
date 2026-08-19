@@ -42,7 +42,7 @@ the source of truth.
 | Leaked inherited secrets in `env` | `Command.EnvClear` | [Running commands](commands.md) |
 | Secrets leaking into logs/traces/fixtures | The observability + record/replay secret invariants | [Observability](observability.md), [Testing your code](testing.md#record-and-replay) |
 | Command-line injection through a Windows legacy parser | Keep data in ordinary `Arg`/`Args`; never interpolate untrusted input into `WindowsRawArg` | [Running commands](commands.md#windows-raw-command-line-fragments) |
-| A hijacked helper binary implementing the hardening itself | Automatic: `setpriv` / `setsid` / `cmd.exe` are pinned to trusted system directories, never taken from `PATH` | [Where the Unix helper binaries come from](#where-the-unix-helper-binaries-come-from) |
+| A hijacked helper binary implementing the hardening itself | Automatic: `setpriv` / `setsid` / `prlimit` / `cmd.exe` are pinned to trusted system directories, never taken from `PATH` | [Where the Unix helper binaries come from](#where-the-unix-helper-binaries-come-from) |
 
 > **Windows raw arguments bypass the safe boundary.** `Command.WindowsRawArg`
 > appends text directly to the child's Windows command line without quoting. It
@@ -181,7 +181,7 @@ assume the drop happened. Windows drops privilege a different way; see
 
 ## Where the Unix helper binaries come from
 
-Three Unix features are implemented by **executing a small helper binary** that
+Four Unix features are implemented by **executing a small helper binary** that
 does the pre-`exec` work and then `exec`s your program in place (no managed code
 may run in a forked .NET child, so this is the only safe mechanism):
 
@@ -190,6 +190,7 @@ may run in a forked .NET child, so this is the only safe mechanism):
 | `Uid` / `Gid` / `Groups` | `setpriv` (util-linux) | sets gid, uid, and the supplementary groups |
 | `KillOnParentDeath` | `setpriv --pdeathsig` (util-linux), then `/bin/sh` | arms `PR_SET_PDEATHSIG(SIGKILL)`, then checks the parent is still the process that spawned it |
 | `Pty` | `setsid --ctty` (util-linux) | new session + acquires the pty as controlling terminal |
+| `Rlimit` | `prlimit` (util-linux) | applies each requested `setrlimit(2)` soft/hard pair to itself |
 
 `KillOnParentDeath` needs the second step because `setpriv` can only arm the
 signal *inside* the child, after the spawn: a parent that dies in that moment is
@@ -208,7 +209,7 @@ thing an attacker would want to replace — and on the privilege-drop path it ru
 `setpriv` found through the calling process's `PATH` would therefore be an
 attacker-chosen program executed with the parent's full privileges.
 
-**So neither helper is ever resolved on `PATH`.** ProcessKit looks each one up
+**So no helper is ever resolved on `PATH`.** ProcessKit looks each one up
 only in a fixed list of trusted system directories — `/usr/bin`, `/bin`,
 `/usr/sbin`, `/sbin`, in that order — and launches the **absolute path** of the
 match, which means no `PATH` entry participates anywhere along the chain (`exec`
@@ -221,16 +222,18 @@ Three consequences worth knowing:
 
 - **A host with no helper in a trusted directory fails honestly**, exactly as a
   host missing the tool outright always did: `ProcessError.Spawn` naming the knob
-  that needed `setpriv`, `ProcessError.Unsupported` for `Pty`. It never falls back
+  that needed `setpriv`, `ProcessError.Unsupported` for `Pty`, and
+  `ProcessError.ResourceLimit` for a `Command.Rlimit` that has no `prlimit` to
+  apply it (the cap the child would have run without is the failure). It never falls back
   to a `PATH` copy, and it never runs your program with the hardening quietly
   skipped. The typed error is the signal — handle it as "this host cannot apply
   this measure".
 - **Non-FHS layouts are affected.** Distributions that do not install util-linux
   into those directories (NixOS, Guix, some minimal images) get that typed failure
-  even though `setpriv` is on their `PATH`. Mainstream Linux does install both
-  helpers into a trusted directory — but not always the *same* one, which is why
-  the list carries `/usr/bin` **and** `/bin`. Debian/Ubuntu and Fedora put both
-  under `/usr/bin`; Alpine's `util-linux` package puts `setsid` under `/usr/bin`
+  even though `setpriv` is on their `PATH`. Mainstream Linux does install the
+  util-linux helpers into a trusted directory — but not always the *same* one, which is why
+  the list carries `/usr/bin` **and** `/bin`. Debian/Ubuntu and Fedora put
+  `setpriv` and `setsid` under `/usr/bin`; Alpine's `util-linux` package puts `setsid` under `/usr/bin`
   and **`setpriv` under `/bin`** (verified in
   `mcr.microsoft.com/dotnet/sdk:10.0-alpine`, the image this project's own Alpine
   CI leg uses). On a merged-`/usr` host the two paths resolve to one directory, so

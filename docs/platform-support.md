@@ -142,7 +142,7 @@ says why, and the matching verb still refuses with its own typed `ProcessError`.
 | `AdoptionByPid` | `ProcessGroup.AdoptByPid` — a separate axis, because a bare pid needs an identity *anchor* rather than a relocation primitive, and the two answers differ on the POSIX process group | [Adopting an external process](#capability-matrices) |
 | `Pty` / `PtyResize` | `Command.Pty`, and `RunningProcess.ResizeAsync` on such a run | [PTY capabilities](#pseudo-terminal-pty-capabilities) |
 | `KillOnParentDeath` / `KillOnParentDeathScope` | `Command.KillOnParentDeath`, and how far its cleanup reaches | [Reaping on sudden parent death](#capability-matrices) |
-| `Helpers` | the external binaries this platform's spawn paths load (`setpriv`, `setsid`, `/bin/sh`; `cmd.exe` on Windows), what each is for, and whether this host holds it | [Caveats](#caveats) |
+| `Helpers` | the external binaries this platform's spawn paths load (`setpriv`, `setsid`, `prlimit`, `/bin/sh`; `cmd.exe` on Windows), what each is for, and whether this host holds it | [Caveats](#caveats) |
 
 Two reading rules keep the answers honest, and are worth knowing before you branch on them:
 
@@ -587,6 +587,7 @@ examples.
 | Combined with `Command.Pty` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (`setsid --ctty` has no `argv[0]` seam) |
 | Combined with a run under the Linux cgroup backend | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the `/bin/sh` migration launcher has no `argv[0]` seam) |
 | Combined with `ResourceLimits.CpuTimeMax` on the POSIX process-group mechanism | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the `/bin/sh` `RLIMIT_CPU` shim has no `argv[0]` seam) |
+| Combined with any `Command.Rlimit` value | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the util-linux `prlimit` helper has no `argv[0]` seam) |
 | Combined with a lone `Setsid` (no privilege drop) | ❌ `ProcessError.Unsupported` | ✅ composes normally (no helper involved) |
 
 `Program` alone still drives PATH/`PreferLocal` resolution, preflight, and spawn diagnostics — the
@@ -742,8 +743,9 @@ that is actually launched (multicall binaries, login-shell conventions). Windows
 (same typed error, at spawn time) when combined with a knob whose spawn path re-`exec`s the target
 by name through a helper with no seam of its own for a distinct `argv[0]`: a `Uid`/`Gid`/`Groups`/
 `KillOnParentDeath` drop (`setpriv`), `Pty` (`setsid --ctty`), a run under the Linux cgroup
-backend (the `/bin/sh` migration launcher), or a `ResourceLimits.CpuTimeMax` run on the POSIX
-process-group mechanism (the `/bin/sh` `RLIMIT_CPU` shim) — see
+backend (the `/bin/sh` migration launcher), a `ResourceLimits.CpuTimeMax` run on the POSIX
+process-group mechanism (the `/bin/sh` `RLIMIT_CPU` shim), or any `Command.Rlimit` value
+(the util-linux `prlimit` helper) — see
 [Running commands](commands.md#posix-argv0-override-arg0).
 
 **POSIX process groups: a `setsid` child can escape.** The process-group mechanism tracks each
