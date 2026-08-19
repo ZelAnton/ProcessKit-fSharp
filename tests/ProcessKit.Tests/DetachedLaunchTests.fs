@@ -323,6 +323,7 @@ type DetachedLaunchTests() =
               "TimeoutGrace", (probe ()).TimeoutGrace(TimeSpan.FromSeconds 1.0)
               "IdleTimeout", (probe ()).IdleTimeout(TimeSpan.FromSeconds 5.0)
               "CancelOn", (probe ()).CancelOn(CancellationToken.None)
+              "CancelGrace", (probe ()).CancelGrace(TimeSpan.FromSeconds 1.0)
               "Stdin", (probe ()).Stdin(Stdin.FromString "input")
               "KeepStdinOpen", (probe ()).KeepStdinOpen()
               "OnStdoutLine", (probe ()).OnStdoutLine(Action<string>(fun _ -> ()))

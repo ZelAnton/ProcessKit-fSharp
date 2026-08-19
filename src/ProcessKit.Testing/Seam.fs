@@ -26,7 +26,10 @@ module internal Seam =
             resolve command
 
     /// Run a completion verb with the same linked-token contract as a real runner. Unlike `SpawnAsync`,
-    /// completion owns the running fake and therefore kills it when either cancellation source fires.
+    /// completion owns the running fake and therefore tears it down when either cancellation source
+    /// fires — through the same `BeginCancelTeardown` seam the real runners use, so a double honours
+    /// `Command.CancelGrace`/`CancelSignal` too: a `FakeProcess` records the soft signal on its `Signals`
+    /// log exactly as it records a `StopAsync` one, and only escalates to the hard kill after the grace.
     let complete
         (resolve: Command -> Result<RunningProcess, ProcessError>)
         (consume: RunningProcess -> Task<Result<'a, ProcessError>>)
@@ -47,7 +50,7 @@ module internal Seam =
                 match resolve command with
                 | Error error -> return Error error
                 | Ok running ->
-                    use _registration = effectiveToken.Register(fun () -> running.Kill())
+                    use _registration = effectiveToken.Register(fun () -> running.BeginCancelTeardown())
                     let! result = consume running
 
                     if effectiveToken.IsCancellationRequested then

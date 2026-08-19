@@ -9,6 +9,7 @@ open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+open ProcessKit.Testing
 
 /// What a synthetic host was asked to do — asserted directly, rather than inferred from timing:
 /// `Kills` proves the single kill (never two, never one on a run that concluded on its own) and
@@ -21,6 +22,28 @@ type private HostCalls() =
     member _.Waits = Volatile.Read(&waits)
     member _.CountKill() = Interlocked.Increment(&kills) |> ignore
     member _.CountWait() = Interlocked.Increment(&waits) |> ignore
+
+/// What a synthetic host was asked to do on the CANCELLATION teardown path (T-373), asserted directly
+/// rather than inferred from timing: the soft signals it was asked to deliver, in order, and how many
+/// hard kills followed. `Signals` is empty and `Kills` is 1 for the unchanged default (no
+/// `Command.CancelGrace`); the ladder shows up as a soft signal FIRST and a kill only after the window.
+type private CancelCalls() =
+    let gate = obj ()
+    let signals = ResizeArray<Signal>()
+    let mutable kills = 0
+
+    /// The soft signals delivered, in order, rendered as a single comma-joined string (`""` for none,
+    /// `"Term"` for one). A scalar so the assertion reads as one exact expectation — which signal, how
+    /// many, in what order — instead of several weaker ones.
+    member _.SignalTrace: string =
+        lock gate (fun () -> signals |> Seq.map string |> String.concat ",")
+
+    member _.Kills = Volatile.Read(&kills)
+
+    member _.RecordSignal(signal: Signal) =
+        lock gate (fun () -> signals.Add signal)
+
+    member _.CountKill() = Interlocked.Increment(&kills) |> ignore
 
 [<TestFixture>]
 type TimeoutTests() =
@@ -213,6 +236,59 @@ type TimeoutTests() =
                 more <- next
 
             do! enumerator.DisposeAsync()
+        }
+
+    // ---- T-373 fixtures: the cancellation teardown seam, observed directly -----------------------
+
+    /// A `RunningProcess` over a synthetic host that records exactly what the cancellation teardown
+    /// asked of it. No real child: `StartKill` publishes the exit the way a killed child's status
+    /// becomes observable, and `Signal` succeeds and records, the way a live tree's soft signal does.
+    let cancelLadderProcess (config: CommandConfig) =
+        let calls = CancelCalls()
+
+        let exited =
+            TaskCompletionSource<Outcome>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let host: RunningHost =
+            { Config = config
+              Pid = None
+              Stdout = Some(new MemoryStream(Array.empty<byte>) :> Stream)
+              Stderr = Some(new MemoryStream(Array.empty<byte>) :> Stream)
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
+              Wait = fun () -> exited.Task
+              StdinError = RunningHost.NoStdinError
+              StdinFeedComplete = ignore
+              StartKill =
+                fun () ->
+                    calls.CountKill()
+                    exited.TrySetResult(Outcome.Signalled(Some 9)) |> ignore
+              Signal =
+                fun signal ->
+                    calls.RecordSignal signal
+                    Ok()
+              GracefulKill = fun _ -> Task.CompletedTask
+              ResizePty = None
+              TreeStats = None
+              Teardown = fun () -> ValueTask() }
+
+        new RunningProcess(host), calls
+
+    /// Poll `condition` until it holds or `budget` runs out. Used where the assertion is about an event
+    /// the child (or a detached escalation timer) produces asynchronously, so the test never sleeps out
+    /// a fixed worst case on a fast machine.
+    let waitUntil (budget: TimeSpan) (condition: unit -> bool) : Task<bool> =
+        task {
+            let startedAt = Stopwatch.GetTimestamp()
+            let mutable ok = condition ()
+
+            while not ok && Stopwatch.GetElapsedTime startedAt < budget do
+                do! Task.Delay 20
+                ok <- condition ()
+
+            return ok
         }
 
     [<Test>]
@@ -542,6 +618,425 @@ type TimeoutTests() =
             match! runTask with
             | Error(ProcessError.Cancelled _) -> ()
             | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task
+
+    // ---- T-373: the opt-in graceful cancellation ladder -------------------------------------------
+    //
+    // `Command.CancelGrace`/`CancelSignal` route a CANCELLATION through the same soft-signal -> grace ->
+    // hard-kill shape `TimeoutGrace`/`StopSignal` give a deadline, and are deliberately independent of
+    // them. Two invariants carry the whole feature and are asserted from both ends below — directly on
+    // the teardown seam (deterministic, no clock beyond the configured window) and end to end through a
+    // real child:
+    //
+    //   1. Unset (the default) is byte-for-byte the old behaviour: one immediate hard kill, no signal.
+    //   2. The OUTCOME never changes. A cancelled run reports `ProcessError.Cancelled` whichever rung of
+    //      the ladder ended the child — only the manner of the goodbye is gentler.
+
+    [<Test>]
+    member _.``CancelGrace and CancelSignal are unset by default and record what was configured (T-373)``() : unit =
+        let plain = Command.create "tool"
+        Assert.That(plain.Config.CancelGrace, Is.EqualTo(None: TimeSpan option))
+        Assert.That(plain.Config.CancelSignal, Is.EqualTo(None: Signal option))
+
+        // The resolved soft signal defaults to Term — the same default `StopSignal` carries.
+        Assert.That(CommandConfig.cancelSignal plain.Config, Is.EqualTo Signal.Term)
+
+        // Instance and module builders agree, and the last write wins (as everywhere else).
+        for command in
+            [ Command.create "tool"
+              |> Command.cancelGrace (TimeSpan.FromSeconds 1.0)
+              |> Command.cancelGrace (TimeSpan.FromSeconds 7.0)
+              |> Command.cancelSignal Signal.Hup
+              Command("tool")
+                  .CancelGrace(TimeSpan.FromSeconds 1.0)
+                  .CancelGrace(TimeSpan.FromSeconds 7.0)
+                  .CancelSignal(Signal.Hup) ] do
+            Assert.That(command.Config.CancelGrace, Is.EqualTo(Some(TimeSpan.FromSeconds 7.0)))
+            Assert.That(command.Config.CancelSignal, Is.EqualTo(Some Signal.Hup))
+
+        // Neither knob gap-fills the timeout pair, in either direction: a command that configures only
+        // the deadline ladder cancels exactly as it did before, and one that configures only the
+        // cancellation ladder still times out exactly as it did before.
+        let timeoutOnly =
+            Command.create "tool"
+            |> Command.timeoutGrace (TimeSpan.FromSeconds 3.0)
+            |> Command.stopSignal Signal.Usr1
+
+        Assert.That(timeoutOnly.Config.CancelGrace, Is.EqualTo(None: TimeSpan option))
+        Assert.That(CommandConfig.cancelSignal timeoutOnly.Config, Is.EqualTo Signal.Term)
+
+        let cancelOnly =
+            Command.create "tool"
+            |> Command.cancelGrace (TimeSpan.FromSeconds 3.0)
+            |> Command.cancelSignal Signal.Usr2
+
+        Assert.That(cancelOnly.Config.TimeoutGrace, Is.EqualTo(None: TimeSpan option))
+        Assert.That(cancelOnly.Config.StopSignal, Is.EqualTo Signal.Term)
+
+    [<Test>]
+    member _.``CancelGrace rejects a negative window and CancelSignal rejects a non-graceful signal (T-373)``() : unit =
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> Command("tool").CancelGrace(TimeSpan.FromSeconds -1.0) |> ignore)
+        )
+        |> ignore
+
+        // The same graceful-stop screening `StopSignal` applies: a hard kill is not a soft signal, and a
+        // non-deliverable raw number is not a signal at all.
+        Assert.Throws<ArgumentException>(Action(fun () -> Command("tool").CancelSignal Signal.Kill |> ignore))
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            Action(fun () -> Command("tool").CancelSignal(Signal.Other 0) |> ignore)
+        )
+        |> ignore
+
+    [<Test>]
+    member _.``a cancellation hard-kills at once when no CancelGrace is configured (T-373)``() : Task =
+        task {
+            let running, calls = cancelLadderProcess (Command.create "test").Config
+            use _ = running
+
+            running.BeginCancelTeardown()
+
+            // Synchronous and unchanged: the kill has already been delivered by the time the teardown
+            // call returns, and nothing was soft-signalled first.
+            Assert.That(calls.Kills, Is.EqualTo 1, "the default cancellation must hard-kill immediately")
+            Assert.That(calls.SignalTrace, Is.EqualTo "", "no soft signal may be sent without CancelGrace")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``CancelGrace sends the soft signal first and escalates only after the window (T-373)``() : Task =
+        task {
+            let grace = TimeSpan.FromMilliseconds 400.0
+
+            let config = (Command.create "test" |> Command.cancelGrace grace).Config
+
+            let running, calls = cancelLadderProcess config
+            use _ = running
+
+            running.BeginCancelTeardown()
+
+            // The soft signal is delivered inline; the hard kill is NOT — that is the whole point.
+            Assert.That(calls.SignalTrace, Is.EqualTo "Term", "the ladder must open with the soft signal")
+            Assert.That(calls.Kills, Is.EqualTo 0, "the hard kill must wait for the grace window")
+
+            let! escalated = waitUntil (TimeSpan.FromSeconds 10.0) (fun () -> calls.Kills > 0)
+
+            Assert.That(escalated, Is.True, "a child that ignored the soft signal must still be hard-killed")
+            Assert.That(calls.SignalTrace, Is.EqualTo "Term", "the soft signal must be sent exactly once")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a run torn down inside the cancel grace is never escalated (T-373)``() : Task =
+        task {
+            // A grace far longer than this test: the escalation may only be skipped because the handle's
+            // own teardown cancelled it, never because the window elapsed.
+            let config =
+                (Command.create "test" |> Command.cancelGrace (TimeSpan.FromSeconds 30.0)).Config
+
+            let running, calls = cancelLadderProcess config
+
+            running.BeginCancelTeardown()
+            Assert.That(calls.SignalTrace, Is.EqualTo "Term")
+
+            // The child obeyed the soft signal and the run concluded: disposing the handle is what tears
+            // the tree down from here, so the pending escalation must stand down rather than fire a kill
+            // at a run that is over (and, on a real host, at a pid the OS may have recycled).
+            do! (running :> IAsyncDisposable).DisposeAsync().AsTask()
+            do! Task.Delay 300
+
+            Assert.That(calls.Kills, Is.EqualTo 0, "a torn-down run must not be hard-killed by a stale escalation")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``CancelSignal chooses the cancellation signal and StopSignal never gap-fills it (T-373)``() : Task =
+        task {
+            // A command that configures only the DEADLINE signal: its cancellation still opens with the
+            // default Term, because the two knobs are independent by contract.
+            let stopOnly =
+                (Command.create "test"
+                 |> Command.stopSignal Signal.Usr1
+                 |> Command.cancelGrace (TimeSpan.FromMilliseconds 200.0))
+                    .Config
+
+            let running, calls = cancelLadderProcess stopOnly
+            use _ = running
+            running.BeginCancelTeardown()
+
+            Assert.That(calls.SignalTrace, Is.EqualTo "Term", "StopSignal must not gap-fill the cancel signal")
+
+            // And an explicitly chosen cancellation signal is the one that goes out — even alongside a
+            // different `StopSignal`.
+            let both =
+                (Command.create "test"
+                 |> Command.stopSignal Signal.Usr1
+                 |> Command.cancelSignal Signal.Hup
+                 |> Command.cancelGrace (TimeSpan.FromMilliseconds 200.0))
+                    .Config
+
+            let chosen, chosenCalls = cancelLadderProcess both
+            use _ = chosen
+            chosen.BeginCancelTeardown()
+
+            Assert.That(chosenCalls.SignalTrace, Is.EqualTo "Hup", "CancelSignal must choose the soft signal")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a graceful cancellation still reports Cancelled and lets the child clean up (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore
+                "POSIX signal delivery: Windows has no signal tier (its soft phase is the documented best-effort WM_CLOSE/CTRL+BREAK)."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-cancel-grace-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                use cts = new CancellationTokenSource()
+
+                // The child's SIGTERM handler is the only thing that can create the marker, so the file
+                // is positive proof that the soft rung of the ladder actually reached the tree.
+                let command =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do sleep 0.05; done"
+                    |> Command.cancelOn cts.Token
+                    |> Command.cancelGrace (TimeSpan.FromSeconds 5.0)
+
+                let runTask = command.RunAsync()
+                do! Task.Delay 400
+                cts.Cancel()
+
+                match! runTask with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"a cancelled run must still report Cancelled, got {other}"
+
+                let! cleanedUp = waitUntil (TimeSpan.FromSeconds 10.0) (fun () -> File.Exists marker)
+
+                Assert.That(
+                    cleanedUp,
+                    Is.True,
+                    "the cancellation must deliver the soft signal so the child can clean up"
+                )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cancellation without CancelGrace never delivers a soft signal (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore "POSIX signal delivery: Windows has no signal tier to prove the absence of."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-cancel-hard-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                use cts = new CancellationTokenSource()
+
+                // The same child, minus the opt-in: the default cancellation is a hard kill, which no
+                // SIGTERM handler can observe, so the marker must never appear.
+                let command =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do sleep 0.05; done"
+                    |> Command.cancelOn cts.Token
+
+                let runTask = command.RunAsync()
+                do! Task.Delay 400
+                cts.Cancel()
+
+                match! runTask with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+                // Give a (wrongly delivered) signal every chance to land before concluding it did not.
+                do! Task.Delay 750
+
+                Assert.That(
+                    File.Exists marker,
+                    Is.False,
+                    "the default cancellation must stay an immediate hard kill, with no soft signal"
+                )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a graceful cancellation reports Cancelled on every platform (T-373)``() : Task =
+        task {
+            use cts = new CancellationTokenSource()
+
+            // Windows has no signal tier: the soft phase is the documented best-effort WM_CLOSE/CTRL+BREAK
+            // (which a console `ping` has neither of), so the grace elapses and the hard kill lands — the
+            // same shape `TimeoutGrace` has there. Either way the answer is `Cancelled`.
+            let command =
+                sleeper ()
+                |> Command.cancelOn cts.Token
+                |> Command.cancelGrace (TimeSpan.FromMilliseconds 300.0)
+
+            let runTask = command.RunAsync()
+            do! Task.Delay 300
+            cts.Cancel()
+
+            match! runTask with
+            | Error(ProcessError.Cancelled _) -> ()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a graceful cancellation lets the child clean up on FirstLineAsync too (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore
+                "POSIX signal delivery: Windows has no signal tier (its soft phase is the documented best-effort WM_CLOSE/CTRL+BREAK)."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-cancel-grace-firstline-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                use cts = new CancellationTokenSource()
+
+                // The streamed twin of the buffered ladder test above, and the one that needs asserting
+                // separately: `FirstLineAsync` reaches its answer by streaming rather than by awaiting the
+                // child's exit, so it is the completion verb that could answer while the ladder it started
+                // is still on its first rung — and answering is what disposes the handle and hard-kills the
+                // tree. The marker is written only by the child's own SIGTERM handler, so finding it
+                // ALREADY THERE the moment the verb answers is positive proof the grace window belonged to
+                // the child instead of being collapsed by the verb's own teardown.
+                let command =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do echo tick; sleep 0.05; done"
+                    |> Command.cancelOn cts.Token
+                    |> Command.cancelGrace (TimeSpan.FromSeconds 5.0)
+
+                // A predicate no line can satisfy: the verb streams until the token, never until a match.
+                let runTask = command.FirstLineAsync(fun _ -> false)
+                do! Task.Delay 400
+                cts.Cancel()
+
+                match! runTask with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"a cancelled FirstLineAsync must still report Cancelled, got {other}"
+
+                Assert.That(
+                    File.Exists marker,
+                    Is.True,
+                    "FirstLineAsync must let the cancellation ladder finish before it answers and reaps the tree"
+                )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cancelled FirstLineAsync waits for the grace, and only when one is configured (T-373)``() : Task =
+        task {
+            // The same contract from the timing side, on every platform: a child that will not leave on the
+            // soft signal (POSIX ignores SIGTERM outright; a Windows console `ping` has neither a window nor
+            // a console group for the best-effort soft tier to reach) can only be ended by the escalation,
+            // so "the verb answered before the window elapsed" means the ladder was skipped.
+            let grace = TimeSpan.FromSeconds 2.0
+
+            let stubborn () =
+                if isWindows then
+                    sleeper ()
+                else
+                    shell "trap '' TERM; while :; do sleep 0.05; done"
+
+            // Cancel a `FirstLineAsync` mid-run and report how long the verb then took to answer.
+            let timeCancellation (command: Command) =
+                task {
+                    use cts = new CancellationTokenSource()
+                    let runTask = (command |> Command.cancelOn cts.Token).FirstLineAsync(fun _ -> false)
+                    do! Task.Delay 300
+                    let stopwatch = Stopwatch.StartNew()
+                    cts.Cancel()
+                    let! result = runTask
+                    stopwatch.Stop()
+
+                    match result with
+                    | Error(ProcessError.Cancelled _) -> ()
+                    | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+                    return stopwatch.Elapsed
+                }
+
+            let! withLadder = timeCancellation (stubborn () |> Command.cancelGrace grace)
+
+            Assert.That(
+                withLadder,
+                Is.GreaterThan(TimeSpan.FromMilliseconds 1200.0),
+                "FirstLineAsync must wait out the configured cancel grace instead of hard-killing on the way out"
+            )
+
+            // And the default is untouched: with no `CancelGrace` there is no window to wait for, so the
+            // verb answers as promptly as it always has — nowhere near the window the ladder run paid.
+            let! withoutLadder = timeCancellation (stubborn ())
+
+            Assert.That(
+                withoutLadder,
+                Is.LessThan(TimeSpan.FromMilliseconds 1000.0),
+                "a cancellation with no CancelGrace must still answer at once, with no grace window"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the in-library test doubles walk the same cancellation ladder (T-373)``() : Task =
+        task {
+            // `ScriptedRunner`/`DryRunRunner`/`FaultInjectingRunner` all serve their completion verbs
+            // through `Seam.complete`, whose cancellation registration is exactly this seam — so a
+            // consumer whose tests lean on a double sees the same ladder the real runners walk, instead
+            // of a double that quietly still hard-kills.
+            let command =
+                Command.create "tool"
+                |> Command.cancelSignal Signal.Hup
+                |> Command.cancelGrace (TimeSpan.FromSeconds 30.0)
+
+            let fake = FakeProcess.OfCommand command
+            let running = fake.Build()
+
+            running.BeginCancelTeardown()
+
+            Assert.That(
+                fake.Signals |> Seq.map string |> String.concat ",",
+                Is.EqualTo "Hup",
+                "a double must record the configured soft signal instead of jumping straight to the kill"
+            )
+
+            // Disposal stands the pending escalation down, exactly as it does on a real handle.
+            do! (running :> IAsyncDisposable).DisposeAsync().AsTask()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows refuses a custom Command CancelSignal at spawn (T-373)``() : Task =
+        if not isWindows then
+            Assert.Ignore "Windows-specific representability contract."
+
+        task {
+            // The mirror of the `StopSignal` refusal: an arbitrary POSIX signal is not representable on
+            // Windows, so the spawn fails with a typed `Unsupported` rather than quietly falling back to
+            // the hard kill while the knob reads as honoured.
+            let command =
+                sleeper ()
+                |> Command.cancelSignal Signal.Int
+                |> Command.cancelGrace (TimeSpan.FromSeconds 1.0)
+
+            match! command.StartAsync() with
+            | Error(ProcessError.Unsupported operation) ->
+                Assert.That(operation, Does.Contain "CancelSignal", "the refusal must name the offending knob")
+            | Error error -> Assert.Fail $"expected Unsupported, got {error}"
+            | Ok running ->
+                do! (running :> IAsyncDisposable).DisposeAsync().AsTask()
+                Assert.Fail "a custom Windows cancellation signal was silently accepted"
         }
         :> Task
 

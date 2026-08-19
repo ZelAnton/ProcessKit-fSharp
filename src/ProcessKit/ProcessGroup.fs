@@ -1046,7 +1046,10 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// build a `RunningProcess` over the shared group and run it to completion via the `RunningProcess`
     /// verb, so encoding, line-ending/BOM/trailing-newline normalization, `OkCodes`, and
     /// `OutputBufferPolicy` all match every other runner. If the (CancelOn-linked) token fires, just this
-    /// child is killed and the run resolves to `ProcessError.Cancelled`. The child's I/O is detached on
+    /// child is torn down and the run resolves to `ProcessError.Cancelled` — an immediate hard kill unless
+    /// the command sets `CancelGrace`, which soft-signals this child first and escalates to the same kill
+    /// after the grace (a shared group has no per-child graceful path beyond that soft signal, the
+    /// documented shared-group scope). The child's I/O is detached on
     /// completion (via the run's teardown); the group keeps owning the child until `ShutdownAsync`/`Dispose`.
     member private this.CaptureShared
         (command: Command)

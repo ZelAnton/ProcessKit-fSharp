@@ -529,8 +529,10 @@ device). The doubles model that observable shape:
   `Ok ()` (not the typed `Unsupported` a non-PTY fake returns) and records the geometry — read
   the last requested `(cols, rows)` back through `FakeProcess.LastResize` for assertions.
 - **Signals are recorded.** `RunningProcess.Signal` appends the requested value to
-  `FakeProcess.Signals`; `StopAsync` appends the command's configured `StopSignal`, so control-flow
-  tests can assert both direct and graceful delivery without an OS process.
+  `FakeProcess.Signals`; `StopAsync` appends the command's configured `StopSignal`, and a completion
+  verb cancelled on a command with
+  [`CancelGrace`](timeouts-and-cancellation.md#graceful-cancellation) appends its `CancelSignal` — so
+  control-flow tests can assert direct, graceful, and cancellation delivery without an OS process.
 - **`ScriptedRunner`** serves a command built with `Command.Pty()` as a merged-stream PTY fake
   automatically, so a scripted PTY scenario reads back the same way.
 - **Cassettes** record a `Pty` flag and geometry (schema v4) and replay as a merged-stream

@@ -608,6 +608,22 @@ type RunningProcess
         host.StartKill()
         terminal.ArmPostKillReap()
 
+    /// The teardown a fired CANCELLATION token drives on this run — the single seam every cancellation
+    /// path shares (the completion verbs in `Runner`, a `Supervisor` incarnation, the in-library runner
+    /// doubles), so none of them can drift into a second cancellation driver.
+    ///
+    /// Without `Command.CancelGrace` it is exactly `Kill()`: the historical immediate hard kill, byte for
+    /// byte. With it, the run's tree is first sent `Command.CancelSignal` (default `Signal.Term`) and
+    /// given up to the configured grace to leave on its own, and only then hard-killed through this very
+    /// `Kill()` path. Either way the caller still reports `ProcessError.Cancelled` — only the manner of
+    /// the teardown changes.
+    ///
+    /// Non-blocking by contract: it is invoked from a `CancellationToken.Register` callback, so the grace
+    /// is waited out on a detached task (cancelled by this handle's own teardown) and never on the
+    /// caller's thread. Internal — a cancellation ladder belongs to the verb that owns the token, not to
+    /// a caller driving a live handle, who has `Kill`/`StopAsync`/`Dispose` for the same job.
+    member internal _.BeginCancelTeardown() = terminal.BeginCancelTeardown()
+
     /// Forward parent termination requests into this run's graceful tree-stop path. POSIX registers
     /// `SIGINT` and `SIGTERM`; Windows handles Ctrl+C and Ctrl+Break through `Console.CancelKeyPress`.
     /// The first signal starts one `StopAsync(gracePeriod)` and suppresses the parent's default immediate

@@ -96,7 +96,9 @@ class ProcessKit.Command
   member Arg(System.String) : ProcessKit.Command
   member Arg0(System.String) : ProcessKit.Command
   member Args(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
+  member CancelGrace(System.TimeSpan) : ProcessKit.Command
   member CancelOn(System.Threading.CancellationToken) : ProcessKit.Command
+  member CancelSignal(ProcessKit.Signal) : ProcessKit.Command
   member CreateNoWindow() : ProcessKit.Command
   member CurrentDir(System.String) : ProcessKit.Command
   member Encoding(System.Text.Encoding) : ProcessKit.Command
@@ -164,7 +166,9 @@ module ProcessKit.CommandModule
   static member arg(System.String, ProcessKit.Command) : ProcessKit.Command
   static member arg0(System.String, ProcessKit.Command) : ProcessKit.Command
   static member args(System.Collections.Generic.IEnumerable<System.String>, ProcessKit.Command) : ProcessKit.Command
+  static member cancelGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member cancelOn(System.Threading.CancellationToken, ProcessKit.Command) : ProcessKit.Command
+  static member cancelSignal(ProcessKit.Signal, ProcessKit.Command) : ProcessKit.Command
   static member create(System.String) : ProcessKit.Command
   static member createNoWindow(ProcessKit.Command) : ProcessKit.Command
   static member currentDir(System.String, ProcessKit.Command) : ProcessKit.Command

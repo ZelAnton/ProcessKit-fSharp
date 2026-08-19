@@ -1295,7 +1295,14 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
                             // never reaches here and is reported by the loop as `IncarnationFailed`.
                             emit (fun () -> SupervisionEvent.IncarnationStarted(eventProgram, attempt, running.Pid))
 
-                            use _registration = effectiveToken.Register(fun () -> running.Kill())
+                            // Cancelling a supervised incarnation goes through the run's own single
+                            // cancellation seam, exactly as `CaptureVerbs.runToCompletion` does (this path
+                            // is a faithful inline of it): the unchanged immediate hard kill by default,
+                            // and the `Command.CancelSignal` -> `CancelGrace` -> hard-kill ladder when the
+                            // supervised command opted in. Independent of `SupervisorOptions`' own stop
+                            // grace, which governs a REQUESTED graceful stop (`StopAsync`), not a
+                            // cancellation — the two are different events and neither gap-fills the other.
+                            use _registration = effectiveToken.Register(fun () -> running.BeginCancelTeardown())
 
                             // A graceful stop landed just before this child became current: stop it now
                             // through its own path (fire-and-forget — `OutputStringAsync` below observes

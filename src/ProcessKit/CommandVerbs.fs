@@ -80,6 +80,16 @@ module internal DetachedLaunch =
                     "CancelOn"
                     "cancelling a run means killing the child, which is precisely the control a detached launch gives up"
             )
+        elif config.CancelGrace.IsSome then
+            // Refused for the same reason as `TimeoutGrace`: there is no parent left to drive the
+            // soft-signal -> grace -> hard-kill ladder. `CancelOn` is already refused just above; this
+            // covers the grace window configured without — or before — a token, so the knob can never
+            // look applied when nothing will ever run it.
+            Some(
+                refuse
+                    "CancelGrace"
+                    "it only softens a cancellation teardown, and a detached launch has no owner left to send the soft signal, wait out the grace, or escalate"
+            )
         elif config.StdinSource.IsSome && not (Stdin.isInherit config.StdinSource) then
             Some(
                 refuse
@@ -302,7 +312,7 @@ type CommandVerbs =
     /// ignored here but unreachable: they live on the container this verb refuses to create.
     ///
     /// **Every incompatible builder knob is refused, not ignored** — `Pty`, `KillOnParentDeath`,
-    /// `Timeout`/`TimeoutGrace`/`IdleTimeout`, `CancelOn`, a feeder `Stdin` source, `KeepStdinOpen`, the
+    /// `Timeout`/`TimeoutGrace`/`IdleTimeout`, `CancelOn`/`CancelGrace`, a feeder `Stdin` source, `KeepStdinOpen`, the
     /// line handlers and tees, `StreamBuffer`, and an active `Retry` policy each come back as a typed
     /// `ProcessError.Unsupported` naming the knob, before anything is spawned. `StdioMode.Piped` (the
     /// default) is the one deliberate exception: with no parent left to drain a pipe it is wired to the
