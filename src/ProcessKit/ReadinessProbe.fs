@@ -419,6 +419,69 @@ module internal ReadinessProbe =
         withBackgroundDrain stdout stderr (fun () ->
             waitForSocketUsing timeProvider unixConnect program endpoint attempts timeout cancellationToken)
 
+    /// Wait until `exists` reports `path` present, or fail with `NotReady` once the shared `timeout`
+    /// deadline elapses (or `Cancelled` if `cancellationToken` fires first). A thin adapter over the
+    /// shared `waitForCoreUsing` core — see it for the full deadline contract. This is an EXISTENCE
+    /// check only, the portable readiness signal used by pidfiles, sentinel files, lock paths, and
+    /// daemons that create a Unix-socket pathname before a caller should attempt a richer connection
+    /// probe: a file and a directory both count as present, and nothing here inspects size, content, or
+    /// whether a writer has finished. A caller that needs "fully written", not merely "created", should
+    /// probe that stronger condition itself through `waitFor`/`RunningProcess.WaitForAsync`. `exists` is
+    /// factored out (rather than hard-coding `File.Exists`/`Directory.Exists`) so tests can substitute a
+    /// deterministic stand-in; `waitForPath` below is the production entry point, wired to the real
+    /// filesystem and to the background drain. Any exception `exists` raises (a denied directory, a
+    /// transient I/O error) is treated the same as "does not exist yet" and retried until the deadline —
+    /// the same "any failure just means not ready yet" rule `waitForPortUsing`/`waitForSocketUsing` apply
+    /// to a refused connect — so a lookup race never surfaces as an unhandled fault out of this probe.
+    let internal waitForPathUsing
+        (timeProvider: TimeProvider)
+        (exists: string -> bool)
+        (program: string)
+        (path: string)
+        (attempts: ReadinessAttempts)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        let probe (_ct: CancellationToken) : Task<bool> =
+            let found =
+                try
+                    exists path
+                with _ ->
+                    // A filesystem lookup failure (permissions, a transient I/O error, a race with a
+                    // concurrent rename) means "not there yet", not a probe fault — retried like any
+                    // other failed attempt until the shared deadline.
+                    false
+
+            Task.FromResult found
+
+        waitForCoreUsing timeProvider program probe attempts timeout cancellationToken
+
+    /// Wait until `path` exists on the real filesystem — as a file, a directory, or anything else
+    /// `File.Exists`/`Directory.Exists` can observe — or fail with `NotReady` once the shared `timeout`
+    /// deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
+    /// `waitForPathUsing`/`waitForCoreUsing` for the full deadline contract and the existence-only
+    /// contract. Background-drains (and discards) the child's piped `stdout`/`stderr` for the duration of
+    /// the poll, exactly like `waitForPort` — see `withBackgroundDrain`. Child-exit detection is not done
+    /// here: `RunningProcess.WaitForPathAsync` layers it on (racing this against the handle's shared
+    /// reap-once exit wait), the same early-exit contract every other probe honours. An existence check
+    /// has no platform precondition (unlike `waitForSocket`'s `AF_UNIX` requirement), so this never
+    /// returns `ProcessError.Unsupported`.
+    let waitForPath
+        (timeProvider: TimeProvider)
+        (program: string)
+        (stdout: Stream option)
+        (stderr: Stream option)
+        (path: string)
+        (attempts: ReadinessAttempts)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        let pathExists (candidate: string) : bool =
+            File.Exists candidate || Directory.Exists candidate
+
+        withBackgroundDrain stdout stderr (fun () ->
+            waitForPathUsing timeProvider pathExists program path attempts timeout cancellationToken)
+
     /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).
     /// `getResponse` is factored out so tests can exercise the polling contract without depending on a
