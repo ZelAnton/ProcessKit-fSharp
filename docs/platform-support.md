@@ -412,6 +412,33 @@ kernel `comm` (truncated to ~15 chars). `StartTime` is `System.Diagnostics.Proce
 other than macOS, where no per-pid parent/image reader exists, only the pid and a best-effort start time
 are reported.
 
+**Standalone process lookup (`ProcessLookup.processInfo`, `processIsAlive`)**
+
+The bare-pid companion to `MembersInfo()` above (no group needed) reuses the exact same per-pid readers,
+so the two never disagree, but its `Ok None` / `Error` boundary and reuse-protection availability are
+worth their own row because it is queried directly against an arbitrary pid rather than a group's own
+known-live membership:
+
+| Behaviour | Windows | Linux | macOS | other BSD |
+|---|:---:|:---:|:---:|:---:|
+| Existence/permission oracle | `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` | `/proc/<pid>/stat` read | `proc_pidinfo(PROC_PIDTBSDINFO)` | zero-signal `kill(pid, 0)` probe |
+| A process that may exist but cannot be inspected | ✅ typed `ProcessError.Io` (denied `OpenProcess`) | ✅ typed `ProcessError.Io` (`EACCES` — `hidepid=1` only, see below) | ✅ typed `ProcessError.Io` (any errno but `ESRCH`) | ✅ typed `ProcessError.Io` (any errno but `ESRCH`/`EPERM`) |
+| `processIsAlive` reuse protection (`Some startTime` verified against the live process) | ✅ | ✅ | ✅ | ❌ `ProcessError.Unsupported` — no start-time reader, so a saved token can never be verified |
+
+Two divergences to read before relying on either outcome:
+
+- **`hidepid=1` vs `hidepid=2`/`subset=pid` on Linux.** The `EACCES`→`Error` / `ENOENT`→`Ok None` split
+  above is exact only for `hidepid=1` (the process directory is visible, its contents refused). Under
+  `hidepid=2`/`hidepid=invisible` (or `mount -o subset=pid`) the kernel makes another user's
+  `/proc/<pid>` **invisible**, so `stat` on it returns the same `ENOENT` a genuinely gone pid does — a
+  live foreign process on such a host reads as `Ok None`, indistinguishable from "never existed". There
+  is no syscall-level signal that separates the two cases there.
+- **A POSIX zombie (exited, not yet `wait`ed by its real parent) still reads `Ok(Some _)`.** None of the
+  Linux/macOS/bare-BSD readers inspect the `stat` state field, so a zombie answers exactly like a live
+  process on every POSIX platform. **Windows has no equivalent state** — an exited process is simply
+  gone (`Ok None`) whether or not anything collected its status. A reaper-style consumer of
+  `processIsAlive` on POSIX must not read `Ok true` as "still doing work", only as "not yet collected".
+
 **Stats (`Stats` / `SampleStatsAsync`)**
 
 | Capability | Windows (Job Object) | Linux cgroup v2 | POSIX process group |

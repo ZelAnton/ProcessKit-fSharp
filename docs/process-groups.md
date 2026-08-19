@@ -742,10 +742,26 @@ else
 `ExeName` / `StartTime`, each `None` where the platform cannot honestly report it, argv/environment never
 included — with three outcomes that must not be confused: `Ok(Some info)` (the process exists), `Ok None`
 (an honest negative — no such process, never an error), and `Error` (the process may well exist but its
-state could not be determined — a denied `OpenProcess`, a `hidepid`-denied `/proc` read — **never** read
-this as "dead"). `pid <= 0` is refused up front with `Ok None`, before any native call; this process's
-own pid is an entirely ordinary target (unlike `AdoptByPid`, a read-only lookup enlists nothing into a
-group).
+state could not be determined — a denied `OpenProcess`, a Linux `EACCES` under `hidepid=1` — **never**
+read this as "dead"). `pid <= 0` is refused up front with `Ok None`, before any native call; this
+process's own pid is an entirely ordinary target (unlike `AdoptByPid`, a read-only lookup enlists nothing
+into a group).
+
+Two platform divergences worth knowing before you rely on either outcome:
+
+- **`hidepid=2` (or `subset=pid`) makes a foreign `/proc/<pid>` invisible, not merely unreadable.** The
+  `EACCES`-vs-`ENOENT` split above holds exactly for `hidepid=1` (the directory is visible, its contents
+  refused). Under `hidepid=2`/`hidepid=invisible` the kernel makes another user's `/proc/<pid>` vanish
+  entirely, so a live foreign process there reads as the ordinary `ENOENT` an already-gone pid also
+  produces — `Ok None` for a process that is, in fact, still running. There is no syscall signal that
+  tells the two apart on such a host.
+- **A POSIX "zombie" (exited but not yet `wait`ed by its real parent) still answers `Ok(Some _)`.** Linux
+  `/proc/<pid>/stat`, macOS `proc_pidinfo`, and the bare-BSD `kill(pid, 0)` probe all keep answering for a
+  zombie — this lookup does not inspect the `stat` state field to filter it out — so `processInfo` and
+  `processIsAlive` both read a zombie as present/alive. **Windows has no equivalent state**: an exited
+  Windows process is simply gone (`Ok None`), collected or not. A reaper-style caller polling
+  `processIsAlive` on POSIX should not assume `true` means the process is still doing useful work — only
+  that nothing has collected its exit status yet.
 
 `processIsAlive` is the reuse-safe liveness question a caller who saved a `MemberInfo.StartTime` (from an
 earlier `processInfo` or `MembersInfo()`) actually wants: is the pid **still that same process**, or has
@@ -786,9 +802,13 @@ Console.WriteLine(ProcessLookup.processIsAlive(pid, saved) switch
 
 Pass the pid together with the `StartTime` you saved: a bare pid check would answer "alive" for a
 stranger that recycled the number after the original process exited, while pairing it with the start
-time — fixed at creation, distinct for a later occupant — tells the two apart. When no token was saved
-(or the platform reports none for the live process now), the check honestly degrades to bare-pid
-liveness rather than reporting a false "dead" it cannot prove. Both functions reuse exactly the same
+time — fixed at creation, distinct for a later occupant — tells the two apart. When **no token was
+saved** (`saved = None`), the check honestly degrades to bare-pid liveness rather than reporting a false
+"dead" it cannot prove. But when a token **was** saved and the *current* process's start time cannot be
+read right now, `processIsAlive` never falls back to "alive" just because the pid still exists — that is
+exactly the reuse false positive this API exists to prevent — it returns a typed `Error` instead:
+`ProcessError.Unsupported` on a platform with no start-time reader at all, `ProcessError.Io` when this
+one pid's current start time specifically could not be read. Both functions reuse exactly the same
 per-platform readers `MembersInfo()` uses — no second, parallel identity-reading mechanism — so the two
 APIs can never disagree about the same pid.
 

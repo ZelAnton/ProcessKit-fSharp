@@ -177,6 +177,130 @@ type ProcessLookupTests() =
         | other -> Assert.Fail $"expected Ok true (no token to prove a recycle), got {other}"
 
     [<Test>]
+    member _.``processIsAlive never reports a guessed "alive" when a saved token cannot be verified against an unreadable current start time (R-01 regression)``
+        ()
+        =
+        // R-01: `processIsAlive` must not fall back to bare-pid liveness when the CALLER supplied a
+        // saved token but the live process's CURRENT start time could not be read — that is exactly the
+        // reuse false-positive this API exists to prevent (a pid recycled by a stranger reads the same
+        // way). Models a reader-bearing platform (Linux/macOS) whose per-pid read failed for this one
+        // pid: the typed answer must be `ProcessError.Io`, never `Ok true`.
+        if isWindows then
+            Assert.Ignore "POSIX-only: exercises the POSIX processInfoForTests / reader-availability seams"
+        else
+            let originalInfo = Posix.processInfoForTests
+            let originalAvailable = Posix.processIdentityReaderAvailableForTests
+
+            try
+                Posix.processIdentityReaderAvailableForTests <- Some(fun () -> true)
+                Posix.processInfoForTests <- Some(fun pid -> Ok(Some(MemberInfo(pid, Some 1, Some "child", None))))
+
+                match ProcessLookup.processIsAlive 4242 (Some(DateTime.Now.AddMinutes -5.0)) with
+                | Error(ProcessError.Io _) -> ()
+                | other -> Assert.Fail $"expected Error(ProcessError.Io _) — never a guessed \"alive\" — got {other}"
+            finally
+                Posix.processInfoForTests <- originalInfo
+                Posix.processIdentityReaderAvailableForTests <- originalAvailable
+
+    [<Test>]
+    member _.``processIsAlive reports typed Unsupported, never a guessed "alive", when this platform has no start-time reader at all``
+        ()
+        =
+        // Same false-positive guard as above, but for a platform with NO reader at all (a BSD other than
+        // macOS): a saved token can never be verified there, so the honest answer is `Unsupported`, never
+        // a silently degraded `Ok true`.
+        if isWindows then
+            Assert.Ignore "POSIX-only: models a reader-less POSIX host"
+        else
+            let originalInfo = Posix.processInfoForTests
+            let originalAvailable = Posix.processIdentityReaderAvailableForTests
+
+            try
+                Posix.processIdentityReaderAvailableForTests <- Some(fun () -> false)
+                Posix.processInfoForTests <- Some(fun pid -> Ok(Some(MemberInfo(pid, None, None, None))))
+
+                match ProcessLookup.processIsAlive 4242 (Some(DateTime.Now.AddMinutes -5.0)) with
+                | Error(ProcessError.Unsupported _) -> ()
+                | other -> Assert.Fail $"expected Error(ProcessError.Unsupported _), got {other}"
+            finally
+                Posix.processInfoForTests <- originalInfo
+                Posix.processIdentityReaderAvailableForTests <- originalAvailable
+
+    [<Test>]
+    member _.``processInfo reports a POSIX zombie the same as a live process — the documented divergence with Windows (R-02)``
+        ()
+        =
+        // R-02: a real /proc/<pid>/stat for a zombie (state 'Z') parses exactly like a live process's —
+        // none of the POSIX readers examine the state field — so this seam-level simulation pins exactly
+        // what the real Linux/macOS/bare-BSD backends produce for a zombie pid: `Ok(Some _)`, unlike
+        // Windows, where the equivalent state is `Ok None`. See the XML doc on `ProcessLookup.processInfo`.
+        if isWindows then
+            Assert.Ignore "POSIX-only: documents the zombie-vs-live divergence Windows does not exhibit"
+        else
+            let original = Posix.processInfoForTests
+
+            try
+                Posix.processInfoForTests <-
+                    Some(fun pid -> Ok(Some(MemberInfo(pid, Some 1, Some "zombie-child", None))))
+
+                match Native.Posix.processInfo 4242 with
+                | Ok(Some _) -> ()
+                | other -> Assert.Fail $"expected Ok(Some _) for a zombie pid, got {other}"
+            finally
+                Posix.processInfoForTests <- original
+
+    [<Test>]
+    member _.``processInfo's StartTime is stable across independent reads and survives a round-trip through a string (R-01)``
+        ()
+        : Task =
+        task {
+            use group = create ()
+
+            match! group.StartAsync sleeper with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                match running.Pid with
+                | None -> Assert.Fail "expected a pid"
+                | Some pid ->
+                    let first =
+                        match ProcessLookup.processInfo pid with
+                        | Ok(Some info) -> info.StartTime
+                        | other -> failwith $"expected Ok(Some _), got {other}"
+
+                    let second =
+                        match ProcessLookup.processInfo pid with
+                        | Ok(Some info) -> info.StartTime
+                        | other -> failwith $"expected Ok(Some _), got {other}"
+
+                    Assert.That(
+                        second,
+                        Is.EqualTo first,
+                        "StartTime changed between two independent reads of the same live process"
+                    )
+
+                    match first with
+                    | Some value ->
+                        let roundTripped =
+                            DateTime.Parse(
+                                value.ToString("o"),
+                                Globalization.CultureInfo.InvariantCulture,
+                                Globalization.DateTimeStyles.RoundtripKind
+                            )
+
+                        Assert.That(
+                            roundTripped,
+                            Is.EqualTo value,
+                            "StartTime did not survive a string round-trip — unsafe to persist across runs"
+                        )
+                    | None -> Assert.Ignore "no start time reported on this platform"
+
+                    running.Kill()
+                    let! _ = running.WaitAsync()
+                    ()
+        }
+        :> Task
+
+    [<Test>]
     member _.``Windows processInfo reports a typed error, never a crash, when OpenProcess is denied``() =
         if not isWindows then
             Assert.Ignore "Windows-only: exercises the OpenProcess-refused branch through its test seam"

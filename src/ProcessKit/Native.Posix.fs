@@ -1114,13 +1114,32 @@ module internal Posix =
     // denied read is never proof the process is gone. Each platform reader below is the same underlying
     // read `readMemberInfo` makes (the same `/proc/<pid>/stat` line, the same `proc_pidinfo` fill), only
     // with its failure classified rather than folded.
+    //
+    // Documented platform divergence: a "zombie" (a process that has exited but whose real parent has
+    // not yet `wait`ed it) still owns a `/proc/<pid>` entry on Linux and still answers `proc_pidinfo`/
+    // `kill(pid, 0)` on macOS/bare-BSD, so every backend below reports it `Ok(Some _)`, exactly like a
+    // live process — this layer never inspects the `stat` state field (`Z`) to tell the two apart.
+    // Windows has no equivalent state: a Windows process that has exited is simply gone (`Ok None`)
+    // whether or not anything has "waited" it. A reaper-style caller of `processIsAlive` on POSIX must
+    // therefore not assume a `true` answer means the pid is still doing useful work — only that its exit
+    // status has not yet been collected by its real parent. See `docs/platform-support.md` ("Standalone
+    // process lookup").
     // ----------------------------------------------------------------------------------
 
     /// Linux backend: one `/proc/<pid>/stat` read, classified. `ENOENT` (the file/directory is gone) is
-    /// the honest "no such process" negative; every other failure — notably `EACCES` under a `hidepid`
-    /// mount — means the process may well exist and is reported as a typed `ProcessError.Io`, never a
-    /// false "gone". World-readable by default (no `hidepid` restriction), so an ordinary foreign process
-    /// is reported, not denied — see `docs/platform-support.md`.
+    /// the honest "no such process" negative; `EACCES` under a `hidepid=1` mount (the directory is
+    /// visible but its contents are not) means the process may well exist and is reported as a typed
+    /// `ProcessError.Io`, never a false "gone" — same for any other read failure. World-readable by
+    /// default (no `hidepid` restriction), so an ordinary foreign process is reported, not denied.
+    ///
+    /// This EACCES/ENOENT split is exact only up to `hidepid=1`. Under `hidepid=2`/`hidepid=invisible`
+    /// (or `mount -o subset=pid`), the kernel makes another user's `/proc/<pid>` **invisible** rather
+    /// than merely unreadable, so `stat` on it returns `ENOENT` exactly like a genuinely gone pid — a
+    /// live foreign process is then honestly indistinguishable from one that never existed, and this
+    /// reads `Ok None` for it. There is no syscall-level signal here that tells the two apart; a caller
+    /// on a `hidepid=2` host that needs to rule this out has to use another channel (a shared pidfd, a
+    /// caller-held handle) rather than this read-only-by-pid lookup. See `docs/platform-support.md`
+    /// ("Standalone process lookup") for the full oracle table.
     let private readLinuxProcessInfoChecked (pid: int) : Result<MemberInfo option, ProcessError> =
         try
             let stat = File.ReadAllText $"/proc/{pid}/stat"

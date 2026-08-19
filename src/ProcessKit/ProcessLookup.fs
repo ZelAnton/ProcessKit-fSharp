@@ -41,9 +41,13 @@ module ProcessLookup =
     /// pid is only as stable as the OS's reuse policy — to tell a *recycled* number apart from the
     /// original process later, pair the returned `StartTime` with the pid and use `processIsAlive`.
     ///
-    /// See `docs/platform-support.md` for the per-platform existence/permission oracle each reader uses
-    /// (Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`; Linux: `/proc/<pid>/stat`; macOS:
-    /// `proc_pidinfo`; the bare BSDs: a zero-signal `kill(pid, 0)` probe).
+    /// See `docs/platform-support.md` ("Standalone process lookup") for the per-platform existence/
+    /// permission oracle each reader uses (Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`;
+    /// Linux: `/proc/<pid>/stat`; macOS: `proc_pidinfo`; the bare BSDs: a zero-signal `kill(pid, 0)`
+    /// probe) and the two documented platform divergences: a BSD other than macOS has no per-pid
+    /// `Ppid`/`ExeName` reader (always `None` there), and — POSIX only — a process that has exited but
+    /// not yet been `wait`ed by its real parent (a "zombie") is still reported `Ok(Some _)`, unlike
+    /// Windows, where the same state is `Ok None`.
     let processInfo (pid: int) : Result<MemberInfo option, ProcessError> =
         if pid <= 0 then
             Ok None
@@ -51,6 +55,15 @@ module ProcessLookup =
             Native.Windows.processInfo pid
         else
             Native.Posix.processInfo pid
+
+    /// Whether THIS platform can read a start-time identity for a live pid at all — the same
+    /// cross-platform switch `processInfo` itself dispatches on, since Windows always carries a
+    /// `Process.StartTime` reader while POSIX depends on `Native.Posix.processIdentityReaderAvailable`
+    /// (Linux/macOS have one; the other BSDs do not). Used by `processIsAlive` to tell "no reader on
+    /// this platform at all" apart from "this pid's current start time specifically could not be read".
+    let private startTimeReaderAvailable () : bool =
+        RuntimeInformation.IsOSPlatform OSPlatform.Windows
+        || Native.Posix.processIdentityReaderAvailable ()
 
     /// Reuse-safe liveness: is the process at `pid` **still the same instance** you saw earlier — the one
     /// whose `MemberInfo.StartTime` you saved (from an earlier `processInfo`, or `ProcessGroup
@@ -66,16 +79,29 @@ module ProcessLookup =
     ///   agree: your process is still running.
     /// - `Ok false` — the process is gone: either the pid names nothing, or it names a **different**
     ///   process now (a recycled number — the start times differ), so *your* process is no longer alive.
-    /// - `Error` — the pid may name a live process but it could not be inspected (the same permission/OS-
-    ///   error surface as `processInfo`). Never read this as "dead".
+    /// - `Error` — either the pid may name a live process but it could not be inspected (the same
+    ///   permission/OS-error surface as `processInfo`), or the caller passed `Some` token but the
+    ///   CURRENT process's start time could not be read, so the recycle check cannot be answered
+    ///   honestly (see the degradation rule below). Never read this as "dead".
     ///
-    /// **Reuse protection degrades honestly.** The recycle check needs a start-time token on **both**
-    /// sides. When `startTime` is `None` (nothing was saved — e.g. it originated on a platform with no
-    /// per-pid reader) or the platform reports none for the live process at `pid` right now, a recycle
-    /// cannot be *proven*, so this degrades to bare-pid liveness: a live process at the number reads as
-    /// `Ok true`. So on a platform that reports a start time (Windows, Linux, macOS), passing the saved
-    /// `Some token` gives full reuse protection; on one that reports none, this is exactly the
-    /// number-only liveness a caller would otherwise write by hand — no weaker, and never a false "dead".
+    /// **Reuse protection degrades honestly — never into a false "alive".** The recycle check needs a
+    /// start-time token on **both** sides.
+    /// - `startTime = None` (the caller saved no token — e.g. it originated on a platform with no
+    ///   per-pid reader): this is an ordinary, deliberate bare-pid liveness check. A live process at the
+    ///   number reads as `Ok true`, exactly the number-only liveness a caller would otherwise write by
+    ///   hand — no weaker, and never a false "dead".
+    /// - `startTime = Some _` (the caller wants reuse protection) but the CURRENT process's start time
+    ///   cannot be read right now: this is **not** treated as "still the original process" just because
+    ///   the number exists — that is precisely the false positive this API exists to prevent (a PID
+    ///   recycled by a stranger would read the same way). It is a typed refusal instead:
+    ///   `ProcessError.Unsupported` when this platform has no start-time reader at all (a BSD other than
+    ///   macOS — the caller should not have a token from this platform to begin with, but the guard is
+    ///   unconditional), or `ProcessError.Io` when the reader exists but this particular pid's current
+    ///   start time could not be read right now (a transient permission/OS condition).
+    ///
+    /// So on a platform that reports a start time (Windows, Linux, macOS), passing the saved `Some
+    /// token` gives full reuse protection, honestly refused rather than guessed when it cannot be
+    /// verified.
     let processIsAlive (pid: int) (startTime: DateTime option) : Result<bool, ProcessError> =
         match processInfo pid with
         | Error error -> Error error
@@ -83,4 +109,20 @@ module ProcessLookup =
         | Ok(Some info) ->
             match startTime, info.StartTime with
             | Some expected, Some current -> Ok(expected = current)
-            | _ -> Ok true
+            | None, _ ->
+                // No token was saved: an ordinary, deliberate bare-pid liveness check.
+                Ok true
+            | Some _, None ->
+                // The caller wants reuse protection, but the CURRENT process's start time could not be
+                // read — never silently answer "alive" only because the pid still exists (that is
+                // exactly the reuse false-positive this whole API exists to prevent).
+                if startTimeReaderAvailable () then
+                    Error(
+                        ProcessError.Io
+                            $"pid {pid}: process exists but its current start time could not be read, so a saved identity token cannot be verified against it — never read this as \"alive\""
+                    )
+                else
+                    Error(
+                        ProcessError.Unsupported
+                            "processIsAlive: this platform has no per-pid start-time reader, so a saved identity token cannot be verified against a live process (pass startTime = None for bare-pid-only liveness)"
+                    )
