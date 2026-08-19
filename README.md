@@ -7,8 +7,8 @@
 
 Async child-process management for .NET with a kernel-backed **no-orphan guarantee**: every
 process you start — and everything *it* spawns — lives in a kill-on-dispose container (a
-**Windows Job Object**, a **Linux cgroup v2**, or a **POSIX process group**), so no descendant
-ever outlives your program.
+**Windows Job Object**, a **Linux cgroup v2**, the **`procctl(2)` process reaper** on FreeBSD, or a
+**POSIX process group**), so no descendant ever outlives your program.
 
 Beyond spawning a subprocess: run-and-capture, line streaming, interactive stdin, shell-free
 pipelines, readiness probes, timeouts & cancellation, supervision with restart/backoff, and a
@@ -44,9 +44,9 @@ test's helper servers — survive a timeout, an exception, or a dropped task, an
 orphans.
 
 ProcessKit spawns every child into the operating system's own containment primitive — a **Job
-Object** on Windows, a **cgroup v2** on Linux (with a process-group fallback), a **POSIX process
-group** on macOS/BSD — so teardown is a kernel operation over the whole tree, not a best-effort
-signal to one pid:
+Object** on Windows, a **cgroup v2** on Linux (with a process-group fallback), the **`procctl(2)`
+process reaper** on FreeBSD, a **POSIX process group** on macOS and the other BSDs — so teardown is
+a kernel operation over the whole tree, not a best-effort signal to one pid:
 
 - **Nothing escapes silently.** Disposing the handle or group reaps every descendant,
   grandchildren included. Where a mechanism has a genuine weakness (a `setsid` child escapes a
@@ -413,8 +413,8 @@ var first = await RunningProcess.WaitAnyAsync([a, b]);
 Console.WriteLine($"contender #{first.Index} exited first with {first.Outcome}");
 ```
 
-`Members()` lists the whole tree on Windows (Job Object) and Linux (cgroup); the POSIX
-process-group backend lists the tracked group *leaders* only. `WaitAnyAsync` applies no per-process
+`Members()` lists the whole tree on Windows (Job Object), Linux (cgroup) and FreeBSD (process
+reaper); the POSIX process-group backend lists the tracked group *leaders* only. `WaitAnyAsync` applies no per-process
 timeout (bound the race with a `Command.Timeout`) and does no output pumping — drain chatty
 children first.
 

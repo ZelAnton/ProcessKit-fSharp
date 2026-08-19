@@ -19,7 +19,9 @@ type Mechanism =
     /// rather than being left to run unconstrained.
     | CgroupV2
 
-    /// POSIX process group (macOS/BSD, or the Linux fallback).
+    /// POSIX process group — macOS and the BSDs other than FreeBSD, or the Linux fallback. Also what a
+    /// FreeBSD host reports when `procctl(PROC_REAP_ACQUIRE)` was refused for this process, since the
+    /// group is then built on the plain process group (see `ProcessReaper`).
     | ProcessGroup
 
     /// FreeBSD kernel **process reaper** — `procctl(2)`'s `PROC_REAP_ACQUIRE`, layered over the POSIX

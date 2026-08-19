@@ -341,13 +341,15 @@ type ProcessError =
     | Stdin of Program: string * Detail: string
 
     /// A `ResourceLimits` cap was requested but could not be enforced — the platform has no
-    /// whole-tree limit primitive (macOS / the Linux process-group fallback), or the Linux cgroup v2
-    /// controllers could not be enabled (this process is not at the real cgroup root).
+    /// whole-tree limit primitive (macOS / the Linux process-group fallback), its whole-tree mechanism
+    /// keeps no accounting a cap could be enforced from (the FreeBSD `procctl(2)` process reaper), or the
+    /// Linux cgroup v2 controllers could not be enabled (this process is not at the real cgroup root).
     | ResourceLimit of Detail: string
 
     /// An external process could not be adopted into a `ProcessGroup` (`ProcessGroup.Adopt`). This is
     /// the honest, typed refusal for a *runtime* adoption failure of a specific process — as opposed to
-    /// `Unsupported`, which reports a mechanism that cannot adopt at all (the POSIX process group). The
+    /// `Unsupported`, which reports a mechanism that cannot adopt at all (the POSIX process group, and the
+    /// FreeBSD process reaper layered over it). The
     /// distinguishable causes all live in `Detail`: the target had already exited or its pid does not
     /// exist (a TOCTOU race — never a silent success), the caller lacks the rights to place a foreign
     /// process into the container, or the process is already assigned to a Job that does not permit

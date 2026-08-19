@@ -75,7 +75,8 @@ type PlatformHelper internal (name: string, purpose: string, availability: Capab
 type SignalCapabilities internal (kill: Capability, softStop: Capability, arbitrary: Capability) =
 
     /// `Signal.Kill` — the unblockable kill. Everywhere the mechanism's own atomic tree kill (a Job Object
-    /// terminate, `cgroup.kill`, `killpg` with `SIGKILL`).
+    /// terminate, `cgroup.kill`, `procctl(PROC_REAP_KILL)` on the FreeBSD process reaper, `killpg` with
+    /// `SIGKILL`).
     member _.Kill = kill
 
     /// `Signal.Int` / `Signal.Term` — the soft stop, and what `ProcessGroup.ShutdownAsync` sends before it
@@ -198,7 +199,9 @@ type ContainmentCapabilities
 
     /// `ProcessGroup.Adopt` — bringing an already-running external process into the container. Follows the
     /// mechanism these options select: a Windows Job Object always can, a Linux cgroup v2 group can (which
-    /// is what requesting whole-tree limits selects), and the POSIX process group cannot at all.
+    /// is what requesting whole-tree limits selects), and neither the POSIX process group nor the FreeBSD
+    /// process reaper can at all — a reaper contains this process's own descendants, which a foreign
+    /// process is not.
     member _.Adoption = adoption
 
     /// `ProcessGroup.AdoptByPid` — the same, from a **bare pid** rather than a `System.Diagnostics.Process`.
@@ -208,7 +211,9 @@ type ContainmentCapabilities
     /// membership). The POSIX process group — which cannot `Adopt` at all — can still track a foreign pid
     /// against a re-verified start-time token, so it is `Qualified` wherever this host has a reader for one
     /// (Linux `/proc`, macOS `proc_pidinfo`) and `Unsupported` where it does not (the BSDs), rather than
-    /// tracking a bare number teardown would later SIGKILL whoever holds.
+    /// tracking a bare number teardown would later SIGKILL whoever holds. The FreeBSD process reaper is
+    /// answered on that same row — it delegates this verb to the process group underneath it and adds no
+    /// anchor of its own — so in practice it reports that `Unsupported`.
     member _.AdoptionByPid = adoptionByPid
 
     /// `Command.Pty` — starting a child on a pseudo-terminal. Reported from the very host gate the spawn
