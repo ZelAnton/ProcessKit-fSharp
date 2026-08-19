@@ -891,6 +891,104 @@ type TimeoutTests() =
         :> Task
 
     [<Test>]
+    member _.``a graceful cancellation lets the child clean up on FirstLineAsync too (T-373)``() : Task =
+        if isWindows then
+            Assert.Ignore
+                "POSIX signal delivery: Windows has no signal tier (its soft phase is the documented best-effort WM_CLOSE/CTRL+BREAK)."
+
+        let marker =
+            Path.Combine(Path.GetTempPath(), $"pk-cancel-grace-firstline-{Guid.NewGuid():N}.txt")
+
+        task {
+            try
+                use cts = new CancellationTokenSource()
+
+                // The streamed twin of the buffered ladder test above, and the one that needs asserting
+                // separately: `FirstLineAsync` reaches its answer by streaming rather than by awaiting the
+                // child's exit, so it is the completion verb that could answer while the ladder it started
+                // is still on its first rung — and answering is what disposes the handle and hard-kills the
+                // tree. The marker is written only by the child's own SIGTERM handler, so finding it
+                // ALREADY THERE the moment the verb answers is positive proof the grace window belonged to
+                // the child instead of being collapsed by the verb's own teardown.
+                let command =
+                    shell $"trap 'echo stopped >> {marker}; exit 0' TERM; while :; do echo tick; sleep 0.05; done"
+                    |> Command.cancelOn cts.Token
+                    |> Command.cancelGrace (TimeSpan.FromSeconds 5.0)
+
+                // A predicate no line can satisfy: the verb streams until the token, never until a match.
+                let runTask = command.FirstLineAsync(fun _ -> false)
+                do! Task.Delay 400
+                cts.Cancel()
+
+                match! runTask with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"a cancelled FirstLineAsync must still report Cancelled, got {other}"
+
+                Assert.That(
+                    File.Exists marker,
+                    Is.True,
+                    "FirstLineAsync must let the cancellation ladder finish before it answers and reaps the tree"
+                )
+            finally
+                if File.Exists marker then
+                    File.Delete marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a cancelled FirstLineAsync waits for the grace, and only when one is configured (T-373)``() : Task =
+        task {
+            // The same contract from the timing side, on every platform: a child that will not leave on the
+            // soft signal (POSIX ignores SIGTERM outright; a Windows console `ping` has neither a window nor
+            // a console group for the best-effort soft tier to reach) can only be ended by the escalation,
+            // so "the verb answered before the window elapsed" means the ladder was skipped.
+            let grace = TimeSpan.FromSeconds 2.0
+
+            let stubborn () =
+                if isWindows then
+                    sleeper ()
+                else
+                    shell "trap '' TERM; while :; do sleep 0.05; done"
+
+            // Cancel a `FirstLineAsync` mid-run and report how long the verb then took to answer.
+            let timeCancellation (command: Command) =
+                task {
+                    use cts = new CancellationTokenSource()
+                    let runTask = (command |> Command.cancelOn cts.Token).FirstLineAsync(fun _ -> false)
+                    do! Task.Delay 300
+                    let stopwatch = Stopwatch.StartNew()
+                    cts.Cancel()
+                    let! result = runTask
+                    stopwatch.Stop()
+
+                    match result with
+                    | Error(ProcessError.Cancelled _) -> ()
+                    | other -> Assert.Fail $"expected Cancelled, got {other}"
+
+                    return stopwatch.Elapsed
+                }
+
+            let! withLadder = timeCancellation (stubborn () |> Command.cancelGrace grace)
+
+            Assert.That(
+                withLadder,
+                Is.GreaterThan(TimeSpan.FromMilliseconds 1200.0),
+                "FirstLineAsync must wait out the configured cancel grace instead of hard-killing on the way out"
+            )
+
+            // And the default is untouched: with no `CancelGrace` there is no window to wait for, so the
+            // verb answers as promptly as it always has — nowhere near the window the ladder run paid.
+            let! withoutLadder = timeCancellation (stubborn ())
+
+            Assert.That(
+                withoutLadder,
+                Is.LessThan(TimeSpan.FromMilliseconds 1000.0),
+                "a cancellation with no CancelGrace must still answer at once, with no grace window"
+            )
+        }
+        :> Task
+
+    [<Test>]
     member _.``the in-library test doubles walk the same cancellation ladder (T-373)``() : Task =
         task {
             // `ScriptedRunner`/`DryRunRunner`/`FaultInjectingRunner` all serve their completion verbs

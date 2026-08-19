@@ -1299,7 +1299,10 @@ type Command internal (config: CommandConfig) =
     /// before. It applies to every cancellation source a run has — the verb's own `CancellationToken`,
     /// this command's `CancelOn` (including one inherited from `CliClient.WithDefaults`),
     /// `Pipeline.CancelOn` (set it on stage 0, which owns the pipeline-wide control configuration), and a
-    /// `Supervisor` incarnation's cancellation — and to buffered and streamed completion verbs alike.
+    /// `Supervisor` incarnation's cancellation — and to buffered and streamed completion verbs alike. The
+    /// streamed one, `FirstLineAsync`, therefore waits for the ladder to conclude before it answers
+    /// `Cancelled` — returning is what reaps its tree, so answering sooner would collapse the very window
+    /// this knob opens. The wait is bounded by `grace`; without this knob it answers immediately, as before.
     ///
     /// **The outcome does not change: a cancelled run is still always an error.** Every consuming path
     /// still reports `ProcessError.Cancelled`, whether the child left on the soft signal or was killed

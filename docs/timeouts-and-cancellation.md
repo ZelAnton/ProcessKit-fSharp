@@ -519,7 +519,7 @@ auto-unsubscribes when the child exits, and leaves output consumption to the cal
 | Cancel during `RunAsync` / `OutputStringAsync` / `OutputBytesAsync` / `ExitCodeAsync` / `ProbeAsync` / `ParseAsync` | tree killed → `Error (ProcessError.Cancelled program)`. The kill is immediate unless [`CancelGrace`](#graceful-cancellation) is set, which makes it a soft signal → grace → hard kill; the reported error is the same either way |
 | Cancel on a live handle (`StdoutLinesAsync`/`FinishAsync` after `StartAsync`) | **not tracked** — the token is checked only before the spawn, and a live handle is caller-driven. Stop the handle yourself: `Kill`/dispose for an immediate hard kill, `StopAsync(gracePeriod)` for a graceful stop, or `ForwardParentSignals(gracePeriod)` for parent console/termination signals; ProcessKit does not surface `Cancelled` for you here |
 | Token already cancelled **before** the run | short-circuits before spawning — no process is ever created |
-| `FirstLineAsync` mid-run | surfaces `ProcessError.Cancelled` once the token fires (not `Ok None`) |
+| `FirstLineAsync` mid-run | surfaces `ProcessError.Cancelled` once the token fires (not `Ok None`). With [`CancelGrace`](#graceful-cancellation) set it answers once the ladder has run, not the instant the stream stops — see [Graceful cancellation](#graceful-cancellation) |
 | Under `Retry` | terminal — the built-in classifiers reject `Cancelled` and the loop stops re-trying |
 | Under a [supervision.md](supervision.md) `Supervisor` | terminal — supervision returns `Cancelled` instead of restarting into a still-cancelled token. This row is about a *token*; supervision has one further, token-free producer of `Cancelled` — a session `StopAsync` that lands before the very first incarnation is started, which has neither an outcome nor a start failure to report (see [supervision.md](supervision.md#errors-and-cancellation)) |
 
@@ -589,6 +589,15 @@ on a later stage is rejected with an `ArgumentException` rather than ignored). I
 reach a live `StartAsync` handle, which is caller-driven exactly as before — use
 `StopAsync(grace)` there. `LaunchDetached` refuses it with a typed `ProcessError.Unsupported`:
 a detached child has no owner left to run the ladder.
+
+**A cancelled verb answers after the ladder, not during it.** The buffered verbs already did —
+they reach their result by awaiting the child's exit. `FirstLineAsync` is the one that reaches
+its answer by *streaming*, and returning is what reaps its tree, so with `CancelGrace` set it
+deliberately waits for the ladder to conclude — the child leaving on the soft signal, or the
+escalation once the grace elapses — before returning `Cancelled`. The grace window is therefore
+the child's, not a race against the verb's own teardown. That wait is bounded by the grace you
+configured, and without `CancelGrace` there is no window to wait for: the verb answers as
+immediately as it always has.
 
 **Scope and platforms** are the same as the rest of cancellation. A run that owns its group
 tears down the whole tree; a run sharing a `ProcessGroup` reaches only its own direct child (the
