@@ -6,8 +6,9 @@ A `ProcessGroup` ties the lifetime of a whole child-process **tree** to a single
 disposable value: every process you start into the group — and everything *those*
 processes spawn — is killed when the group is disposed. An owner that returns
 early, throws, or has its task dropped never leaks subprocesses, because the
-kernel object behind the group (a **Windows Job Object**, a **Linux cgroup v2**,
-or a **POSIX process group**) reaps even grandchildren you never knew existed.
+kernel object behind the group (a **Windows Job Object**, a **Linux cgroup v2**, the
+**`procctl(2)` process reaper** on FreeBSD, or a **POSIX process group**) reaps even
+grandchildren you never knew existed.
 That whole-tree containment is the reason this library exists:
 `System.Diagnostics.Process` reaches the direct child at best, so a build tool's
 compiler children, the real payload behind a `cmd /c …` / `sh -c …` wrapper, or a

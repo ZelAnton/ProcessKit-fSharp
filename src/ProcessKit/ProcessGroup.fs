@@ -822,7 +822,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// container, never a use-after-teardown.
     member this.AdoptByPid(pid: int) : Result<unit, ProcessError> =
         // The two numbers that are never adoptable are refused HERE, before any backend sees them, so the
-        // guarantee is one rule for every mechanism rather than three implementations of it. Typed, not
+        // guarantee is one rule for every mechanism rather than one implementation of it per backend. Typed, not
         // thrown: unlike a `null` argument (a programming error `Adopt` surfaces eagerly), a pid usually
         // arrives from outside the program — a pidfile, a registry, an IPC message — so a bad one is data
         // to report, not a contract violation to raise on.

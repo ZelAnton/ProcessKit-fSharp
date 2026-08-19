@@ -551,7 +551,8 @@ token parameter (`cmd.RunAsync(ct)`). A cancelled run is always an `Error` (`Pro
 ## Process groups and tree control
 
 A `ProcessGroup` is a kill-on-dispose container for a whole process *tree* (Windows Job
-Object / Linux cgroup v2 / POSIX process group). It is itself an `IProcessRunner`.
+Object / Linux cgroup v2 / FreeBSD `procctl(2)` process reaper / POSIX process group). It is
+itself an `IProcessRunner`.
 
 **F#**
 

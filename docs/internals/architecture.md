@@ -55,41 +55,42 @@ The files currently compile in this exact order. The headings are architectural 
 38. `Native.Posix.fs` — `posix_spawn`, process groups, signals, and `waitpid` registry.
 39. `ProcessLookup.fs` — standalone identity-safe lookup and reuse-safe liveness for a bare pid held outside any group, over the two per-pid readers above.
 40. `Native.Cgroup.fs` — Linux cgroup v2 discovery, controls, membership, and accounting.
-41. `Capabilities.fs` — containment mechanism selection and the three-valued capability snapshot probed from it.
-42. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
+41. `Native.FreeBSD.fs` — FreeBSD `procctl(2)` process-reaper acquisition, subtree membership, per-subtree signalling, and the re-parented-orphan sweep.
+42. `Capabilities.fs` — containment mechanism selection and the three-valued capability snapshot probed from it.
+43. `ConsoleEncoding.fs` — console/OEM code-page resolution for decoding legacy child output.
 
 ### Backend, pump, and channels
 
-43. `Backend.fs` — containment interface and its three implementations.
-44. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
-45. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
-46. `ProcessStdin.fs` — interactive stdin handle.
-47. `ReadinessProbe.fs` — readiness polling.
-48. `RunningHost.fs` — the spawned-host contract a live handle is built from.
-49. `ConsumptionGate.fs` — consumption-claim state machine and terminal-wait ledger of one handle.
-50. `RunTerminal.fs` — one handle's shared terminal waits, bounds, tokens, and teardown.
-51. `ExpectWindow.fs` — bounded expect window and ANSI filtering for interactive sessions.
-52. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
-53. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
-54. `RunningProcess.fs` — the public live-handle facade over the six files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
+44. `Backend.fs` — containment interface and its four implementations.
+45. `Pump.fs` — pipe decoding, line/raw buffering, tees, and stdin pumping.
+46. `StreamChannel.fs` — streaming channel construction and full-mode behavior.
+47. `ProcessStdin.fs` — interactive stdin handle.
+48. `ReadinessProbe.fs` — readiness polling.
+49. `RunningHost.fs` — the spawned-host contract a live handle is built from.
+50. `ConsumptionGate.fs` — consumption-claim state machine and terminal-wait ledger of one handle.
+51. `RunTerminal.fs` — one handle's shared terminal waits, bounds, tokens, and teardown.
+52. `ExpectWindow.fs` — bounded expect window and ANSI filtering for interactive sessions.
+53. `OutputSessions.fs` — one handle's output pumps, streaming channels, and session shapes.
+54. `ReadinessRace.fs` — readiness probing raced against the child's own exit.
+55. `RunningProcess.fs` — the public live-handle facade over the six files above: every verb, composed from the claim gate, the terminal waits, and the output sessions.
 
 ### Runner and verbs
 
-55. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
-56. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
-57. `PtySession.fs` — expect-style interaction over a live handle.
-58. `IProcessRunner.fs` — injectable runner seam.
-59. `Runner.fs` — capture primitives and reusable verbs.
-60. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
-61. `DelegatingProcessRunner.fs` — runner decorator base.
-62. `ProcessGroup.fs` — containment owner and shared-group runner.
-63. `JobRunner.fs` — default private-group runner.
-64. `CommandVerbs.fs` — default-runner `Command` extensions.
-65. `PipelineRunner.fs` — internal pipeline execution.
-66. `Pipeline.fs` — pipeline public API.
-67. `Supervisor.fs` — restart supervision.
-68. `CliClient.fs` — configured command client.
-69. `Exec.fs` — concise execution entry points.
+56. `ContentLengthSession.fs` — `Content-Length` framed byte transport over a live handle.
+57. `JsonRpcSession.fs` — typed JSON-RPC 2.0 conversation over that framed transport.
+58. `PtySession.fs` — expect-style interaction over a live handle.
+59. `IProcessRunner.fs` — injectable runner seam.
+60. `Runner.fs` — capture primitives and reusable verbs.
+61. `ProcessRunnerExtensions.fs` — .NET extensions for custom runners.
+62. `DelegatingProcessRunner.fs` — runner decorator base.
+63. `ProcessGroup.fs` — containment owner and shared-group runner.
+64. `JobRunner.fs` — default private-group runner.
+65. `CommandVerbs.fs` — default-runner `Command` extensions.
+66. `PipelineRunner.fs` — internal pipeline execution.
+67. `Pipeline.fs` — pipeline public API.
+68. `Supervisor.fs` — restart supervision.
+69. `CliClient.fs` — configured command client.
+70. `Exec.fs` — concise execution entry points.
 
 When adding a file, place it after everything it consumes and before everything that consumes it. Alphabetical sorting or SDK globbing would silently destroy this ordering model.
 
@@ -180,7 +181,7 @@ The current interface has 22 abstract members:
 - `KillChild` kills one child's containment subtree where applicable.
 - `KillTree` immediately kills the whole container without releasing it.
 - `GracefulKillTree` requests termination, waits for the grace period, then escalates where supported, returning a `GracefulOutcome` (the soft-signal fate, whether the tree drained within grace, whether it escalated) that `ProcessGroup.ShutdownReportAsync` turns into the public `ShutdownReport`; every other caller (`ShutdownAsync`, the per-run graceful-timeout path) discards it exactly as it discarded the bare `Task` before T-384.
-- `SoftStopScope` (T-384) reports how far a soft stop reaches on the backend's CURRENT live membership, read from the same state `Signal`/`GracefulKillTree` consult and side-effect-free by contract — `SoftStopScope.WholeTree` unconditionally on the process-group and cgroup v2 backends, `OptInMembers`/`Unsupported` on the Job Object backend depending on whether a live CTRL-capable leader (`ctrlGroups`) or windowed member (`Native.Windows.hasWindowedMemberWindows`, a non-mutating sibling of `postCloseToJobWindows`) is present.
+- `SoftStopScope` (T-384) reports how far a soft stop reaches on the backend's CURRENT live membership, read from the same state `Signal`/`GracefulKillTree` consult and side-effect-free by contract — `SoftStopScope.WholeTree` unconditionally on the process-group, process-reaper, and cgroup v2 backends, `OptInMembers`/`Unsupported` on the Job Object backend depending on whether a live CTRL-capable leader (`ctrlGroups`) or windowed member (`Native.Windows.hasWindowedMemberWindows`, a non-mutating sibling of `postCloseToJobWindows`) is present.
 - `Members` snapshots membership.
 - `Signal` broadcasts a signal.
 - `Suspend` and `Resume` control the tree.
@@ -193,7 +194,7 @@ The current interface has 22 abstract members:
   cgroup sampling preserves adopted and descendant members: tracked/adopted leaders use pinned tokens,
   while other members use an identity captured from the cgroup snapshot and checked again after reading.
   The public `ProcessGroup` call runs this operation under the lifecycle gate, so it cannot race teardown.
-- `UpdateLimits` re-applies a full replacement resource-limit set to the live container (Job Object / cgroup v2); the process-group mechanism has no primitive to update and returns `ProcessError.ResourceLimit`. Because the caps land through several sequential native writes, a limit-capable backend captures the container's prior caps and best-effort restores them if a write fails partway, so an `Error` leaves the live container on the previous set — never a silent mix that `Options.Limits` would misreport (only an also-failed restore is indeterminate, and its `ProcessError.ResourceLimit` message says so).
+- `UpdateLimits` re-applies a full replacement resource-limit set to the live container (Job Object / cgroup v2); the process-group and process-reaper mechanisms have no primitive to update and return `ProcessError.ResourceLimit`. Because the caps land through several sequential native writes, a limit-capable backend captures the container's prior caps and best-effort restores them if a write fails partway, so an `Error` leaves the live container on the previous set — never a silent mix that `Options.Limits` would misreport (only an also-failed restore is indeterminate, and its `ProcessError.ResourceLimit` message says so).
 - `LimitEvidence` answers, per resource-limit axis (`Memory`/`Processes`/`Cpu`), whether a cap this group ever carried actually fired — the post-mortem question `Stats`/exit code/signal cannot answer honestly (see [Resource limits](../process-groups.md#limit-evidence)). `ProcessGroup.hardRelease` calls it exactly once, under the same lifecycle lock as every other backend call, on the still-live container immediately *before* `HardRelease` tears it down, and caches the result — only the cgroup v2 backend (`Native.Cgroup.limitEvidence`) reads real kernel counters (`memory.events`' `oom`, `pids.events`' `max`, `cpu.stat`'s `nr_throttled`); the Windows Job Object backend answers `Unknown` for every axis it ever capped (`NotTripped` for one it never did, without touching native); the POSIX process-group backend answers `Unknown` unconditionally, on every axis, because it has no evidence apparatus at all. `CappedAxes` is the STICKY per-axis "was this ever configured" record `ProcessGroup` passes in, kept independently of `IContainmentBackend`.
 - `HardRelease` performs the once-only hard teardown and frees the container.
 
@@ -346,9 +347,11 @@ Metric cardinality is deliberately bounded. Metrics carry the program name and, 
 
 ## Platform differences
 
+The columns are three of the four mechanisms. The FreeBSD **process reaper** has no column of its own because `ProcessReaperBackend` wraps `ProcessGroupBackend` rather than replacing it: every row below reads the same for it except the handful listed under [FreeBSD process reaper: what changes](../platform-support.md#freebsd-process-reaper-what-changes), which is the complete list of differences.
+
 | Capability | Windows Job Object | POSIX process group | Linux cgroup v2 |
 |---|---|---|---|
-| Selection | Windows, with or without limits | macOS/BSD; Linux without whole-tree limits (CPU-time-only is supported here) | Linux when whole-tree limits are requested |
+| Selection | Windows, with or without limits | macOS and the BSDs other than FreeBSD; Linux without whole-tree limits (CPU-time-only is supported here); FreeBSD only when the reaper acquisition is refused (otherwise `Mechanism.ProcessReaper`) | Linux when whole-tree limits are requested |
 | Containment timing | Child suspended, assigned to Job, then resumed | Group created atomically by `posix_spawn` attributes | POSIX group at spawn; `/bin/sh` launcher joins the cgroup before `exec`ing the target (already contained on its first instruction) |
 | Adopt external process (`Adopt`) | `AssignProcessToJobObject` (opens a least-privilege handle, assigns, closes it — Job membership persists) | `ProcessError.Unsupported` — `setpgid` cannot relocate a foreign, already-`exec`ed process | Write the pid to `cgroup.procs` (limited groups only; the plain POSIX fallback is the middle column) |
 | Adopt external process by bare pid (`AdoptByPid`) | The same call; the anchor is the process object behind its one `OpenProcess` | Tracked individually against a start-time token re-verified before every delivery (its future forks are not contained); `ProcessError.Unsupported` where no identity reader exists (the BSDs) | The same `cgroup.procs` write, with a start-time read either side of it; a number that changed hands is moved back out to the parent cgroup |

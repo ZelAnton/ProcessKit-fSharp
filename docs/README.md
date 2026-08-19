@@ -7,8 +7,8 @@
 
 Async child-process management for .NET with a kernel-backed **no-orphan guarantee**: every
 process you start — and everything *it* spawns — lives in a kill-on-dispose container (a
-**Windows Job Object**, a **Linux cgroup v2**, or a **POSIX process group**), so no descendant
-ever outlives your program.
+**Windows Job Object**, a **Linux cgroup v2**, the **`procctl(2)` process reaper** on FreeBSD, or a
+**POSIX process group**), so no descendant ever outlives your program.
 
 Beyond spawning a subprocess: run-and-capture, line streaming, interactive stdin, shell-free
 pipelines, readiness probes, timeouts & cancellation, supervision with restart/backoff, and a

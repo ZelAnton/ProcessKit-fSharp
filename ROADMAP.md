@@ -6,8 +6,9 @@ Shipped changes are in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## What the library covers
 
-- **Whole-tree kill-on-dispose containment** — a Windows Job Object, a Linux cgroup v2, or a POSIX
-  process group — with the active `Mechanism` reported honestly, never a silent downgrade.
+- **Whole-tree kill-on-dispose containment** — a Windows Job Object, a Linux cgroup v2, the FreeBSD
+  `procctl(2)` process reaper, or a POSIX process group — with the active `Mechanism` reported
+  honestly, never a silent downgrade.
 - The immutable **`Command`** builder and the full verb set (`Run` / `RunUnit` / `OutputString` /
   `OutputBytes` / `ExitCode` / `Probe` / `Parse` / `TryParse` / `FirstLine` / `Start`), with honest
   results (a non-zero exit is data until you ask for success) and a typed `ProcessError`.

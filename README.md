@@ -77,7 +77,7 @@ a kernel operation over the whole tree, not a best-effort signal to one pid:
 | **ProcessKit** | **✓** | **✓** | **✓** | **✓** |
 
 The first column is the differentiator: a child's *descendants* are contained and reaped as a
-unit (Job Object / cgroup v2 / process group), not just the direct child.
+unit (Job Object / cgroup v2 / process reaper / process group), not just the direct child.
 
 For a fuller, axis-by-axis comparison against `System.Diagnostics.Process`, CliWrap,
 Medallion.Shell, and SimpleExec — plus "was → now" migration snippets for the most common
