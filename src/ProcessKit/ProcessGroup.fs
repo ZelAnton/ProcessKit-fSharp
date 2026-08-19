@@ -1002,13 +1002,20 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// a fabricated verdict read off counters that are still changing.
     ///
     /// Per axis, deliberately never folded into one whole-group verdict — see `LimitVerdict` for what each
-    /// value means, and `LimitEvidence` for why folding would misrepresent "no evidence" as "no". Only the
-    /// Linux cgroup v2 mechanism can ever answer `Tripped`/`NotTripped` from real evidence (see
-    /// `Native.Cgroup.limitEvidence` for exactly which kernel counters back each axis); a Windows Job
-    /// Object and the POSIX process-group fallback keep no such post-mortem record at all, so every axis
-    /// they ever capped reads `Unknown` — not an oversight, a measured conclusion about what each
-    /// mechanism actually preserves after the fact. An axis this group never capped reads `NotTripped`
-    /// (nothing was capped, so nothing could fire) on every mechanism, without touching native at all.
+    /// value means, and `LimitEvidence` for why folding would misrepresent "no evidence" as "no" (and for
+    /// why `IoMax`/`CpuAffinity` have no axis here at all). Only the Linux cgroup v2 mechanism can ever
+    /// answer `Tripped`/`NotTripped` from real evidence (see `Native.Cgroup.limitEvidence` for exactly
+    /// which kernel counters back each axis, and `LimitEvidence.Cpu` for the further `CpuTimeMax`
+    /// refinement that applies on every mechanism). The two mechanisms differ in what they say about an
+    /// axis this group never capped: a Windows Job Object keeps no post-mortem record that any of these
+    /// caps fired, so every axis it ever capped reads `Unknown` — not an oversight, a measured conclusion
+    /// about what it actually preserves after the fact — but an axis it never capped still reads
+    /// `NotTripped` (nothing was capped, so nothing could fire) without touching native at all. The POSIX
+    /// process-group fallback has no whole-tree resource-accounting apparatus whatsoever — the same reason
+    /// `Create`/`UpdateLimits` refuse any whole-tree cap on it — so it answers `Unknown` on every axis
+    /// UNCONDITIONALLY, including one this group never capped: there is no "nothing was capped" case that
+    /// lets it read `NotTripped` the way a Job Object can, because it never had any evidence apparatus to
+    /// begin with.
     member this.LimitEvidence() : Result<LimitEvidence, ProcessError> =
         lock sync (fun () ->
             match capturedLimitEvidence with

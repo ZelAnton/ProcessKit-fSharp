@@ -650,7 +650,11 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
                 else
                     LimitVerdict.NotTripped
 
-            LimitEvidence(verdict capped.Memory, verdict capped.Processes, verdict capped.Cpu)
+            // `Cpu` passes through `GuardCpuVerdict`: this Job's raw verdict is derived from `CpuQuota`
+            // alone (`capped.Cpu`), so a `NotTripped` it reports must still be downgraded to `Unknown` when
+            // this group also carries a `CpuTimeMax` — a Job-time kill has no accounting a Job Object keeps
+            // (R-01).
+            LimitEvidence(verdict capped.Memory, verdict capped.Processes, capped.GuardCpuVerdict(verdict capped.Cpu))
 
         member _.HardRelease() =
             ctrlGroups.Clear()
@@ -1591,10 +1595,16 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
 
         member _.LimitEvidence(_capped: CappedAxes) : LimitEvidence =
             // The POSIX process-group mechanism has no whole-tree resource accounting at all — the same
-            // reason `Create`/`UpdateLimits` refuse any whole-tree cap on it in the first place. Every
-            // axis is `Unknown` unconditionally (never gated on `capped`, which on this mechanism can
-            // never actually be true for these three axes): there is no evidence apparatus here at all,
-            // not "a cap may have fired unseen".
+            // reason `Create`/`UpdateLimits` refuse any whole-tree cap on it in the first place. Every axis
+            // is `Unknown` UNCONDITIONALLY, deliberately ignoring `capped` — including for an axis this
+            // group never capped, unlike the Windows Job Object backend's `NotTripped` for that case.
+            // `capped` is NOT always `false` here, despite this mechanism refusing every whole-tree cap:
+            // `ProcessGroup.UpdateLimits` records an axis a request NAMES on the sticky `CappedAxes` before
+            // attempting the apply, so `capped.X = true` is reachable on this backend too, from a request
+            // this mechanism then refuses (see the "an axis named by a failed UpdateLimits still joins the
+            // sticky cap record" test). Ignoring `capped` here is a deliberate choice, not a because-it-
+            // can't-happen shortcut: there is no evidence apparatus on this mechanism at all, not "a cap may
+            // have fired unseen" — gating on `capped` would still have nothing honest to read (R-02).
             LimitEvidence(LimitVerdict.Unknown, LimitVerdict.Unknown, LimitVerdict.Unknown)
 
         member _.HardRelease() =

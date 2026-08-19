@@ -27,6 +27,7 @@ suspend/resume, member listing, resource limits, or stats.
 - [Resource limits](#resource-limits)
 - [Disk I/O rate limits](#disk-io-rate-limits)
 - [Stats](#stats)
+- [Limit Evidence](#limit-evidence)
 
 ## Creating a group
 
@@ -1251,7 +1252,21 @@ together, turning "we have no evidence" into "no"):
 |---|---|
 | Linux cgroup v2 | Real evidence from `memory.events`' `oom`, `pids.events`' `max`, and `cpu.stat`'s `nr_throttled` — `Tripped`/`NotTripped` per axis, or `Unknown` when a counter file/key can't be read (an older kernel, a controller this hierarchy never enabled, a cgroup already gone). |
 | Windows Job Object | `Unknown` on every axis it ever capped — not an oversight: a Job Object keeps no post-mortem record that any of these caps fired. An axis it never capped reads `NotTripped` without touching native at all. |
-| POSIX process group / macOS / BSD | `Unknown` on every axis, unconditionally — this mechanism has no whole-tree resource accounting to read at all (the same reason `Create`/`UpdateLimits` refuse any whole-tree cap on it in the first place). |
+| POSIX process group / macOS / BSD | `Unknown` on every axis, **unconditionally** — including one this group never capped. This mechanism has no whole-tree resource accounting to read at all (the same reason `Create`/`UpdateLimits` refuse any whole-tree cap on it in the first place), so unlike the Job Object it has no "nothing was capped" case to answer `NotTripped` from either. |
+
+`Cpu` answers for `ResourceLimits.CpuQuota` specifically. When a group **also**
+carries a `ResourceLimits.CpuTimeMax` cap (Windows Job-time, or POSIX
+`RLIMIT_CPU` applied per spawned process), a `NotTripped` this axis would
+otherwise report is downgraded to `Unknown` instead, on every mechanism: no
+counter here — not a Job's accounting, not cgroup v2's `nr_throttled` — can
+attribute a job-time/`RLIMIT_CPU` trip, so "the quota did not throttle" is not
+the same honest "no" once a `CpuTimeMax` is in play too. A real `Tripped` from
+quota-throttle evidence is never downgraded.
+
+`ResourceLimits.IoMax` and `WithCpuAffinity` have **no** corresponding
+`LimitEvidence` axis at all — no mechanism here keeps a post-mortem "this
+whole-tree I/O rate or CPU-affinity cap engaged" record, so there is nothing
+honest to report for them, not even `Unknown`.
 
 Recorded **sticky** across a live `UpdateLimits`: an axis a request names joins
 the group's cap record whether that request then succeeds or fails, so a cap

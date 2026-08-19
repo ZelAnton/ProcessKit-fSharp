@@ -1100,8 +1100,8 @@ module internal Cgroup =
             tryFiles files
 
     /// Post-run, per-axis `LimitEvidence` for a cgroup v2 group: the ONLY containment backend with real
-    /// evidence to read (see `ProcessGroup.LimitEvidence`'s own doc comment for why Windows Job Objects
-    /// and the POSIX process-group fallback answer `Unknown` unconditionally). Reads straight from the
+    /// evidence to read (see `ProcessGroup.LimitEvidence`'s own doc comment for exactly what a Windows Job
+    /// Object and the POSIX process-group fallback answer instead, and why). Reads straight from the
     /// kernel's own per-axis counters — never re-derived from the `ResourceLimits` that requested the cap
     /// — so a configured cap that never fired reads `NotTripped`, one that did reads `Tripped`, and one
     /// this cgroup cannot honestly attribute (an older kernel, a controller this hierarchy never enabled,
@@ -1112,11 +1112,17 @@ module internal Cgroup =
     /// | Memory | `memory.events.local` (preferred) / `memory.events` | `oom` — this cgroup hit **its own** cap and had to OOM. Deliberately not `oom_kill`, which also counts a *global* host OOM kill of a member, misattributing a system-wide event to this cap. |
     /// | Processes | `pids.events.local` (preferred) / `pids.events` | `max` — a fork inside the cgroup was refused by `pids.max`. |
     /// | CPU | `cpu.stat` | `nr_throttled` — the tree was throttled by `cpu.max`'s quota at least once. |
+    ///
+    /// `Cpu`'s raw verdict from `nr_throttled` is about `cpu.max`/`CpuQuota` alone; it is passed through
+    /// `CappedAxes.GuardCpuVerdict` before it reaches the returned `LimitEvidence`, so a group that ALSO
+    /// carries a `CpuTimeMax` (per-child `RLIMIT_CPU`, which `cpu.stat` cannot see at all) never reports a
+    /// fabricated `NotTripped` for it — including when `CpuQuota` itself was never set, so `nr_throttled`
+    /// is never even read (T-381/R-01).
     let limitEvidence (cgroupPath: string) (capped: CappedAxes) : LimitEvidence =
         LimitEvidence(
             axisVerdict cgroupPath capped.Memory [ "memory.events.local"; "memory.events" ] "oom",
             axisVerdict cgroupPath capped.Processes [ "pids.events.local"; "pids.events" ] "max",
-            axisVerdict cgroupPath capped.Cpu [ "cpu.stat" ] "nr_throttled"
+            capped.GuardCpuVerdict(axisVerdict cgroupPath capped.Cpu [ "cpu.stat" ] "nr_throttled")
         )
 
     /// How one attempt to remove the cgroup directory ended.
