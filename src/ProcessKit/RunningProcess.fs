@@ -186,7 +186,7 @@ type RunningProcess
             None, None
 
     // The probe-vs-exit race (`ReadinessRace.raceAgainstExit`), bound to THIS handle's config, its
-    // still-`Fresh` pipe snapshot and its one memoized exit wait. All five readiness verbs go through
+    // still-`Fresh` pipe snapshot and its one memoized exit wait. All six readiness verbs go through
     // this one choke point, so their early-exit behaviour cannot drift apart (KB K-043).
     let raceReadinessAgainstExit
         (timeout: TimeSpan)
@@ -429,6 +429,23 @@ type RunningProcess
                 stdout
                 stderr
                 endpoint
+                attempts
+                budget
+                readinessToken)
+
+    let waitForPath
+        (path: string)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        raceReadinessAgainstExit timeout cancellationToken (fun attempts stdout stderr budget readinessToken ->
+            ReadinessProbe.waitForPath
+                config.TimeProvider
+                config.Program
+                stdout
+                stderr
+                config.WorkingDirectory
+                path
                 attempts
                 budget
                 readinessToken)
@@ -1558,6 +1575,47 @@ type RunningProcess
                         return Unchecked.defaultof<_>
             }
 
+    /// Wait until `path` exists on disk — as a file, a directory, or anything else
+    /// `File.Exists`/`Directory.Exists` can observe — or fail with `NotReady` once the shared `timeout`
+    /// deadline elapses (or `Cancelled` if `cancellationToken` fires first). This is the portable
+    /// readiness signal for a pidfile, a sentinel/lock file, or a Unix-socket pathname a daemon creates
+    /// before a caller should attempt a richer connection probe (`WaitForSocketAsync`).
+    ///
+    /// A relative `path` resolves against this run's own `Command.CurrentDir` (the CHILD's working
+    /// directory) when one was set — the same rule `Command.PreferLocal` already applies to its own
+    /// relative entries — and otherwise resolves against the calling process's current directory, the
+    /// same as an unresolved `File.Exists` call. Pass an absolute `path` for a sentinel the child
+    /// writes when no `CurrentDir` is configured, so the probe does not depend on where this process
+    /// happens to be running from.
+    ///
+    /// EXISTENCE ONLY: a file and a directory both count as ready the instant `stat` can see them —
+    /// this does not require the path to be a regular file, does not wait for its writer to finish, and
+    /// makes no size/stability promise, so a sentinel a daemon `touch`es before it is done writing
+    /// elsewhere is reported ready immediately. A caller that needs "fully written", not merely
+    /// "created" (e.g. a config file whose writer must finish first), should probe that stronger
+    /// condition itself with `WaitForAsync`. A filesystem lookup failure (a denied directory, a
+    /// transient I/O error, a race with a concurrent rename) is treated the same as "does not exist
+    /// yet" and retried until the deadline — the same "any failure just means not ready yet" rule
+    /// `WaitForPortAsync`/`WaitForSocketAsync` apply to a refused connect. An existence check has no
+    /// platform precondition (unlike `WaitForSocketAsync`'s `AF_UNIX` gate), so this never returns
+    /// `ProcessError.Unsupported`.
+    ///
+    /// If the child exits before `path` appears, existence is checked exactly once more — bounded by
+    /// what is left of `timeout` and by a brief internal grace, so a sentinel created immediately before
+    /// the child terminated is reported as `Ok` instead of being lost — and this then returns `NotReady`
+    /// rather than polling out the full `timeout`; a cancelled token or an already-spent deadline still
+    /// wins over that last check. That is the same early-exit contract `WaitForPortAsync`/
+    /// `WaitForHttpAsync`/`WaitForSocketAsync`/`WaitForAsync` honour, and it runs via the one reap-once
+    /// exit wait the rest of the handle shares (so a later `WaitAsync`/`ProfileAsync` still reports the
+    /// real exit). Background-drains (and discards) the child's piped stdout/stderr for the duration of
+    /// the poll, exactly like `WaitForPortAsync` — see its doc for what that does and doesn't compose
+    /// with afterward.
+    member _.WaitForPathAsync
+        (path: string, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<unit, ProcessError>> =
+        ArgumentNullException.ThrowIfNull path
+        waitForPath path timeout cancellationToken
+
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` once the shared
     /// `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first). Every connect
     /// attempt and polling backoff shares that one deadline, so a slow or non-cooperative connect can
@@ -1567,7 +1625,8 @@ type RunningProcess
     /// by a brief internal grace, so a port opened immediately before the child terminated is reported
     /// as `Ok` instead of being lost — and this then returns `NotReady` rather than polling out the full
     /// `timeout`; a cancelled token or an already-spent deadline still wins over that last dial. That is
-    /// the same early-exit contract `WaitForHttpAsync`/`WaitForSocketAsync`/`WaitForAsync` honour, and it
+    /// the same early-exit contract `WaitForHttpAsync`/`WaitForSocketAsync`/`WaitForPathAsync`/
+    /// `WaitForAsync` honour, and it
     /// runs via the one reap-once exit wait the rest of the handle shares (so a later
     /// `WaitAsync`/`ProfileAsync` still reports the real exit). Background-drains (and discards) the child's piped stdout/stderr for the
     /// duration of the poll — like `WaitForLineAsync`, so a child that writes more than one OS pipe buffer
@@ -1577,7 +1636,7 @@ type RunningProcess
     /// streaming session. A capture verb (`OutputStringAsync`/`OutputBytesAsync`/`StdoutLinesAsync`/
     /// `OutputEventsAsync`) called AFTER this probe therefore only sees what the child wrote after the
     /// probe concluded, not the full run — the same "doesn't compose with a subsequent fresh capture"
-    /// limitation `WaitForLineAsync` already documents, now uniform across all five readiness probes. If
+    /// limitation `WaitForLineAsync` already documents, now uniform across every other readiness probe. If
     /// a buffered/streaming verb already claimed the pipes before this call, that verb's own pump is
     /// already draining them and this probe leaves them alone (no second reader).
     member _.WaitForPortAsync
@@ -1703,11 +1762,11 @@ type RunningProcess
     /// terminated is reported as `Ok` instead of being lost — and this then returns `NotReady` rather
     /// than polling out the full `timeout`. Callers therefore must expect one extra `probe` invocation
     /// after the child exits; a cancelled token or an already-spent deadline suppresses it. That is the
-    /// same early-exit contract `WaitForHttpAsync`/`WaitForPortAsync` honour, and it runs via the one
-    /// reap-once exit wait the rest of the handle shares (so a later `WaitAsync`/`ProfileAsync` still
-    /// reports the real exit). Background-drains (and discards) the child's piped stdout/stderr for
-    /// the duration of the poll, exactly like `WaitForPortAsync` — see its doc for what that does and
-    /// doesn't compose with afterward.
+    /// same early-exit contract `WaitForHttpAsync`/`WaitForPortAsync`/`WaitForPathAsync` honour, and it
+    /// runs via the one reap-once exit wait the rest of the handle shares (so a later
+    /// `WaitAsync`/`ProfileAsync` still reports the real exit). Background-drains (and discards) the
+    /// child's piped stdout/stderr for the duration of the poll, exactly like `WaitForPortAsync` — see
+    /// its doc for what that does and doesn't compose with afterward.
     member _.WaitForAsync
         (probe: Func<Task<bool>>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
