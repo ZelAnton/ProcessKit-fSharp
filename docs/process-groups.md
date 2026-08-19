@@ -565,7 +565,7 @@ guarantee stays unconditional either way — see the four teardown needs (dispos
 
 `group.SoftStopScope()` answers "if I call `Signal(Signal.Term)` (or
 `ShutdownAsync`/`ShutdownReportAsync`) right now, which of this group's *current*
-members would actually receive that soft signal?" — a side-effect-free capability
+members have a live target for that soft signal?" — a side-effect-free capability
 query read from the group's live membership, so asking never changes what a later
 soft stop does:
 
@@ -580,7 +580,14 @@ Unlike `ContainmentCapabilities` (a fixed, pre-creation snapshot for a set of
 call — the same reason `ProcessGroup.Mechanism` is per-group rather than a platform
 constant. It only ever describes the soft tier: the unconditional hard kill
 (`Signal.Kill`, `KillAll`, disposing the group) always reaches the whole tree
-regardless of what this reports.
+regardless of what this reports. On Windows, `OptInMembers` is a capability report,
+not a delivery guarantee: a live console-CTRL leader can still see
+`GenerateConsoleCtrlEvent` fail for reasons this read does not probe (such as the
+caller having no console to share), in which case the later `Signal(Int/Term)`
+call returns `ProcessError.Unsupported` even though `SoftStopScope` reported
+`OptInMembers`. The cgroup and POSIX `WholeTree` cases have no such gap — the
+signal write/`killpg` call itself is the delivery mechanism, not a separate step
+that can independently fail.
 
 ## Signals and suspend/resume
 

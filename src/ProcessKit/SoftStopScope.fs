@@ -2,8 +2,9 @@ namespace ProcessKit
 
 /// How far a **soft stop** — a `Signal.Term`/`Signal.Int`-class request that asks a tree to exit
 /// cleanly rather than hard-killing it — reaches on *this* group, right now: the honest answer to "if I
-/// call `group.Signal(Signal.Term)` this instant, which of its members will actually receive that
-/// request?", read with `ProcessGroup.SoftStopScope()` *before* the signal is attempted.
+/// call `group.Signal(Signal.Term)` this instant, which of its members have a live target for that
+/// request?", read with `ProcessGroup.SoftStopScope()` *before* the signal is attempted. This is a
+/// capability report, not a delivery guarantee — see below.
 ///
 /// This is a **capability report, not an action**: querying it delivers no signal, posts no `WM_CLOSE`,
 /// spawns nothing, and does not mutate the group — asking never changes the answer a later `Signal` call
