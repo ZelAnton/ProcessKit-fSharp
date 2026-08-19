@@ -2002,6 +2002,59 @@ type ReadinessTests() =
         }
         :> Task
 
+    // Relative-path resolution contract (R-01): a relative `path` resolves against the run's own
+    // configured `Command.CurrentDir`, the CHILD's working directory — not against whatever directory
+    // this test process happens to be running from — the same rule `Command.PreferLocal` already
+    // applies to its own relative entries.
+    [<Test>]
+    member _.``WaitForPath resolves a relative path against the configured CurrentDir``() : Task =
+        task {
+            let childDir = Directory.CreateTempSubdirectory("processkit-waitforpath-").FullName
+            let relativeName = $"processkit-{Guid.NewGuid():N}.ready"
+            File.WriteAllText(Path.Combine(childDir, relativeName), "")
+
+            try
+                let config = (Command.create "test" |> Command.currentDir childDir).Config
+                use running = syntheticProcessWith config (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForPathAsync(relativeName, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.Pass()
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                Directory.Delete(childDir, true)
+        }
+        :> Task
+
+    // The other half of the same contract: a same-named relative path sitting in a DIFFERENT
+    // directory must not be mistaken for the configured `CurrentDir`'s own sentinel — proving the
+    // resolution looks exactly where R-01 ratified it should, not "somewhere" that happens to match.
+    [<Test>]
+    member _.``WaitForPath does not consider a relative path ready when it exists only outside the configured CurrentDir``
+        ()
+        : Task =
+        task {
+            let childDir =
+                Directory.CreateTempSubdirectory("processkit-waitforpath-child-").FullName
+
+            let elsewhereDir =
+                Directory.CreateTempSubdirectory("processkit-waitforpath-elsewhere-").FullName
+
+            let relativeName = $"processkit-{Guid.NewGuid():N}.ready"
+            File.WriteAllText(Path.Combine(elsewhereDir, relativeName), "")
+
+            try
+                let config = (Command.create "test" |> Command.currentDir childDir).Config
+                use running = syntheticProcessWith config (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForPathAsync(relativeName, TimeSpan.FromMilliseconds 250.0) with
+                | Error(ProcessError.NotReady _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected NotReady (elsewhere-directory hit must not count), got {other}"
+            finally
+                Directory.Delete(childDir, true)
+                Directory.Delete(elsewhereDir, true)
+        }
+        :> Task
+
     [<Test>]
     member _.``WaitAny returns the first process to exit``() : Task =
         task {

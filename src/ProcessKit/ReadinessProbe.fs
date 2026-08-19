@@ -109,8 +109,8 @@ module internal ReadinessProbe =
             min remaining pollBackoff
 
     /// The single polling/deadline core every readiness probe funnels through: the HTTP
-    /// (`waitForHttpUsing`), port (`waitForPortUsing`), Unix domain socket (`waitForSocketUsing`), and
-    /// custom (`waitFor`) probes each express their per-attempt check as a
+    /// (`waitForHttpUsing`), port (`waitForPortUsing`), Unix domain socket (`waitForSocketUsing`), path
+    /// (`waitForPathUsing`), and custom (`waitFor`) probes each express their per-attempt check as a
     /// `probe: CancellationToken -> Task<bool>` (true = ready) and hand it here, so the deadline
     /// mechanics live in exactly one place instead of being hand-synchronised across copies. Polls
     /// `probe` until it returns true, or fails with `NotReady` once the shared
@@ -456,13 +456,33 @@ module internal ReadinessProbe =
 
         waitForCoreUsing timeProvider program probe attempts timeout cancellationToken
 
+    /// Resolves a caller-supplied `path` against `workingDirectory` exactly the way
+    /// `Command.PreferLocal`'s own relative-entry resolution does (`Native.Common.commandContext`):
+    /// an absolute `path` is returned unchanged; a relative one is combined with `workingDirectory`
+    /// when the command set one, and otherwise left as-is (so it still resolves against THIS
+    /// process's own current directory, matching every BCL filesystem call that receives it
+    /// unresolved). Factored out so `waitForPath`'s single up-front resolution follows the same rule
+    /// as the rest of the codebase instead of inventing its own.
+    let private resolvePathAgainstWorkingDirectory (workingDirectory: string option) (path: string) : string =
+        if Path.IsPathRooted path then
+            path
+        else
+            match workingDirectory with
+            | Some cwd -> Path.Combine(cwd, path)
+            | None -> path
+
     /// Wait until `path` exists on the real filesystem — as a file, a directory, or anything else
     /// `File.Exists`/`Directory.Exists` can observe — or fail with `NotReady` once the shared `timeout`
     /// deadline elapses (or `Cancelled` if `cancellationToken` fires first). See
     /// `waitForPathUsing`/`waitForCoreUsing` for the full deadline contract and the existence-only
-    /// contract. Background-drains (and discards) the child's piped `stdout`/`stderr` for the duration of
-    /// the poll, exactly like `waitForPort` — see `withBackgroundDrain`. Child-exit detection is not done
-    /// here: `RunningProcess.WaitForPathAsync` layers it on (racing this against the handle's shared
+    /// contract. A relative `path` resolves against `workingDirectory` (the run's own
+    /// `Command.CurrentDir`, i.e. the CHILD's working directory) when one was set — the same rule
+    /// `Command.PreferLocal` already applies to its own relative entries — and otherwise resolves
+    /// against this process's own current directory, exactly like an unresolved `File.Exists` call
+    /// would; the resolution happens once, before polling starts, not per attempt. Background-drains
+    /// (and discards) the child's piped `stdout`/`stderr` for the duration of the poll, exactly like
+    /// `waitForPort` — see `withBackgroundDrain`. Child-exit detection is not done here:
+    /// `RunningProcess.WaitForPathAsync` layers it on (racing this against the handle's shared
     /// reap-once exit wait), the same early-exit contract every other probe honours. An existence check
     /// has no platform precondition (unlike `waitForSocket`'s `AF_UNIX` requirement), so this never
     /// returns `ProcessError.Unsupported`.
@@ -471,16 +491,19 @@ module internal ReadinessProbe =
         (program: string)
         (stdout: Stream option)
         (stderr: Stream option)
+        (workingDirectory: string option)
         (path: string)
         (attempts: ReadinessAttempts)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
+        let resolvedPath = resolvePathAgainstWorkingDirectory workingDirectory path
+
         let pathExists (candidate: string) : bool =
             File.Exists candidate || Directory.Exists candidate
 
         withBackgroundDrain stdout stderr (fun () ->
-            waitForPathUsing timeProvider pathExists program path attempts timeout cancellationToken)
+            waitForPathUsing timeProvider pathExists program resolvedPath attempts timeout cancellationToken)
 
     /// Poll an HTTP endpoint until a response satisfies `isSatisfactory`, or fail with `NotReady` once
     /// the shared `timeout` deadline elapses (or `Cancelled` if `cancellationToken` fires first).

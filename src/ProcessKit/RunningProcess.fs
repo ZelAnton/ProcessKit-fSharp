@@ -186,7 +186,7 @@ type RunningProcess
             None, None
 
     // The probe-vs-exit race (`ReadinessRace.raceAgainstExit`), bound to THIS handle's config, its
-    // still-`Fresh` pipe snapshot and its one memoized exit wait. All five readiness verbs go through
+    // still-`Fresh` pipe snapshot and its one memoized exit wait. All six readiness verbs go through
     // this one choke point, so their early-exit behaviour cannot drift apart (KB K-043).
     let raceReadinessAgainstExit
         (timeout: TimeSpan)
@@ -444,6 +444,7 @@ type RunningProcess
                 config.Program
                 stdout
                 stderr
+                config.WorkingDirectory
                 path
                 attempts
                 budget
@@ -1580,6 +1581,13 @@ type RunningProcess
     /// readiness signal for a pidfile, a sentinel/lock file, or a Unix-socket pathname a daemon creates
     /// before a caller should attempt a richer connection probe (`WaitForSocketAsync`).
     ///
+    /// A relative `path` resolves against this run's own `Command.CurrentDir` (the CHILD's working
+    /// directory) when one was set — the same rule `Command.PreferLocal` already applies to its own
+    /// relative entries — and otherwise resolves against the calling process's current directory, the
+    /// same as an unresolved `File.Exists` call. Pass an absolute `path` for a sentinel the child
+    /// writes when no `CurrentDir` is configured, so the probe does not depend on where this process
+    /// happens to be running from.
+    ///
     /// EXISTENCE ONLY: a file and a directory both count as ready the instant `stat` can see them —
     /// this does not require the path to be a regular file, does not wait for its writer to finish, and
     /// makes no size/stability promise, so a sentinel a daemon `touch`es before it is done writing
@@ -1628,7 +1636,7 @@ type RunningProcess
     /// streaming session. A capture verb (`OutputStringAsync`/`OutputBytesAsync`/`StdoutLinesAsync`/
     /// `OutputEventsAsync`) called AFTER this probe therefore only sees what the child wrote after the
     /// probe concluded, not the full run — the same "doesn't compose with a subsequent fresh capture"
-    /// limitation `WaitForLineAsync` already documents, now uniform across all five readiness probes. If
+    /// limitation `WaitForLineAsync` already documents, now uniform across every other readiness probe. If
     /// a buffered/streaming verb already claimed the pipes before this call, that verb's own pump is
     /// already draining them and this probe leaves them alone (no second reader).
     member _.WaitForPortAsync

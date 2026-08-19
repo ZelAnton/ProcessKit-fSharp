@@ -1397,7 +1397,10 @@ Probe semantics are deliberately uniform:
   reported ready the instant it appears; probe a stronger "fully written" condition yourself with
   `WaitForAsync` when that distinction matters. A lookup failure (permissions, a transient I/O error)
   is treated the same as "not there yet" and retried until the deadline, and this probe never returns
-  `ProcessError.Unsupported` — an existence check has no platform precondition.
+  `ProcessError.Unsupported` — an existence check has no platform precondition. A relative `path`
+  resolves against the run's own `CurrentDir` (the child's working directory) when one was configured
+  on the `Command`, otherwise against the calling process's own current directory — pass an absolute
+  `path` for a child sentinel when no `CurrentDir` is set.
 
 `WaitForAsync` takes a function returning `Task<bool>` (`Func<Task<bool>>` from C#), so any
 async health check fits — re-evaluated until it returns `true` or the deadline elapses.
