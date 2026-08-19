@@ -1238,7 +1238,7 @@ peer's stdin for the usual `shutdown`/`exit` handshake. Dispose the `RunningProc
 ## Readiness probes
 
 "Start a server, then use it" needs the server to be *ready*, not merely started.
-Five probes replace the arbitrary sleep, each bounded by its own deadline and each
+Six probes replace the arbitrary sleep, each bounded by its own deadline and each
 returning a `Result`:
 
 **F#**
@@ -1285,7 +1285,14 @@ task {
         | Ok() -> printfn "configured HTTP health check passed"
         | Error err -> eprintfn $"{err.Message}"
 
-        // 5. Any async predicate (a file appearing, a custom dependency check, …):
+        // 5. A filesystem path appearing (a pidfile, a sentinel/lock file, a socket path
+        //    someone else will dial) — existence only, not "fully written":
+        match! proc.WaitForPathAsync("/run/my-server.pid", TimeSpan.FromSeconds 10.0) with
+        | Ok() -> printfn "pidfile is there"
+        | Error err -> eprintfn $"{err.Message}"
+
+        // 6. Any async predicate (a custom dependency check, a stronger "file is fully
+        //    written" check, …):
         match! proc.WaitForAsync((fun () -> healthCheck ()), TimeSpan.FromSeconds 10.0) with
         | Ok() -> printfn "healthy"
         | Error err -> eprintfn $"{err.Message}"
@@ -1341,7 +1348,15 @@ Console.WriteLine(await proc.WaitForHttpAsync(health, healthClient, TimeSpan.Fro
     { IsOk: false, ErrorValue: var err } => err.Message,
 });
 
-// 5. Any async predicate (a file appearing, a custom dependency check, …):
+// 5. A filesystem path appearing (a pidfile, a sentinel/lock file, a socket path
+//    someone else will dial) — existence only, not "fully written":
+Console.WriteLine(await proc.WaitForPathAsync("/run/my-server.pid", TimeSpan.FromSeconds(10)) switch
+{
+    { IsOk: true }        => "pidfile is there",
+    { IsOk: false, ErrorValue: var err } => err.Message,
+});
+
+// 6. Any async predicate (a custom dependency check, a stronger "file is fully written" check, …):
 Console.WriteLine(await proc.WaitForAsync(() => healthCheck(), TimeSpan.FromSeconds(10)) switch
 {
     { IsOk: true }        => "healthy",
@@ -1355,27 +1370,37 @@ Probe semantics are deliberately uniform:
   distinct from `ProcessError.Timeout`, which is the run's own deadline.
 - A probe also fails *fast* once readiness can no longer happen: the child exits, or
   (for `WaitForLineAsync`) its stdout closes — no waiting out a 10s deadline on a dead
-  server. Observing the exit does not by itself discard readiness, though: the four
+  server. Observing the exit does not by itself discard readiness, though: the five
   external-condition probes (`WaitForPortAsync` / `WaitForSocketAsync` / `WaitForHttpAsync` /
-  `WaitForAsync`) check the condition exactly one more time first — bounded by what is left of the
-  deadline and by a brief grace — so a port, socket, endpoint, or sentinel published immediately
-  before the child terminated still reports `Ok` instead of being lost to that exit. Expect that one
-  extra invocation of a `WaitForAsync` predicate; an already-cancelled token or a spent deadline
-  skips it.
+  `WaitForPathAsync` / `WaitForAsync`) check the condition exactly one more time first — bounded by
+  what is left of the deadline and by a brief grace — so a port, socket, endpoint, or sentinel path
+  published immediately before the child terminated still reports `Ok` instead of being lost to that
+  exit. Expect that one extra invocation of a `WaitForAsync` predicate; an already-cancelled token or
+  a spent deadline skips it.
 - A failed probe **never kills the child.** You decide what happens next: retry, log
   and continue, or tear down.
-- All five probes background-drain the child's piped stdout/stderr while polling, so a chatty
+- All six probes background-drain the child's piped stdout/stderr while polling, so a chatty
   child that writes more than one OS pipe buffer of startup output (~64 KiB on Linux) before
   becoming ready can't block in `write()` and spuriously fail the probe with `NotReady`.
   `WaitForLineAsync` hands the drained stdout back to you (consumed up to and including the
   matching line — continue with `FinishAsync()` or further streaming afterwards); `WaitForPortAsync` /
-  `WaitForSocketAsync` / `WaitForHttpAsync` / `WaitForAsync` discard what they drain and stop draining
-  once the probe concludes. Either way, a capture verb called afterward (`OutputStringAsync`/
-  `OutputBytesAsync`/a fresh `StdoutLinesAsync`/`OutputEventsAsync`) only sees output the child wrote
-  *after* the probe concluded — run probes before a capturing verb if you need the complete output.
+  `WaitForSocketAsync` / `WaitForHttpAsync` / `WaitForPathAsync` / `WaitForAsync` discard what they
+  drain and stop draining once the probe concludes. Either way, a capture verb called afterward
+  (`OutputStringAsync`/`OutputBytesAsync`/a fresh `StdoutLinesAsync`/`OutputEventsAsync`) only sees
+  output the child wrote *after* the probe concluded — run probes before a capturing verb if you
+  need the complete output.
 - `WaitForSocketAsync` requires the host to support `AF_UNIX` sockets (Windows 10 1809+, any current
   Linux/macOS); a host without that support fails immediately with `ProcessError.Unsupported`, before
   ever attempting to dial — never a silent downgrade or a hang.
+- `WaitForPathAsync` checks **existence only** — a file and a directory both count, and it does not
+  wait for the writer to finish. A pidfile a daemon `touch`es before it is done writing elsewhere is
+  reported ready the instant it appears; probe a stronger "fully written" condition yourself with
+  `WaitForAsync` when that distinction matters. A lookup failure (permissions, a transient I/O error)
+  is treated the same as "not there yet" and retried until the deadline, and this probe never returns
+  `ProcessError.Unsupported` — an existence check has no platform precondition. A relative `path`
+  resolves against the run's own `CurrentDir` (the child's working directory) when one was configured
+  on the `Command`, otherwise against the calling process's own current directory — pass an absolute
+  `path` for a child sentinel when no `CurrentDir` is set.
 
 `WaitForAsync` takes a function returning `Task<bool>` (`Func<Task<bool>>` from C#), so any
 async health check fits — re-evaluated until it returns `true` or the deadline elapses.

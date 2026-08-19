@@ -142,7 +142,7 @@ says why, and the matching verb still refuses with its own typed `ProcessError`.
 | `AdoptionByPid` | `ProcessGroup.AdoptByPid` — a separate axis, because a bare pid needs an identity *anchor* rather than a relocation primitive, and the two answers differ on the POSIX process group | [Adopting an external process](#capability-matrices) |
 | `Pty` / `PtyResize` | `Command.Pty`, and `RunningProcess.ResizeAsync` on such a run | [PTY capabilities](#pseudo-terminal-pty-capabilities) |
 | `KillOnParentDeath` / `KillOnParentDeathScope` | `Command.KillOnParentDeath`, and how far its cleanup reaches | [Reaping on sudden parent death](#capability-matrices) |
-| `Helpers` | the external binaries this platform's spawn paths load (`setpriv`, `setsid`, `/bin/sh`; `cmd.exe` on Windows), what each is for, and whether this host holds it | [Caveats](#caveats) |
+| `Helpers` | the external binaries this platform's spawn paths load (`setpriv`, `setsid`, `prlimit`, `/bin/sh`; `cmd.exe` on Windows), what each is for, and whether this host holds it | [Caveats](#caveats) |
 
 Two reading rules keep the answers honest, and are worth knowing before you branch on them:
 
@@ -474,6 +474,26 @@ limit-capable container; the POSIX process-group mechanism supports only the per
 rlimit. Any unsupported request fails at creation with `ProcessError.ResourceLimit` rather than
 returning a silently-unbounded group.
 
+**Per-process resource limits (`Command.Rlimit`)**
+
+| Capability | Windows | Linux | macOS / BSD |
+|---|:---:|:---:|:---:|
+| `Rlimit(Cpu\|Core\|Data\|FileSize\|NoFile\|Stack, soft, hard)` | ❌ `ProcessError.Unsupported` | ✅ via util-linux `prlimit` | ❌ `ProcessError.ResourceLimit` (no util-linux) |
+
+`Command.Rlimit` caps ONE process rather than the tree: the value is applied to the child before its
+program starts (`setrlimit(2)` semantics) and inherited individually by every descendant, each of which
+may lower it further or raise its soft value back to the inherited hard one. Values are in the
+resource's own unit — bytes for `Core`/`Data`/`FileSize`/`Stack`, seconds for `Cpu`, a count for
+`NoFile` — and there is no "unlimited" value, because the builder exists to lower what the child
+inherited. Applying it needs a helper that can call `setrlimit` between the spawn and the `exec`, which
+on .NET means an external one: util-linux's `prlimit`, resolved only from a trusted system directory
+(`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and never from `PATH`, exactly as `setpriv` is. A host
+holding it in none of them — macOS/BSD, which have no util-linux, or a minimal image — refuses the
+spawn with `ProcessError.ResourceLimit`; Windows, which has no `setrlimit` concept at all, refuses with
+`ProcessError.Unsupported` and offers the whole-tree Job Object caps above instead. Where `Cpu` meets
+the group's `WithCpuTimeMax`, the stricter of the two values is what the child gets
+(see [Resource limits](process-groups.md#per-process-limits-on-a-command)).
+
 `WithCpuAffinity` pins the tree to a set of zero-based core indices and carries two platform ceilings,
 both reported as a typed `ProcessError.ResourceLimit` at creation/update rather than as a silently
 dropped pin. **Windows:** `JOBOBJECT_BASIC_LIMIT_INFORMATION.Affinity` is one pointer-sized mask
@@ -567,6 +587,7 @@ examples.
 | Combined with `Command.Pty` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (`setsid --ctty` has no `argv[0]` seam) |
 | Combined with a run under the Linux cgroup backend | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the `/bin/sh` migration launcher has no `argv[0]` seam) |
 | Combined with `ResourceLimits.CpuTimeMax` on the POSIX process-group mechanism | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the `/bin/sh` `RLIMIT_CPU` shim has no `argv[0]` seam) |
+| Combined with any `Command.Rlimit` value | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (the util-linux `prlimit` helper has no `argv[0]` seam) |
 | Combined with a lone `Setsid` (no privilege drop) | ❌ `ProcessError.Unsupported` | ✅ composes normally (no helper involved) |
 
 `Program` alone still drives PATH/`PreferLocal` resolution, preflight, and spawn diagnostics — the
@@ -722,8 +743,9 @@ that is actually launched (multicall binaries, login-shell conventions). Windows
 (same typed error, at spawn time) when combined with a knob whose spawn path re-`exec`s the target
 by name through a helper with no seam of its own for a distinct `argv[0]`: a `Uid`/`Gid`/`Groups`/
 `KillOnParentDeath` drop (`setpriv`), `Pty` (`setsid --ctty`), a run under the Linux cgroup
-backend (the `/bin/sh` migration launcher), or a `ResourceLimits.CpuTimeMax` run on the POSIX
-process-group mechanism (the `/bin/sh` `RLIMIT_CPU` shim) — see
+backend (the `/bin/sh` migration launcher), a `ResourceLimits.CpuTimeMax` run on the POSIX
+process-group mechanism (the `/bin/sh` `RLIMIT_CPU` shim), or any `Command.Rlimit` value
+(the util-linux `prlimit` helper) — see
 [Running commands](commands.md#posix-argv0-override-arg0).
 
 **POSIX process groups: a `setsid` child can escape.** The process-group mechanism tracks each

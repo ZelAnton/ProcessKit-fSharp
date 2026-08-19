@@ -128,6 +128,7 @@ class ProcessKit.Command
   member Retry(System.Int32, System.TimeSpan, System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Command
   member RetryBackoff(System.Int32, System.TimeSpan, System.Double, System.TimeSpan, System.Boolean, System.Func<ProcessKit.ProcessError, System.Boolean>) : ProcessKit.Command
   member RetryNever() : ProcessKit.Command
+  member Rlimit(ProcessKit.RlimitResource, System.Int64, System.Int64) : ProcessKit.Command
   member Setsid() : ProcessKit.Command
   member Stderr(ProcessKit.StdioMode) : ProcessKit.Command
   member StderrEncoding(System.Text.Encoding) : ProcessKit.Command
@@ -160,6 +161,7 @@ class ProcessKit.Command
   property Arguments : System.Collections.Generic.IReadOnlyList<System.String> { get }
   property ConfiguredTimeout : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
   property Program : System.String { get }
+  property Rlimits : System.Collections.Generic.IReadOnlyList<ProcessKit.Rlimit> { get }
   property WorkingDirectory : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
 
 module ProcessKit.CommandModule
@@ -199,6 +201,7 @@ module ProcessKit.CommandModule
   static member retry(System.Int32, System.TimeSpan, Microsoft.FSharp.Core.FSharpFunc<ProcessKit.ProcessError, System.Boolean>, ProcessKit.Command) : ProcessKit.Command
   static member retryBackoff(System.Int32, System.TimeSpan, System.Double, System.TimeSpan, System.Boolean, Microsoft.FSharp.Core.FSharpFunc<ProcessKit.ProcessError, System.Boolean>, ProcessKit.Command) : ProcessKit.Command
   static member retryNever(ProcessKit.Command) : ProcessKit.Command
+  static member rlimit(ProcessKit.RlimitResource, System.Int64, System.Int64, ProcessKit.Command) : ProcessKit.Command
   static member setsid(ProcessKit.Command) : ProcessKit.Command
   static member stderr(ProcessKit.StdioMode, ProcessKit.Command) : ProcessKit.Command
   static member stderrEncoding(System.Text.Encoding, ProcessKit.Command) : ProcessKit.Command
@@ -1300,6 +1303,61 @@ class ProcessKit.ResultExtensions
   static member Switch<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, System.Action<T>, System.Action<ProcessKit.ProcessError>) : System.Void
   static member TryGetValue<T>(Microsoft.FSharp.Core.FSharpResult<T, ProcessKit.ProcessError>, T&, ProcessKit.ProcessError&) : System.Boolean
 
+class ProcessKit.Rlimit
+  member ToString() : System.String
+  property Hard : System.Int64 { get }
+  property Resource : ProcessKit.RlimitResource { get }
+  property Soft : System.Int64 { get }
+
+class ProcessKit.RlimitResource
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.RlimitResource>
+  member Equals(ProcessKit.RlimitResource) : System.Boolean
+  member Equals(ProcessKit.RlimitResource, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsCore() : System.Boolean
+  member get_IsCpu() : System.Boolean
+  member get_IsData() : System.Boolean
+  member get_IsFileSize() : System.Boolean
+  member get_IsNoFile() : System.Boolean
+  member get_IsStack() : System.Boolean
+  member get_Tag() : System.Int32
+  property All : System.Collections.Generic.IReadOnlyList<ProcessKit.RlimitResource> { get }
+  property Core : ProcessKit.RlimitResource { get }
+  property Cpu : ProcessKit.RlimitResource { get }
+  property Data : ProcessKit.RlimitResource { get }
+  property FileSize : ProcessKit.RlimitResource { get }
+  property IsCore : System.Boolean { get }
+  property IsCpu : System.Boolean { get }
+  property IsData : System.Boolean { get }
+  property IsFileSize : System.Boolean { get }
+  property IsNoFile : System.Boolean { get }
+  property IsStack : System.Boolean { get }
+  property Name : System.String { get }
+  property NoFile : ProcessKit.RlimitResource { get }
+  property Stack : ProcessKit.RlimitResource { get }
+  property Tag : System.Int32 { get }
+  static member FromName(System.String) : ProcessKit.RlimitResource
+  static member TryFromName(System.String) : Microsoft.FSharp.Core.FSharpOption<ProcessKit.RlimitResource>
+  static member get_Core() : ProcessKit.RlimitResource
+  static member get_Cpu() : ProcessKit.RlimitResource
+  static member get_Data() : ProcessKit.RlimitResource
+  static member get_FileSize() : ProcessKit.RlimitResource
+  static member get_NoFile() : ProcessKit.RlimitResource
+  static member get_Stack() : ProcessKit.RlimitResource
+
+module ProcessKit.RlimitResource+Tags
+  field literal Core : System.Int32
+  field literal Cpu : System.Int32
+  field literal Data : System.Int32
+  field literal FileSize : System.Int32
+  field literal NoFile : System.Int32
+  field literal Stack : System.Int32
+
 class ProcessKit.RotatingFileSink : System.IO.Stream
   :> System.IAsyncDisposable
   :> System.IDisposable
@@ -1382,6 +1440,7 @@ class ProcessKit.RunningProcess
   member WaitForHttpAsync(System.Uri, System.Net.Http.HttpClient, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForHttpAsync(System.Uri, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForLineAsync(System.Func<System.String, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  member WaitForPathAsync(System.String, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForPortAsync(System.Net.IPEndPoint, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForSocketAsync(System.String, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }

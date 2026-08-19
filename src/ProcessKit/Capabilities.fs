@@ -58,8 +58,8 @@ type Capability =
 [<Sealed>]
 type PlatformHelper internal (name: string, purpose: string, availability: Capability) =
 
-    /// The helper as it is named on this platform (`setpriv`, `setsid`, `/bin/sh`, `cmd.exe`). Never a
-    /// resolved absolute path: the snapshot reports capability, not this host's filesystem layout.
+    /// The helper as it is named on this platform (`setpriv`, `setsid`, `prlimit`, `/bin/sh`, `cmd.exe`).
+    /// Never a resolved absolute path: the snapshot reports capability, not this host's filesystem layout.
     member _.Name = name
 
     /// What ProcessKit needs it for — the knobs and paths that stop working without it.
@@ -388,6 +388,11 @@ module internal CapabilityProbe =
             /// POSIX only: the `setsid` controlling-terminal helper resolves in a trusted directory.
             ControllingTerminalHelperAvailable: bool
 
+            /// POSIX only: the `prlimit` helper that applies `Command.Rlimit` — the PER-PROCESS
+            /// `setrlimit(2)` caps, not the whole-tree `ResourceLimits` above — resolves in a trusted
+            /// directory.
+            ProcessLimitHelperAvailable: bool
+
             /// POSIX only: `/bin/sh` is present and executable (the cgroup launcher, the `RLIMIT_CPU` shim,
             /// and the `KillOnParentDeath` pre-arm guard all `exec` it by absolute path).
             SystemShellAvailable: bool
@@ -651,6 +656,16 @@ module internal CapabilityProbe =
                       (trustedHelperMissing "setsid" facts.TrustedHelperDirectories "the Pty controlling terminal")
               )
               PlatformHelper(
+                  "prlimit",
+                  "the Command.Rlimit per-process setrlimit(2) caps, which it applies to itself before it execs the target in place",
+                  availableWhen
+                      facts.ProcessLimitHelperAvailable
+                      (trustedHelperMissing
+                          "prlimit"
+                          facts.TrustedHelperDirectories
+                          "the Command.Rlimit per-process caps")
+              )
+              PlatformHelper(
                   "/bin/sh",
                   "the cgroup v2 self-migrating launcher, the CpuTimeMax (RLIMIT_CPU) shim, and the KillOnParentDeath pre-arm guard",
                   availableWhen
@@ -736,6 +751,7 @@ module internal CapabilityProbe =
               PtyHostRefusal = (if isWindows then None else Native.Posix.ptyHostSupport ())
               PrivilegeDropHelperAvailable = not isWindows && Native.Posix.privilegeDropHelperAvailable ()
               ControllingTerminalHelperAvailable = not isWindows && Native.Posix.controllingTerminalHelperAvailable ()
+              ProcessLimitHelperAvailable = not isWindows && Native.Posix.processLimitHelperAvailable ()
               SystemShellAvailable = not isWindows && Native.Posix.systemShellAvailable ()
               ProcessIdentityReaderAvailable = not isWindows && Native.Posix.processIdentityReaderAvailable ()
               TrustedHelperDirectories =
