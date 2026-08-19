@@ -35,7 +35,7 @@ type ApiParityTests() =
 
     [<Test>]
     member _.``ProcessError accessors read fields across cases without destructuring``() =
-        let exit = ProcessError.Exit("git", 2, "out", "err", None)
+        let exit = ProcessError.Exit("git", 2, "out", "err")
         Assert.That(exit.Program, Is.EqualTo(Some "git"))
         Assert.That(exit.Code, Is.EqualTo(Some 2))
         Assert.That(exit.Stdout, Is.EqualTo(Some "out"))
@@ -44,7 +44,7 @@ type ApiParityTests() =
         Assert.That(exit.Combined, Is.EqualTo(Some "out\nerr"))
         Assert.That(exit.StdoutBytes, Is.EqualTo(None: byte[] option))
 
-        let signalled = ProcessError.Signalled("tool", Some 9, "", "boom", None)
+        let signalled = ProcessError.Signalled("tool", Some 9, "", "boom")
         Assert.That(signalled.Program, Is.EqualTo(Some "tool"))
         Assert.That(signalled.Signal, Is.EqualTo(Some 9))
         Assert.That(signalled.Code, Is.EqualTo(None: int option))
@@ -208,11 +208,12 @@ type ApiParityTests() =
             | Error error -> Assert.Fail $"OutputBytes errored: {error.Message}"
             | Ok result ->
                 match ProcessResult.ensureSuccess result with
-                | Error(ProcessError.Exit(_, code, _, _, stdoutBytes)) ->
+                | Error(ProcessError.Exit(_, code, _, _) as error) ->
                     Assert.That(code, Is.EqualTo 7)
                     // A bytes-based checking verb: FailureError attaches the exact pre-decode bytes
-                    // alongside the decoded Stdout text (T-391).
-                    Assert.That(stdoutBytes, Is.EqualTo(Some result.Stdout))
+                    // alongside the decoded Stdout text (T-391), via `ProcessError.AttachStdoutBytes`'s
+                    // identity-keyed side channel rather than a constructor field.
+                    Assert.That(error.StdoutBytes, Is.EqualTo(Some result.Stdout))
                 | Error other -> Assert.Fail $"expected an Exit error, got {other.Message}"
                 | Ok _ -> Assert.Fail "expected exit 7 to fail ensureSuccess"
         }

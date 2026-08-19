@@ -144,20 +144,24 @@ type ProcessResult<'T>
     /// command or a pipeline) can never drift on how a non-zero exit, signal kill, or timeout is
     /// reported. For a `byte[]` capture the stdout is decoded with the configured `StdoutEncoding` to
     /// fill the (string) error field, and the exact pre-decode bytes are also attached to the error's
-    /// `StdoutBytes` — the ONE place that field is populated, so it can never drift from `StdoutText`'s
-    /// decoding. A `string` capture (or any non-`byte[]` capture) leaves `StdoutBytes` `None`: it is
-    /// never fabricated from the already-decoded text.
+    /// `StdoutBytes` (via `ProcessError.AttachStdoutBytes`'s identity-keyed side channel, not a
+    /// constructor field — see that member's doc for why) — the ONE place that field is populated, so it
+    /// can never drift from `StdoutText`'s decoding. A `string` capture (or any non-`byte[]` capture)
+    /// leaves `StdoutBytes` `None`: it is never fabricated from the already-decoded text.
     member internal this.FailureError: ProcessError =
-        let stdoutBytes =
-            match box stdout with
-            | :? (byte[]) as bytes -> Some bytes
-            | _ -> None
+        let error =
+            match outcome with
+            | Outcome.Exited code -> ProcessError.Exit(program, code, this.StdoutText, stderr)
+            | Outcome.Signalled signal -> ProcessError.Signalled(program, signal, this.StdoutText, stderr)
+            | Outcome.TimedOut -> ProcessError.Timeout(program, timeoutDuration, this.StdoutText, stderr)
+            | Outcome.Unobserved reason -> ProcessError.Unobserved(program, reason)
 
-        match outcome with
-        | Outcome.Exited code -> ProcessError.Exit(program, code, this.StdoutText, stderr, stdoutBytes)
-        | Outcome.Signalled signal -> ProcessError.Signalled(program, signal, this.StdoutText, stderr, stdoutBytes)
-        | Outcome.TimedOut -> ProcessError.Timeout(program, timeoutDuration, this.StdoutText, stderr, stdoutBytes)
-        | Outcome.Unobserved reason -> ProcessError.Unobserved(program, reason)
+        match outcome, box stdout with
+        | (Outcome.Exited _ | Outcome.Signalled _ | Outcome.TimedOut), (:? (byte[]) as bytes) ->
+            ProcessError.AttachStdoutBytes(error, bytes)
+        | _ -> ()
+
+        error
 
     /// Demand a successful run (an **accepted** exit code — one in `Command.OkCodes`, `{0}` by default):
     /// returns the result unchanged on success, otherwise the corresponding `ProcessError`

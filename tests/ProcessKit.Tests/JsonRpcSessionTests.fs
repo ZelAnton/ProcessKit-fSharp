@@ -475,7 +475,7 @@ type JsonRpcSessionTests() =
             let! answer = call
 
             match answer with
-            | Error(ProcessError.Timeout(program, timeout, _, _, _)) ->
+            | Error(ProcessError.Timeout(program, timeout, _, _)) ->
                 Assert.That(program, Is.EqualTo "language-server")
                 Assert.That(timeout, Is.EqualTo(TimeSpan.FromMilliseconds 200.0))
             | other -> Assert.Fail $"expected a timeout, got {other}"
@@ -624,7 +624,7 @@ type JsonRpcSessionTests() =
             peer.Stdin.StallWrites()
 
             match! session.RequestRawAsync("initialize", null, TimeSpan.FromMilliseconds 200.0) with
-            | Error(ProcessError.Timeout(program, timeout, _, _, _)) ->
+            | Error(ProcessError.Timeout(program, timeout, _, _)) ->
                 Assert.That(program, Is.EqualTo "language-server")
                 Assert.That(timeout, Is.EqualTo(TimeSpan.FromMilliseconds 200.0))
             | other -> Assert.Fail $"expected a typed timeout on the blocked send, got {other}"
@@ -742,7 +742,7 @@ type JsonRpcSessionTests() =
             try
                 // A per-request deadline that elapses while the send is parked on that feeder.
                 match! session.RequestRawAsync("textDocument/hover", null, TimeSpan.FromMilliseconds 150.0) with
-                | Error(ProcessError.Timeout(program, timeout, _, _, _)) ->
+                | Error(ProcessError.Timeout(program, timeout, _, _)) ->
                     Assert.That(program, Is.EqualTo "language-server")
                     Assert.That(timeout, Is.EqualTo(TimeSpan.FromMilliseconds 150.0))
                 | other -> Assert.Fail $"expected the parked send to time out alone, got {other}"
@@ -821,7 +821,7 @@ type JsonRpcSessionTests() =
             // The queued request's own 150 ms budget elapses while it is still waiting for that gate:
             // not one byte of ITS frame was written, so it fails alone instead of ending the session.
             match! session.RequestRawAsync("textDocument/hover", null, TimeSpan.FromMilliseconds 150.0) with
-            | Error(ProcessError.Timeout(program, timeout, _, _, _)) ->
+            | Error(ProcessError.Timeout(program, timeout, _, _)) ->
                 Assert.That(program, Is.EqualTo "language-server")
                 Assert.That(timeout, Is.EqualTo(TimeSpan.FromMilliseconds 150.0))
             | other -> Assert.Fail $"expected the queued request to time out alone, got {other}"

@@ -1125,7 +1125,7 @@ type PipelineTests() =
             let pipeline = (shell "exit 3").Pipe sortStage
 
             match! pipeline.RunAsync() with
-            | Error(ProcessError.Exit(_, 3, _, _, _)) -> Assert.Pass()
+            | Error(ProcessError.Exit(_, 3, _, _)) -> Assert.Pass()
             | other -> Assert.Fail $"expected Exit 3, got {other}"
         }
         :> Task
@@ -1628,7 +1628,7 @@ type PipelineTests() =
                 Assert.That(stopwatch.Elapsed, Is.GreaterThan(TimeSpan.FromMilliseconds 600.0))
 
                 match result.EnsureSuccess() with
-                | Error(ProcessError.Timeout(program, actual, _, _, _) as error) ->
+                | Error(ProcessError.Timeout(program, actual, _, _) as error) ->
                     Assert.That(actual, Is.EqualTo configured)
                     Assert.That(error.Message, Is.EqualTo($"'{program}' timed out after {configured.TotalSeconds}s"))
                 | other -> Assert.Fail $"expected Timeout, got {other}"
@@ -3019,7 +3019,7 @@ type PipelineTests() =
                 do! assertFinishesPromptly start
 
                 match! start with
-                | Error(ProcessError.Timeout(_, actual, _, _, _)) -> Assert.That(actual, Is.EqualTo configured)
+                | Error(ProcessError.Timeout(_, actual, _, _)) -> Assert.That(actual, Is.EqualTo configured)
                 | Error(ProcessError.Cancelled _) ->
                     Assert.Fail "a staging deadline must not be downgraded to Cancelled"
                 | other -> Assert.Fail $"expected Timeout, got {other}"

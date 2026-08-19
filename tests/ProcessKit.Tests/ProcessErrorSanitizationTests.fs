@@ -83,16 +83,16 @@ type ProcessErrorSanitizationTests() =
         [ "Spawn", ProcessError.Spawn(hostile, hostile)
           "NotFound", ProcessError.NotFound(hostile, Some hostile)
           "NotFound/unsearched", ProcessError.NotFound(hostile, None)
-          "Exit", ProcessError.Exit(hostile, 1, hostile, hostile, None)
-          "Signalled", ProcessError.Signalled(hostile, Some 9, hostile, hostile, None)
-          "Signalled/unknown", ProcessError.Signalled(hostile, None, hostile, hostile, None)
-          "Timeout", ProcessError.Timeout(hostile, TimeSpan.FromSeconds 3.0, hostile, hostile, None)
+          "Exit", ProcessError.Exit(hostile, 1, hostile, hostile)
+          "Signalled", ProcessError.Signalled(hostile, Some 9, hostile, hostile)
+          "Signalled/unknown", ProcessError.Signalled(hostile, None, hostile, hostile)
+          "Timeout", ProcessError.Timeout(hostile, TimeSpan.FromSeconds 3.0, hostile, hostile)
           "Unobserved", ProcessError.Unobserved(hostile, hostile)
           "Cancelled", ProcessError.Cancelled hostile
           "NotReady", ProcessError.NotReady(hostile, TimeSpan.FromSeconds 1.0)
           "Parse", ProcessError.Parse(hostile, hostile)
           "RetryPredicate",
-          ProcessError.RetryPredicate(hostile, ProcessError.Exit(hostile, 3, hostile, hostile, None), hostile)
+          ProcessError.RetryPredicate(hostile, ProcessError.Exit(hostile, 3, hostile, hostile), hostile)
           "JsonRpc", ProcessError.JsonRpc(hostile, hostile, -32601, hostile, Some hostile)
           "JsonRpc/no detail", ProcessError.JsonRpc(hostile, hostile, -32602, "", None)
           "OutputTooLarge/lines", ProcessError.OutputTooLarge(hostile, Some 10, None, 11, 512)
@@ -164,7 +164,7 @@ type ProcessErrorSanitizationTests() =
         let expected: string = $"failed to parse output of '{printable}': {printable}"
         Assert.That(parse.Message, Is.EqualTo expected)
 
-        let exited = ProcessError.Exit(printable, 2, "", printable, None)
+        let exited = ProcessError.Exit(printable, 2, "", printable)
         Assert.That(exited.Message, Is.EqualTo $"'{printable}' exited with code 2: {printable}")
 
     [<Test>]
@@ -174,17 +174,16 @@ type ProcessErrorSanitizationTests() =
         let stderr = "warning: first\nwarning: second\r\nremote: permission denied\n   \n\n"
         let stdout = "unrelated stdout chatter"
 
-        let exited = ProcessError.Exit("git", 1, stdout, stderr, None)
+        let exited = ProcessError.Exit("git", 1, stdout, stderr)
         Assert.That(exited.Message, Is.EqualTo "'git' exited with code 1: remote: permission denied")
 
-        let signalled = ProcessError.Signalled("git", Some 9, stdout, stderr, None)
+        let signalled = ProcessError.Signalled("git", Some 9, stdout, stderr)
         Assert.That(signalled.Message, Is.EqualTo "'git' was terminated by signal 9: remote: permission denied")
 
-        let killed = ProcessError.Signalled("git", None, stdout, stderr, None)
+        let killed = ProcessError.Signalled("git", None, stdout, stderr)
         Assert.That(killed.Message, Is.EqualTo "'git' was killed: remote: permission denied")
 
-        let timedOut =
-            ProcessError.Timeout("git", TimeSpan.FromSeconds 5.0, stdout, stderr, None)
+        let timedOut = ProcessError.Timeout("git", TimeSpan.FromSeconds 5.0, stdout, stderr)
 
         Assert.That(timedOut.Message, Is.EqualTo "'git' timed out after 5s: remote: permission denied")
 
@@ -208,22 +207,22 @@ type ProcessErrorSanitizationTests() =
 
         for name, separator in separators do
             let stderr = $"noise the operator must not see{separator}real: the last line"
-            let exited = ProcessError.Exit("tool", 1, "", stderr, None)
+            let exited = ProcessError.Exit("tool", 1, "", stderr)
 
             let quoted: string = $"{name} must end the line the tail is taken from"
             Assert.That(exited.Message, Is.EqualTo "'tool' exited with code 1: real: the last line", quoted)
 
     [<Test>]
     member _.``a blank stream adds no dangling separator``() =
-        let blank = ProcessError.Exit("git", 2, "", "   \n\n\t\n", None)
+        let blank = ProcessError.Exit("git", 2, "", "   \n\n\t\n")
         Assert.That(blank.Message, Is.EqualTo "'git' exited with code 2")
 
-        let empty = ProcessError.Timeout("git", TimeSpan.FromSeconds 1.0, "", "", None)
+        let empty = ProcessError.Timeout("git", TimeSpan.FromSeconds 1.0, "", "")
         Assert.That(empty.Message, Is.EqualTo "'git' timed out after 1s")
 
     [<Test>]
     member _.``a 100 KB stream renders as a small stable preview with an ellipsis``() =
-        let exited = ProcessError.Exit("tool", 1, hugeStream, hugeStream, None)
+        let exited = ProcessError.Exit("tool", 1, hugeStream, hugeStream)
 
         let bounded: string = "a 100 KB stderr must not reach the log line"
         Assert.That(exited.Message.Length, Is.LessThan 600, bounded)
@@ -232,7 +231,7 @@ type ProcessErrorSanitizationTests() =
         // Stable: ten times the input renders the same message, so the log line's size is a property of
         // the render, not of whatever the child decided to write.
         let tenfold =
-            ProcessError.Exit("tool", 1, hugeStream, String.replicate 10 hugeStream, None)
+            ProcessError.Exit("tool", 1, hugeStream, String.replicate 10 hugeStream)
 
         Assert.That(tenfold.Message, Is.EqualTo exited.Message)
 
@@ -321,7 +320,7 @@ type ProcessErrorSanitizationTests() =
 
     [<Test>]
     member _.``nesting a RetryPredicate cannot walk around the bound``() =
-        let leaf = ProcessError.Exit("tool", 1, hugeStream, hugeStream, None)
+        let leaf = ProcessError.Exit("tool", 1, hugeStream, hugeStream)
 
         let nest depth =
             List.fold (fun inner _ -> ProcessError.RetryPredicate("tool", inner, hugeStream)) leaf [ 1..depth ]
@@ -339,15 +338,14 @@ type ProcessErrorSanitizationTests() =
 
     [<Test>]
     member _.``the structured fields keep the caller's bytes untouched``() =
-        let original = ProcessError.Exit(hostile, 42, hugeStream, hostile, None)
+        let original = ProcessError.Exit(hostile, 42, hugeStream, hostile)
 
         match original with
-        | ProcessError.Exit(program, code, stdout, stderr, stdoutBytes) ->
+        | ProcessError.Exit(program, code, stdout, stderr) ->
             Assert.That(program, Is.EqualTo hostile)
             Assert.That(code, Is.EqualTo 42)
             Assert.That(stdout, Is.EqualTo hugeStream)
             Assert.That(stderr, Is.EqualTo hostile)
-            Assert.That(stdoutBytes, Is.EqualTo(None: byte[] option))
         | other -> Assert.Fail $"expected an Exit, got {other}"
 
         Assert.That(original.Program, Is.EqualTo(Some hostile))
@@ -379,7 +377,17 @@ type ProcessErrorSanitizationTests() =
         let rawBytes = [| 0x68uy; 0x69uy; 0x80uy; 0xC3uy; 0x41uy |]
         let decodedText = Text.Encoding.UTF8.GetString rawBytes
 
-        let error = ProcessError.Exit("tool", 1, decodedText, "", Some rawBytes)
+        // `ProcessResult.FailureError` is the ONE place `StdoutBytes` is ever attached (via
+        // `ProcessError.AttachStdoutBytes`'s identity-keyed side channel, not a constructor field — see
+        // its doc), so a bytes-based checking verb is exercised through `ProcessResult<byte[]>` here
+        // rather than by constructing the `Exit` case directly.
+        let error =
+            match
+                ProcessResult.Create rawBytes "" (Outcome.Exited 1) TimeSpan.Zero
+                |> ProcessResult.ensureSuccess
+            with
+            | Error e -> e
+            | Ok _ -> failwith "expected exit 1 to fail ensureSuccess"
 
         let roundTrip: string =
             "the exact bytes must round-trip through StdoutBytes, unchanged"
@@ -396,7 +404,14 @@ type ProcessErrorSanitizationTests() =
         assertDisplaySafe "Exit.Message (non-UTF-8 stdout)" error.Message
 
         // A text-based checking verb never fabricates bytes from an already-decoded string.
-        let textOnly = ProcessError.Exit("tool", 1, decodedText, "", None)
+        let textOnly =
+            match
+                ProcessResult.Create decodedText "" (Outcome.Exited 1) TimeSpan.Zero
+                |> ProcessResult.ensureSuccess
+            with
+            | Error e -> e
+            | Ok _ -> failwith "expected exit 1 to fail ensureSuccess"
+
         Assert.That(textOnly.StdoutBytes, Is.EqualTo(None: byte[] option), "text-based capture must stay None")
 
         // RetryPredicate forwards StdoutBytes through the same delegation as Stdout/Stderr/Code.

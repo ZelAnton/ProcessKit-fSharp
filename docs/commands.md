@@ -1714,8 +1714,8 @@ task {
     match! (Command.create "deploy").RunAsync() with
     | Ok out -> printfn $"{out}"
     | Error(ProcessError.NotFound(program, _)) -> eprintfn $"not installed: {program}"
-    | Error(ProcessError.Exit(program, code, _, stderr, _)) -> eprintfn $"{program} exited {code}: {stderr}"
-    | Error(ProcessError.Timeout(program, t, _, _, _)) -> eprintfn $"{program} timed out after {t}"
+    | Error(ProcessError.Exit(program, code, _, stderr)) -> eprintfn $"{program} exited {code}: {stderr}"
+    | Error(ProcessError.Timeout(program, t, _, _)) -> eprintfn $"{program} timed out after {t}"
     | Error err -> eprintfn $"{err.Message}"
 }
 ```
@@ -1737,9 +1737,9 @@ Console.WriteLine(await new Command("deploy").RunAsync() switch
 |---|---|---|
 | `ProcessError.Spawn` | `program, detail` | The program was located but the OS couldn't start it (permissions, a bad working directory, or a `.cmd`/`.bat` argument that can't be safely quoted for the `cmd.exe` wrapper — a `%`/`!`/newline, see [Program, arguments, working directory](#program-arguments-working-directory)). **Not** `isNotFound`. |
 | `ProcessError.NotFound` | `program, Searched: string option` | The program couldn't be located (`isNotFound` is `true`); `searched` is the probed path when known. |
-| `ProcessError.Exit` | `program, code, stdout, stderr, stdoutBytes: byte[] option` | A success-requiring verb saw a non-zero exit; both streams attached in full. `stdoutBytes` (read via the `StdoutBytes` accessor) is the exact pre-decode capture when the checking verb was built over `ProcessResult<byte[]>`, `None` for a text-based capture. |
-| `ProcessError.Signalled` | `program, signal: int option, stdout, stderr, stdoutBytes: byte[] option` | Killed by a signal with no exit code; `signal` carries the number on Unix, `None` elsewhere; the partial streams captured before the kill are attached. `stdoutBytes` follows the same rule as `Exit`'s. |
-| `ProcessError.Timeout` | `program, timeout, stdout, stderr, stdoutBytes: byte[] option` | The run's own deadline killed it; whatever it captured before the kill is attached. `stdoutBytes` follows the same rule as `Exit`'s. |
+| `ProcessError.Exit` | `program, code, stdout, stderr` | A success-requiring verb saw a non-zero exit; both streams attached in full. |
+| `ProcessError.Signalled` | `program, signal: int option, stdout, stderr` | Killed by a signal with no exit code; `signal` carries the number on Unix, `None` elsewhere; the partial streams captured before the kill are attached. |
+| `ProcessError.Timeout` | `program, timeout, stdout, stderr` | The run's own deadline killed it; whatever it captured before the kill is attached. |
 | `ProcessError.NotReady` | `program, timeout` | A [readiness probe](streaming.md) gave up — distinct from a timeout. |
 | `ProcessError.Parse` | `program, detail` | A `ParseAsync` / `TryParseAsync` parser rejected the output, or `OutputJsonAsync<'T>` couldn't deserialize it as valid JSON. |
 | `ProcessError.RetryPredicate` | `program, original, detail` | A `Retry` / `RetryBackoff` classifier threw. `original` preserves the failed attempt's typed error; this is terminal and never retried. |
@@ -1794,6 +1794,15 @@ can't destructure an F# union — `ProcessError` exposes `.Program`, `.Stdout`, 
 carry that field (e.g. `.Code` is set only on `Exit`, `.Stdout`/`.Stderr`/`.Combined` on
 `Exit`/`Signalled`/`Timeout`) and `None` elsewhere. The generated `err.IsExit` / `IsSignalled` /
 `IsTimeout` / `IsCancelled` case testers pair with them.
+
+`.StdoutBytes: byte[] option` is a further accessor on `Exit`/`Signalled`/`Timeout`, carrying the
+**exact pre-decode stdout bytes** — but only when the failure was produced from a `byte[]`
+capture: `OutputBytesAsync` (on a `Command` or a `Pipeline`) followed by
+`ProcessResult.ensureSuccess` / `EnsureSuccess()` on the resulting `ProcessResult<byte[]>`. It is
+`None` for every text-based failure — including one raised by `RunAsync`/`ParseAsync`/
+`OutputJsonAsync` and their pipeline twins, which are always built over `ProcessResult<string>`
+and so never populate it — because the bytes are never reconstructed from the already-decoded
+`Stdout` text.
 
 ---
 

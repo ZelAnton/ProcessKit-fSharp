@@ -694,16 +694,18 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         | CassetteFailureKind.Parse -> Ok(ProcessError.Parse(program, detail))
         | CassetteFailureKind.Exit ->
             match Option.ofNullable failure.Code with
-            // A cassette records stdout as JSON text, never raw bytes, so a replayed failure's
-            // `StdoutBytes` is always `None` — it is never fabricated from the recorded string.
-            | Some code -> Ok(ProcessError.Exit(program, code, stdout, stderr, None))
+            // A cassette records stdout as JSON text, never raw bytes, and this constructor never goes
+            // through `ProcessResult.FailureError` (the only place `StdoutBytes` is ever attached), so a
+            // replayed failure's `StdoutBytes` is always `None` — never fabricated from the recorded
+            // string.
+            | Some code -> Ok(ProcessError.Exit(program, code, stdout, stderr))
             | None -> Error "an 'Exit' failure carries no exit code"
         | CassetteFailureKind.Signalled ->
-            Ok(ProcessError.Signalled(program, Option.ofNullable failure.Signal, stdout, stderr, None))
+            Ok(ProcessError.Signalled(program, Option.ofNullable failure.Signal, stdout, stderr))
         | CassetteFailureKind.Timeout ->
             match Option.ofNullable failure.TimeoutMs with
             | Some milliseconds ->
-                Ok(ProcessError.Timeout(program, TimeSpan.FromMilliseconds milliseconds, stdout, stderr, None))
+                Ok(ProcessError.Timeout(program, TimeSpan.FromMilliseconds milliseconds, stdout, stderr))
             | None -> Error "a 'Timeout' failure carries no timeout"
         | CassetteFailureKind.OutputTooLarge ->
             Ok(
@@ -1628,7 +1630,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 { noFailurePayload with
                     Kind = CassetteFailureKind.Parse
                     Detail = redactText detail }
-        | ProcessError.Exit(_, code, stdout, stderr, _) ->
+        | ProcessError.Exit(_, code, stdout, stderr) ->
             // `StdoutBytes` is not recorded: a cassette entry is JSON text, and replay always rebuilds
             // with `StdoutBytes = None` (see `failureToError` above) — recording it would promise a
             // round-trip this format cannot honour.
@@ -1638,14 +1640,14 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                     Code = Nullable code
                     Stdout = redactText stdout
                     Stderr = redactText stderr }
-        | ProcessError.Signalled(_, signal, stdout, stderr, _) ->
+        | ProcessError.Signalled(_, signal, stdout, stderr) ->
             Some
                 { noFailurePayload with
                     Kind = CassetteFailureKind.Signalled
                     Signal = Option.toNullable signal
                     Stdout = redactText stdout
                     Stderr = redactText stderr }
-        | ProcessError.Timeout(_, timeout, stdout, stderr, _) ->
+        | ProcessError.Timeout(_, timeout, stdout, stderr) ->
             Some
                 { noFailurePayload with
                     Kind = CassetteFailureKind.Timeout

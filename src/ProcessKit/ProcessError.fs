@@ -1,6 +1,7 @@
 namespace ProcessKit
 
 open System
+open System.Runtime.CompilerServices
 open System.Text
 
 /// The one sanitize-and-bound rule every caller-, child-, or peer-controlled fragment goes through
@@ -255,22 +256,22 @@ type ProcessError =
     /// field when you want to name the directories that were searched.
     | NotFound of Program: string * Searched: string option
 
-    /// A success-requiring verb (`run`) observed a non-zero exit code. `StdoutBytes` carries the exact
-    /// pre-decode stdout bytes when the checking verb was built over `ProcessResult<byte[]>` (a
-    /// bytes-based capture — `OutputBytesAsync`/`ProcessResult.ensureSuccess` on a `byte[]` result and
-    /// their pipeline twins); `None` for a text-based capture (`Stdout` is then the only representation,
-    /// never reconstructed into bytes). See `ProcessError.StdoutBytes` for the read-without-destructure
-    /// accessor.
-    | Exit of Program: string * Code: int * Stdout: string * Stderr: string * StdoutBytes: byte[] option
+    /// A success-requiring verb (`run`) observed a non-zero exit code. `StdoutBytes` (an accessor, not a
+    /// constructor field — see the note below) carries the exact pre-decode stdout bytes when the
+    /// checking verb was built over `ProcessResult<byte[]>` (a bytes-based capture —
+    /// `OutputBytesAsync`/`ProcessResult.ensureSuccess` on a `byte[]` result and their pipeline twins);
+    /// `None` for a text-based capture (`Stdout` is then the only representation, never reconstructed
+    /// into bytes). See `ProcessError.StdoutBytes` for the read-without-destructure accessor.
+    | Exit of Program: string * Code: int * Stdout: string * Stderr: string
 
     /// The process was terminated by a signal (Unix) or otherwise killed without a code. `StdoutBytes`
     /// is the exact pre-decode capture for a bytes-based checking verb, `None` for a text-based one — see
     /// `Exit.StdoutBytes` above.
-    | Signalled of Program: string * Signal: int option * Stdout: string * Stderr: string * StdoutBytes: byte[] option
+    | Signalled of Program: string * Signal: int option * Stdout: string * Stderr: string
 
     /// The run exceeded its configured timeout. `StdoutBytes` is the exact pre-decode capture for a
     /// bytes-based checking verb, `None` for a text-based one — see `Exit.StdoutBytes` above.
-    | Timeout of Program: string * Timeout: TimeSpan * Stdout: string * Stderr: string * StdoutBytes: byte[] option
+    | Timeout of Program: string * Timeout: TimeSpan * Stdout: string * Stderr: string
 
     /// The run's actual exit status was never observed (see `Outcome.Unobserved`) — a native API
     /// failure, an unresolved POSIX reap race, or a hard-killed tree that was not reaped inside the
@@ -372,6 +373,28 @@ type ProcessError =
     /// The requested operation is unsupported on this platform or in this configuration.
     | Unsupported of Operation: string
 
+    /// The side channel `ProcessResult.FailureError` uses to attach `StdoutBytes` to a freshly
+    /// constructed `Exit`/`Signalled`/`Timeout` instance, keyed by object identity.
+    ///
+    /// A positional-constructor DU case's arity is itself part of the frozen public API contract once
+    /// shipped: adding a field to `Exit`/`Signalled`/`Timeout` widens `NewExit`/`NewSignalled`/
+    /// `NewTimeout` from 4 to 5 arguments, which is source-breaking for every F# consumer that
+    /// constructs or pattern-matches these cases, binary-breaking for C# callers of `NewExit` and
+    /// friends, and fails NuGet Package Validation's ApiCompat gate (`CP0002`) against the shipped
+    /// baseline. Keeping the field OUT of the case and attaching it after construction, instead, keeps
+    /// that arity frozen — `StdoutBytes` is additive in the way the accessor already promised.
+    /// `ConditionalWeakTable` also does not pin the byte array's lifetime beyond the `ProcessError`
+    /// that carries it, so it does not turn a struct-sized failure into one that leaks large captures.
+    static let stdoutBytesTable = ConditionalWeakTable<ProcessError, byte[]>()
+
+    /// Attach the exact pre-decode stdout bytes to a specific `Exit`/`Signalled`/`Timeout` instance. The
+    /// ONLY caller is `ProcessResult.FailureError`, immediately after constructing the error — the one
+    /// place `StdoutBytes` is ever populated (see the case docs above and `ProcessError.StdoutBytes`
+    /// below). `error` must not already be attached (each `FailureError` call constructs a brand-new
+    /// instance, so this never fires twice for the same object).
+    static member internal AttachStdoutBytes(error: ProcessError, bytes: byte[]) : unit =
+        stdoutBytesTable.Add(error, bytes)
+
     /// A short, human-readable description for logs and diagnostics — always **one line**, and always
     /// bounded.
     ///
@@ -399,15 +422,15 @@ type ProcessError =
             | Some path ->
                 $"program '{MessageText.fragment program}' was not found (searched {MessageText.searchedPath path})"
             | None -> $"program '{MessageText.fragment program}' was not found"
-        | ProcessError.Exit(program, code, _, stderr, _) ->
+        | ProcessError.Exit(program, code, _, stderr) ->
             $"'{MessageText.fragment program}' exited with code {code}{MessageText.diagnosticTail stderr}"
-        | ProcessError.Signalled(program, signal, _, stderr, _) ->
+        | ProcessError.Signalled(program, signal, _, stderr) ->
             let tail = MessageText.diagnosticTail stderr
 
             match signal with
             | Some s -> $"'{MessageText.fragment program}' was terminated by signal {s}{tail}"
             | None -> $"'{MessageText.fragment program}' was killed{tail}"
-        | ProcessError.Timeout(program, timeout, _, stderr, _) ->
+        | ProcessError.Timeout(program, timeout, _, stderr) ->
             $"'{MessageText.fragment program}' timed out after {timeout.TotalSeconds}s{MessageText.diagnosticTail stderr}"
         | ProcessError.Unobserved(program, detail) ->
             $"'{MessageText.fragment program}' has no observed exit status: {MessageText.fragment detail}"
@@ -494,9 +517,9 @@ type ProcessError =
         match this with
         | ProcessError.Spawn(program, _)
         | ProcessError.NotFound(program, _)
-        | ProcessError.Exit(program, _, _, _, _)
-        | ProcessError.Signalled(program, _, _, _, _)
-        | ProcessError.Timeout(program, _, _, _, _)
+        | ProcessError.Exit(program, _, _, _)
+        | ProcessError.Signalled(program, _, _, _)
+        | ProcessError.Timeout(program, _, _, _)
         | ProcessError.Unobserved(program, _)
         | ProcessError.Cancelled program
         | ProcessError.NotReady(program, _)
@@ -516,9 +539,9 @@ type ProcessError =
     /// attempt inside `RetryPredicate`); `None` otherwise.
     member this.Stdout: string option =
         match this with
-        | ProcessError.Exit(_, _, stdout, _, _)
-        | ProcessError.Signalled(_, _, stdout, _, _)
-        | ProcessError.Timeout(_, _, stdout, _, _) -> Some stdout
+        | ProcessError.Exit(_, _, stdout, _)
+        | ProcessError.Signalled(_, _, stdout, _)
+        | ProcessError.Timeout(_, _, stdout, _) -> Some stdout
         | ProcessError.RetryPredicate(_, original, _) -> original.Stdout
         | _ -> None
 
@@ -528,11 +551,19 @@ type ProcessError =
     /// `RetryPredicate`). `None` when the capture was text-based (`ProcessResult<string>`): the bytes are
     /// never reconstructed from the decoded string — that would fabricate data, not report exact bytes —
     /// and `None` for every other case, which carries no stdout at all.
+    ///
+    /// Backed by the `stdoutBytesTable` side channel (see `ProcessError.AttachStdoutBytes` above), not a
+    /// case field: `ProcessResult.FailureError` is the only place that ever attaches an entry, so a
+    /// directly-constructed `Exit`/`Signalled`/`Timeout` (via `ProcessError.NewExit` and friends, or a
+    /// pattern-match reconstruction) always reads `None` here until attached.
     member this.StdoutBytes: byte[] option =
         match this with
-        | ProcessError.Exit(_, _, _, _, stdoutBytes)
-        | ProcessError.Signalled(_, _, _, _, stdoutBytes)
-        | ProcessError.Timeout(_, _, _, _, stdoutBytes) -> stdoutBytes
+        | ProcessError.Exit _
+        | ProcessError.Signalled _
+        | ProcessError.Timeout _ ->
+            match stdoutBytesTable.TryGetValue this with
+            | true, bytes -> Some bytes
+            | false, _ -> None
         | ProcessError.RetryPredicate(_, original, _) -> original.StdoutBytes
         | _ -> None
 
@@ -540,9 +571,9 @@ type ProcessError =
     /// attempt inside `RetryPredicate`); `None` otherwise.
     member this.Stderr: string option =
         match this with
-        | ProcessError.Exit(_, _, _, stderr, _)
-        | ProcessError.Signalled(_, _, _, stderr, _)
-        | ProcessError.Timeout(_, _, _, stderr, _) -> Some stderr
+        | ProcessError.Exit(_, _, _, stderr)
+        | ProcessError.Signalled(_, _, _, stderr)
+        | ProcessError.Timeout(_, _, _, stderr) -> Some stderr
         | ProcessError.RetryPredicate(_, original, _) -> original.Stderr
         | _ -> None
 
@@ -551,9 +582,9 @@ type ProcessError =
     /// `RetryPredicate`); `None` otherwise.
     member this.Combined: string option =
         match this with
-        | ProcessError.Exit(_, _, stdout, stderr, _)
-        | ProcessError.Signalled(_, _, stdout, stderr, _)
-        | ProcessError.Timeout(_, _, stdout, stderr, _) -> Some(ProcessError.CombineStreams(stdout, stderr))
+        | ProcessError.Exit(_, _, stdout, stderr)
+        | ProcessError.Signalled(_, _, stdout, stderr)
+        | ProcessError.Timeout(_, _, stdout, stderr) -> Some(ProcessError.CombineStreams(stdout, stderr))
         | ProcessError.RetryPredicate(_, original, _) -> original.Combined
         | _ -> None
 
@@ -561,7 +592,7 @@ type ProcessError =
     /// `None` otherwise (a signal kill or timeout has none).
     member this.Code: int option =
         match this with
-        | ProcessError.Exit(_, code, _, _, _) -> Some code
+        | ProcessError.Exit(_, code, _, _) -> Some code
         | ProcessError.RetryPredicate(_, original, _) -> original.Code
         | _ -> None
 
@@ -569,7 +600,7 @@ type ProcessError =
     /// `RetryPredicate` original is one; `None` otherwise.
     member this.Signal: int option =
         match this with
-        | ProcessError.Signalled(_, signal, _, _, _) -> signal
+        | ProcessError.Signalled(_, signal, _, _) -> signal
         | ProcessError.RetryPredicate(_, original, _) -> original.Signal
         | _ -> None
 

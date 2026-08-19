@@ -1,3 +1,4 @@
+using System;
 using System.Threading.Tasks;
 using Microsoft.FSharp.Core;
 using NUnit.Framework;
@@ -16,13 +17,7 @@ public class ProcessErrorAccessorTests
     [Test]
     public void Exit_accessors_expose_program_code_and_streams_without_destructuring()
     {
-        ProcessError error = ProcessError.NewExit(
-            "git",
-            128,
-            "partial stdout",
-            "fatal: not a git repository",
-            FSharpOption<byte[]>.None
-        );
+        ProcessError error = ProcessError.NewExit("git", 128, "partial stdout", "fatal: not a git repository");
 
         Assert.That(error.IsExit, Is.True);
         Assert.That(error.Program is { Value: "git" });
@@ -32,7 +27,9 @@ public class ProcessErrorAccessorTests
         Assert.That(error.Combined is { Value: "partial stdout\nfatal: not a git repository" });
         Assert.That(error.Signal, Is.Null); // an Exit never carries a signal
         Assert.That(error.Message, Does.Contain("exited with code 128"));
-        Assert.That(error.StdoutBytes, Is.Null); // a text-based Exit never fabricates bytes from Stdout
+        // `StdoutBytes` is attached ONLY by `ProcessResult.FailureError`, so a directly constructed
+        // `Exit` (via `NewExit`) never carries it, whether the original capture was text or bytes.
+        Assert.That(error.StdoutBytes, Is.Null);
     }
 
     [Test]
@@ -41,17 +38,17 @@ public class ProcessErrorAccessorTests
         // Invalid UTF-8 (a lone continuation byte) is the whole point: the exact bytes must survive on
         // StdoutBytes even though the decoded Stdout text is necessarily a lossy replacement-character
         // preview (T-391 — the F# side of this same regression lives in
-        // ProcessErrorSanitizationTests.fs).
+        // ProcessErrorSanitizationTests.fs). `ProcessResult<byte[]>.EnsureSuccess()` is the only path
+        // that attaches StdoutBytes — it goes through the single construction point,
+        // `ProcessResult.FailureError`.
         byte[] rawBytes = [0x68, 0x69, 0x80, 0x41];
         string decodedText = System.Text.Encoding.UTF8.GetString(rawBytes);
 
-        ProcessError error = ProcessError.NewExit(
-            "tool",
-            1,
-            decodedText,
-            "",
-            FSharpOption<byte[]>.Some(rawBytes)
-        );
+        var result = ProcessResult.Create(rawBytes, "", Outcome.NewExited(1), TimeSpan.Zero);
+        var errorResult = result.EnsureSuccess();
+
+        Assert.That(errorResult.IsOk, Is.False);
+        ProcessError error = errorResult.ErrorValue;
 
         Assert.That(error.StdoutBytes is { Value: not null });
 

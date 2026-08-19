@@ -79,7 +79,7 @@ task {
 
     match! cmd.RunAsync() with
     | Ok stdout -> printfn $"{stdout}"
-    | Error(ProcessError.Timeout(program, timeout, _, _, _)) ->
+    | Error(ProcessError.Timeout(program, timeout, _, _)) ->
         eprintfn $"{program} exceeded {timeout}"
     | Error err -> eprintfn $"{err.Message}"
 }
@@ -99,11 +99,9 @@ Console.WriteLine(await cmd.RunAsync() switch
 });
 ```
 
-`ProcessError.Timeout(program, timeout, stdout, stderr, stdoutBytes)` carries the partial
+`ProcessError.Timeout(program, timeout, stdout, stderr)` carries the partial
 stdout/stderr captured before the kill — a hung tool's last words are still
-available on the error, not discarded. `stdoutBytes` is the exact pre-decode
-capture when the checking verb was built over a `byte[]` result (`None` for a
-text-based one) — see [Errors](commands.md#errors).
+available on the error, not discarded.
 
 **The clock starts at the spawn.** The deadline bounds the run's *total wall time*, so it is
 measured from the moment the child started — not from the moment you get around to collecting it.
@@ -253,7 +251,7 @@ capture verbs treat the deadline as *data*; the success-checking verbs raise it.
 | Verb | A timeout deadline becomes |
 |---|---|
 | `OutputStringAsync()` / `OutputBytesAsync()` | `Ok` result with `IsTimedOut = true`, `Code = None`, `Outcome = Outcome.TimedOut`, partial output kept |
-| `RunAsync()` / `RunUnitAsync()` | `Error (ProcessError.Timeout(program, timeout, stdout, stderr, stdoutBytes))` — partial output attached |
+| `RunAsync()` / `RunUnitAsync()` | `Error (ProcessError.Timeout(program, timeout, stdout, stderr))` — partial output attached |
 | `ExitCodeAsync()` | `Error (ProcessError.Timeout …)` — it will not invent a sentinel code |
 | `ProbeAsync()` | `Error (ProcessError.Timeout …)` |
 | `ParseAsync(f)` / `TryParseAsync(f)` | `Error (ProcessError.Timeout …)` — both require success, so the deadline is raised |
@@ -370,7 +368,7 @@ task {
                 ProcessError.isTransient err
                 || err.IsTimeout
                 || (match err with
-                    | ProcessError.Exit(_, 7, _, _, _) -> true
+                    | ProcessError.Exit(_, 7, _, _) -> true
                     | _ -> false))
 
     match! cmd.RunAsync() with

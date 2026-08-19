@@ -1063,7 +1063,7 @@ type SupervisorTests() =
                 supervise([ failWith 127; ok () ])
                     .GiveUpWhen(fun error ->
                         match error with
-                        | ProcessError.Exit(_, 127, _, _, _) -> true
+                        | ProcessError.Exit(_, 127, _, _) -> true
                         | _ -> false)
 
             match! sup.RunAsync() with
@@ -1087,7 +1087,7 @@ type SupervisorTests() =
                 supervise([ failWith 1; ok () ])
                     .GiveUpWhen(fun error ->
                         match error with
-                        | ProcessError.Exit(_, 127, _, _, _) -> true
+                        | ProcessError.Exit(_, 127, _, _) -> true
                         | _ -> false)
 
             match! sup.RunAsync() with
@@ -1106,7 +1106,7 @@ type SupervisorTests() =
                     .MaxRestarts(0)
                     .GiveUpWhen(fun error ->
                         match error with
-                        | ProcessError.Exit(_, 127, _, _, _) -> true
+                        | ProcessError.Exit(_, 127, _, _) -> true
                         | _ -> false)
 
             match! sup.RunAsync() with

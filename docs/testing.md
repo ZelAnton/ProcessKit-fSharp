@@ -253,7 +253,7 @@ task {
 
     // Success-requiring verb: the non-zero exit surfaces as an error.
     match! Runner.run runner CancellationToken.None grep with
-    | Error(ProcessError.Exit(program, code, _, stderr, _)) -> () // program="grep", code=2, stderr="boom"
+    | Error(ProcessError.Exit(program, code, _, stderr)) -> () // program="grep", code=2, stderr="boom"
     | _ -> ()
 
     // Honest-result verb: the non-zero exit is data.

@@ -642,7 +642,7 @@ type JsonRpcSession
                         ProcessError.Cancelled program
                     else
                         match armed with
-                        | Some span -> ProcessError.Timeout(program, span, "", "", None)
+                        | Some span -> ProcessError.Timeout(program, span, "", "")
                         | None -> ProcessError.Cancelled program
 
                 // If this call still owns the entry, fail it under the same gate as the router's answer
@@ -712,7 +712,7 @@ type JsonRpcSession
                         deadline.IsCancellationRequested
                         && not cancellationToken.IsCancellationRequested
                         ->
-                        ProcessError.Timeout(program, span, "", "", None)
+                        ProcessError.Timeout(program, span, "", "")
                     | _ -> error
 
                 match! this.SendFramed(payload, linked.Token, classifyInterrupt) with

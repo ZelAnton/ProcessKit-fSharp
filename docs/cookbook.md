@@ -157,7 +157,7 @@ timeout / cancellation), never on a non-zero exit.
 match! (Command.create "definitely-not-a-program").OutputStringAsync() with
 | Ok result -> printfn $"{result.Stdout}"
 | Error(ProcessError.NotFound(program, _)) -> eprintfn $"not installed: {program}"
-| Error(ProcessError.Timeout(program, timeout, _, _, _)) -> eprintfn $"{program} timed out after {timeout}"
+| Error(ProcessError.Timeout(program, timeout, _, _)) -> eprintfn $"{program} timed out after {timeout}"
 | Error err -> eprintfn $"{err.Message}"
 ```
 
@@ -205,9 +205,7 @@ switch (await cmd.RunAsync())
 ```
 
 The success-requiring verbs (`RunAsync` / `RunUnitAsync`) additionally turn a non-zero exit into
-`ProcessError.Exit(program, code, stdout, stderr, stdoutBytes)`, where `stdoutBytes` is the exact
-pre-decode bytes when the verb was built over a `byte[]` capture (`None` for a text-based one) — see
-[Errors](commands.md#errors).
+`ProcessError.Exit(program, code, stdout, stderr)`.
 
 ## Exit codes and probing
 
