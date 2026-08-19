@@ -4,7 +4,7 @@
 
 ProcessKit treats platform behaviour as first-class. Every child you start lives inside the
 operating system's own containment primitive, so the kill-on-dispose tree guarantee holds on
-Windows, Linux, and macOS/BSD alike. Where a mechanism is genuinely weaker than another, the
+Windows, Linux, FreeBSD, and macOS/the other BSDs alike. Where a mechanism is genuinely weaker than another, the
 difference is reported honestly — the active `Mechanism` is queryable and unsupported operations
 return a typed `ProcessError`, never a silent downgrade. This page collects every per-OS
 mechanism, capability matrix, and caveat in one place.
@@ -18,7 +18,7 @@ mechanism, capability matrix, and caveat in one place.
 
 ## Containment mechanisms
 
-A `ProcessGroup` wraps one of three OS primitives. Whichever it gets, disposing the group (or the
+A `ProcessGroup` wraps one of four OS primitives. Whichever it gets, disposing the group (or the
 live `RunningProcess` from a one-shot verb) reaps the whole tree — children, grandchildren, and
 anything they spawned — as a single kernel operation.
 
@@ -26,7 +26,8 @@ anything they spawned — as a single kernel operation.
 |---|---|---|
 | `Mechanism.JobObject` | Windows | A Job Object created with kill-on-close. Children are spawned suspended, assigned to the job, then resumed, so even a grandchild forked in the first instant is already contained. Teardown closes the job handle (`KILL_ON_JOB_CLOSE`) or terminates the job. |
 | `Mechanism.CgroupV2` | Linux (when resource limits are requested and a usable cgroup v2 root exists) | A private cgroup under the unified hierarchy. Each child is launched through a small `/bin/sh` helper that joins the cgroup (writes its own pid to `cgroup.procs`) before `exec`ing the target in place, so the target is contained on its first instruction and a child it forks immediately inherits the limits; teardown is `cgroup.kill` followed by removing the cgroup directory. |
-| `Mechanism.ProcessGroup` | macOS/BSD, and the Linux default when no limits are requested | POSIX process groups. Each spawned child forms its own process-group id (pgid); teardown sends `SIGKILL` to the tracked pgids (`killpg`). |
+| `Mechanism.ProcessReaper` | FreeBSD | The kernel **process reaper** (`procctl(2)`'s `PROC_REAP_ACQUIRE`), layered over the POSIX process group. This process becomes the reaper of its whole descendant tree, so every descendant stays inside it — a `setsid` escapee included. Membership is `PROC_REAP_GETPIDS`; teardown and every whole-tree signal are `PROC_REAP_KILL` per subtree. |
+| `Mechanism.ProcessGroup` | macOS and the other BSDs, and the Linux default when no limits are requested | POSIX process groups. Each spawned child forms its own process-group id (pgid); teardown sends `SIGKILL` to the tracked pgids (`killpg`). |
 
 ### When each mechanism is chosen
 
@@ -41,8 +42,17 @@ The selection at `ProcessGroup.Create` is deterministic per platform:
   reports `ProcessGroup`, not `CgroupV2`. A CPU-time-only group also uses `ProcessGroup` and applies
   `RLIMIT_CPU` per spawned child. If whole-tree limits are requested but no usable cgroup exists,
   creation fails with `ProcessError.ResourceLimit` rather than running unbounded.
-- **macOS / BSD** always use a **POSIX process group** (`Mechanism.ProcessGroup`). They have no
-  whole-tree limit primitive, so requesting one fails fast with `ProcessError.ResourceLimit`; a
+- **FreeBSD** uses the **process reaper** (`Mechanism.ProcessReaper`) for a limit-free group: it is the
+  one unix outside Linux with a real whole-tree containment primitive, so it is preferred over the plain
+  process group rather than folded into it. Reaper status is acquired once per process, permanently, at the
+  first `ProcessGroup.Create`; if that acquisition is refused the group falls back to the POSIX process
+  group and reports `Mechanism.ProcessGroup` — the created group's own `Mechanism` is always the final
+  word, never an assumption. The reaper is a containment *relationship*, not a container: it accounts for
+  nothing, so a whole-tree limit is refused here exactly as on the other BSDs (`ProcessError.ResourceLimit`,
+  never a per-process `RLIMIT_*` surrogate presented as a whole-tree cap), while a CPU-time-only limit
+  remains available per child.
+- **macOS and the other BSDs** always use a **POSIX process group** (`Mechanism.ProcessGroup`). They have
+  no whole-tree limit primitive, so requesting one fails fast with `ProcessError.ResourceLimit`; a
   CPU-time-only limit remains available per child.
 
 ### Reading the active mechanism
@@ -60,6 +70,7 @@ match ProcessGroup.Create() with
     match group.Mechanism with
     | Mechanism.JobObject -> printfn "Windows Job Object — whole-tree kill, members, stats"
     | Mechanism.CgroupV2 -> printfn "Linux cgroup v2 — whole-tree kill, signals, limits, stats"
+    | Mechanism.ProcessReaper -> printfn "FreeBSD process reaper — whole-tree kill/signal/members, setsid escapees included"
     | Mechanism.ProcessGroup -> printfn "POSIX process group — kill-on-dispose, leaders-only members"
 | Error err -> eprintfn $"{err.Message}"
 ```
@@ -73,13 +84,14 @@ Console.WriteLine(group.Mechanism switch
 {
     { IsJobObject: true }    => "Windows Job Object — whole-tree kill, members, stats",
     { IsCgroupV2: true }     => "Linux cgroup v2 — whole-tree kill, signals, limits, stats",
+    { IsProcessReaper: true } => "FreeBSD process reaper — whole-tree kill/signal/members",
     { IsProcessGroup: true } => "POSIX process group — kill-on-dispose, leaders-only members",
     _                        => "unknown mechanism",
 });
 ```
 
-The `Mechanism.IsJobObject` / `IsCgroupV2` / `IsProcessGroup` properties are the same check in
-boolean form, convenient from C#.
+The `Mechanism.IsJobObject` / `IsCgroupV2` / `IsProcessReaper` / `IsProcessGroup` properties are the same
+check in boolean form, convenient from C#.
 
 ## Capability snapshot
 
@@ -251,9 +263,12 @@ hosted-service image in this smoke.)
 
 ## Capability matrices
 
-In the matrices below the columns are the three mechanisms. The **POSIX process group** column
-covers macOS/BSD *and* the Linux default (a limit-free group), since they share one backend.
-Legend: ✅ full support · 🟡 supported with a documented qualification · ❌ not available.
+In the matrices below the columns are three of the four mechanisms. The **POSIX process group** column
+covers macOS/the other BSDs *and* the Linux default (a limit-free group), since they share one backend.
+The FreeBSD **process reaper** is not given a column of its own because it *is* that backend plus a
+whole-tree layer: every row below reads the same for it except the handful listed under
+[FreeBSD process reaper: what changes](#freebsd-process-reaper-what-changes), which is the complete list of
+differences. Legend: ✅ full support · 🟡 supported with a documented qualification · ❌ not available.
 
 **Whole-tree teardown**
 
@@ -654,6 +669,27 @@ default Ctrl+C handling, so writing U+0003 to ConPTY input does not interrupt it
 `WindowsCtrlSignals()` opt-in only registers the leader for ProcessKit's targeted CTRL+BREAK path;
 it does not add or remove the process-group flag.
 
+### FreeBSD process reaper: what changes
+
+`Mechanism.ProcessReaper` is the POSIX process-group backend plus a whole-tree layer, so every row in the
+matrices above reads the same for it. These are the differences, in full:
+
+| Capability | POSIX process group | FreeBSD process reaper |
+|---|:---:|:---:|
+| Kill-on-dispose reaches a `setsid` descendant | ❌ it leaves the tracked pgid (see the caveat below) | ✅ `pi_subtree` is fixed at fork and never rewritten, so the kernel still walks it |
+| `Members()` / `MembersInfo()` / `Stats().ActiveProcessCount` | the tracked group **leaders** only | ✅ every live descendant of every child the group started (`PROC_REAP_GETPIDS`) |
+| `Signal` / `Suspend` / `Resume` / the graceful soft tier | `killpg` per tracked pgid | `PROC_REAP_KILL` per subtree — the same signal vocabulary, delivered once per process, escapees included |
+| Orphaned descendants (the daemonising double fork) | re-parent to `init`, which reaps them | re-parent to **this** process; ProcessKit `waitpid`s those corpses itself, and never one it forked (that exit status belongs to whoever started it) |
+| Per-member CPU/memory in `MemberStats()` | Linux `/proc`, macOS `proc_pidinfo` | ❌ honestly absent — FreeBSD has no `/proc` by default and this port carries no `sysctl(KERN_PROC)` reader, so a member is reported with its pid and no invented figures |
+| Whole-tree resource limits | ❌ `ProcessError.ResourceLimit` | ❌ `ProcessError.ResourceLimit` — the reaper contains a tree but accounts for nothing in it, so nothing changes here |
+| `Adopt` / `AdoptByPid` | ❌ / 🟡 (❌ on the BSDs, which have no start-time reader) | ❌ / ❌ — the reaper holds this process's own *descendants*, and `PROC_REAP_ACQUIRE` does not re-attach even children forked before it, let alone a process started outside this tree |
+
+`ProcessGroup.Capabilities()` reports `Creation` as `Qualified` on FreeBSD rather than `Available`, and
+says why: acquiring reaper status is a permanent, process-wide side effect, so a snapshot predicts the
+mechanism instead of proving it by performing it. Creation does not fail either way — a host where the
+acquisition is refused silently gets the POSIX process group and the created group reports
+`Mechanism.ProcessGroup`.
+
 ## Caveats
 
 The honest fine print — mostly consequences of OS semantics, plus a few tracked internal
@@ -752,9 +788,20 @@ process-group mechanism (the `/bin/sh` `RLIMIT_CPU` shim), or any `Command.Rlimi
 child's pgid, and teardown signals those pgids. A descendant that deliberately starts a new
 session (a `setsid` call) gets a fresh process group that the parent group does not track, so it
 can outlive the teardown. This is the genuine weakness of the process-group mechanism; it is why
-`ProcessGroup.Mechanism` is reported rather than papered over. The Job Object and cgroup v2
-mechanisms have no such hole — membership is enforced by the kernel container, not by group
-bookkeeping. When this matters, check the active mechanism.
+`ProcessGroup.Mechanism` is reported rather than papered over. The Job Object, cgroup v2 and FreeBSD
+process-reaper mechanisms have no such hole — membership is enforced by the kernel (a container for the
+first two, the reaper's per-descendant subtree tag for the third), not by group bookkeeping. When this
+matters, check the active mechanism.
+
+**FreeBSD: being the reaper is an obligation, not only a capability.** Acquiring reaper status makes an
+orphaned descendant re-parent onto *this* process instead of onto `init`, which is exactly the containment
+`Mechanism.ProcessReaper` exists for — and it transfers `init`'s duty along with it: when such a process
+exits it becomes a zombie of this process and someone must `wait` for it. ProcessKit discharges that on
+every reaper read (membership, delivery, teardown) plus a short bounded drain at teardown, and it collects
+only processes it did **not** fork itself, so no run verb's exit status is ever stolen. Two consequences
+are worth planning for: reaper status is process-wide and is never released while the process lives (it is
+shared by every live `ProcessGroup`, and possibly by your own code, which may have acquired it first), and
+a descendant that outlives every group still re-parents here rather than to `init`.
 
 **Unix privilege drop clears supplementary groups unless you set them.** A `Uid`/`Gid`/`User` drop
 runs through the `setpriv` helper (util-linux), which by default *clears* the parent's supplementary

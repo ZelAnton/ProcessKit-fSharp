@@ -65,6 +65,7 @@ module internal StableIdentifiers =
         | Mechanism.JobObject -> "job_object"
         | Mechanism.CgroupV2 -> "cgroup_v2"
         | Mechanism.ProcessGroup -> "process_group"
+        | Mechanism.ProcessReaper -> "process_reaper"
 
     /// A curated signal's identifier, or `None` for `Signal.Other`.
     ///

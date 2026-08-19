@@ -514,13 +514,15 @@ so on.
 Every guarantee above is honest — but honest also means naming where it stops:
 
 - **A `setsid` descendant can escape the POSIX process-group mechanism.** On the
-  POSIX process-group backend (macOS/BSD always, Linux without a delegated cgroup
-  v2 hierarchy), teardown works by signalling tracked process-group ids. A
+  POSIX process-group backend (macOS and the BSDs other than FreeBSD, Linux without a
+  delegated cgroup v2 hierarchy), teardown works by signalling tracked process-group ids. A
   descendant that itself calls `setsid()` — deliberately, to survive its parent —
   starts a **new** process group the containing `ProcessGroup` never tracked, so it
   can outlive teardown. This is a real gap in that specific mechanism, not a
-  documentation nuance: the Job Object and cgroup v2 mechanisms have no such hole,
-  because their membership is kernel-enforced rather than pgid bookkeeping. Check
+  documentation nuance: the Job Object, cgroup v2 and FreeBSD process-reaper
+  mechanisms have no such hole, because their membership is kernel-enforced rather
+  than pgid bookkeeping — on FreeBSD by the reaper's per-descendant subtree tag, which
+  a `setsid()` does not change. Check
   `ProcessGroup.Mechanism` when this matters, and see
   [Platform support → Caveats](platform-support.md#caveats) for the full writeup.
 - **There is no whole-tree resource limit on macOS/BSD, or on Linux without a real

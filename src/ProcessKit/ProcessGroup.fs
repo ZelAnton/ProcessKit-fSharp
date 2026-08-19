@@ -13,9 +13,10 @@ open System.Threading.Tasks
 /// Every process started into the group — and everything those processes spawn — is reaped when
 /// the group is disposed (deterministic under `use`) or, failing that, when the GC finalizes it.
 /// The OS primitive is chosen at creation and reported honestly by `Mechanism` — a Windows Job
-/// Object (`KILL_ON_JOB_CLOSE`), a Linux cgroup v2 (when resource limits are requested), or a POSIX
-/// process group (`killpg` teardown). All of that lives behind an `IContainmentBackend`; this type
-/// only orchestrates once-only teardown, the stdin/stream wiring, and the runner/disposable seams.
+/// Object (`KILL_ON_JOB_CLOSE`), a Linux cgroup v2 (when resource limits are requested), a FreeBSD
+/// `procctl(2)` process reaper (whole-tree, `setsid` escapees included), or a POSIX process group
+/// (`killpg` teardown). All of that lives behind an `IContainmentBackend`; this type only orchestrates
+/// once-only teardown, the stdin/stream wiring, and the runner/disposable seams.
 [<Sealed>]
 type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOptions) =
 
@@ -157,6 +158,21 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // No whole-tree limits: the POSIX group forms when children are spawned (each becomes its own
             // pgid). A CPU-time-only cap rides along per child through `RLIMIT_CPU`.
             withBackend (ProcessGroupBackend limits)
+        | MechanismChoice.Selected Mechanism.ProcessReaper ->
+            // FreeBSD: take reaper status for this process — once, permanently, process-wide — and layer
+            // the whole-tree `procctl(2)` reaper over the very same POSIX process group the branch above
+            // builds. This is the only place the acquisition is ever attempted: it is a real side effect,
+            // so the capability snapshot predicts this mechanism without performing it.
+            //
+            // A refused acquisition is NOT a creation failure and NOT a silent claim: the group is built on
+            // the plain process group instead and reports `Mechanism.ProcessGroup`, `setsid` hole included,
+            // rather than telling a caller it holds a containment guarantee this process could not take.
+            let posix = ProcessGroupBackend limits
+
+            if Native.FreeBsd.acquireReaperStatus () then
+                withBackend (ProcessReaperBackend(posix, limits))
+            else
+                withBackend posix
 
     /// What process containment can actually do on **this** host, for the default options — a
     /// side-effect-free snapshot taken WITHOUT creating a group or spawning anything. See the

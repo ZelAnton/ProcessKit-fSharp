@@ -29,6 +29,7 @@ module Program =
         | Mechanism.JobObject -> "JobObject (Windows Job Object)"
         | Mechanism.CgroupV2 -> "CgroupV2 (Linux cgroup v2)"
         | Mechanism.ProcessGroup -> "ProcessGroup (POSIX process group)"
+        | Mechanism.ProcessReaper -> "ProcessReaper (FreeBSD procctl(2) process reaper)"
 
     // Spawn a child and capture its stdout, requiring a clean exit.
     let private basicCapture () =

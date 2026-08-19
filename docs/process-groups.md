@@ -103,6 +103,7 @@ Two read-only properties report what you actually got. `Options` echoes back the
 match group.Mechanism with
 | Mechanism.JobObject -> printfn "Windows Job Object"
 | Mechanism.CgroupV2 -> printfn "Linux cgroup v2"
+| Mechanism.ProcessReaper -> printfn "FreeBSD process reaper"
 | Mechanism.ProcessGroup -> printfn "POSIX process group"
 | _ -> ()
 ```
@@ -114,6 +115,7 @@ Console.WriteLine(group.Mechanism switch
 {
     { IsJobObject: true }    => "Windows Job Object",
     { IsCgroupV2: true }     => "Linux cgroup v2",
+    { IsProcessReaper: true } => "FreeBSD process reaper",
     { IsProcessGroup: true } => "POSIX process group",
     _                        => "unknown mechanism",
 });
@@ -127,7 +129,10 @@ whether you asked for limits:
   resource limits *and* the host can deliver them; for plain containment — and on
   any Linux host without delegated cgroup v2 — it uses a **POSIX process group**
   (`Mechanism.ProcessGroup`).
-- **macOS / BSD** always use a **POSIX process group** (`Mechanism.ProcessGroup`).
+- **FreeBSD** uses the kernel **process reaper** (`Mechanism.ProcessReaper`) — the whole
+  descendant tree, `setsid` escapees included — falling back to the POSIX process group
+  and saying so if reaper status cannot be acquired.
+- **macOS and the other BSDs** always use a **POSIX process group** (`Mechanism.ProcessGroup`).
 
 Because the mechanism is reported rather than assumed, a weaker backend is never
 a silent downgrade — you can branch on `Mechanism` if a capability matters. The
@@ -571,7 +576,8 @@ soft stop does:
 | Mechanism | `SoftStopScope` |
 |---|---|
 | Linux cgroup v2 | `WholeTree` — the signal reaches every process in the cgroup |
-| POSIX process group (macOS / BSD / Linux without cgroup v2) | `WholeTree` — `killpg` reaches every tracked leader and its descendants (a `setsid`'d child escapes, the same documented weakness kill-on-drop already has) |
+| FreeBSD process reaper | `WholeTree` — `PROC_REAP_KILL` reaches every process in every subtree the group owns, with no escapee at all: this is the strongest form of the promise on any unix |
+| POSIX process group (macOS / the other BSDs / Linux without cgroup v2) | `WholeTree` — `killpg` reaches every tracked leader and its descendants (a `setsid`'d child escapes, the same documented weakness kill-on-drop already has) |
 | Windows Job Object | `OptInMembers` when the group has a live console-CTRL leader (`Command.WindowsCtrlSignals()`) or a live windowed member, else `Unsupported` |
 
 Unlike `ContainmentCapabilities` (a fixed, pre-creation snapshot for a set of
@@ -995,9 +1001,11 @@ directional rates accepted by the backend. You can build a `ResourceLimits` valu
 with the same `WithMemoryMax` / `WithMaxProcesses` / `WithCpuQuota` / `WithCpuAffinity` /
 `WithIoMax` methods if you want to inspect or compose limits before applying them.
 
-Limits need a **real container** — a Windows Job Object or a Linux cgroup v2.
+Limits need a **real container** — a Windows Job Object or a Linux cgroup v2. The FreeBSD process
+reaper does not qualify and does not pretend to: it contains a whole tree but keeps no aggregate
+accounting, so it refuses a whole-tree cap exactly as the process group does.
 
-| Capability | Windows Job Object | Linux cgroup v2 | POSIX process group / macOS / BSD |
+| Capability | Windows Job Object | Linux cgroup v2 | POSIX process group / macOS / BSD / FreeBSD reaper |
 |---|:---:|:---:|:---:|
 | Memory cap | ✅ whole-tree | ✅ whole-tree (`memory.max`) | ❌ |
 | Atomic whole-tree OOM kill | ❌ `Unsupported` | ✅ (`memory.oom.group`) | ❌ `Unsupported` |
@@ -1293,7 +1301,8 @@ Behaviour follows the mechanism, honestly and without a silent downgrade:
 |---|---|
 | Windows Job Object | ✅ re-applies via `SetInformationJobObject` on the live job (caps, affinity mask, **and** UI restrictions) |
 | Linux cgroup v2 | ✅ rewrites `memory.max` / `memory.oom.group` / `pids.max` / `cpu.max` / `cpuset.cpus` in place (UI restrictions → `ProcessError.Unsupported`) |
-| POSIX process group / macOS / BSD | ❌ `ProcessError.ResourceLimit` (no whole-tree limit primitive to update) |
+| POSIX process group / macOS / the other BSDs | ❌ `ProcessError.ResourceLimit` (no whole-tree limit primitive to update) |
+| FreeBSD process reaper | ❌ `ProcessError.ResourceLimit` — it contains a whole tree but accounts for nothing in it, so there is no cap to update |
 
 `CpuTimeMax` is spawn-time on POSIX, including the cgroup backend. A live update that changes it is
 rejected before any controller file is written, so `UpdateLimits` never leaves a partially changed
@@ -1499,7 +1508,7 @@ together, turning "we have no evidence" into "no"):
 |---|---|
 | Linux cgroup v2 | Real evidence from `memory.events`' `oom`, `pids.events`' `max`, and `cpu.stat`'s `nr_throttled` — `Tripped`/`NotTripped` per axis, or `Unknown` when a counter file/key can't be read (an older kernel, a controller this hierarchy never enabled, a cgroup already gone). |
 | Windows Job Object | `Unknown` on every axis it ever capped — not an oversight: a Job Object keeps no post-mortem record that any of these caps fired. An axis it never capped reads `NotTripped` without touching native at all. |
-| POSIX process group / macOS / BSD | `Unknown` on every axis, **unconditionally** — including one this group never capped. This mechanism has no whole-tree resource accounting to read at all (the same reason `Create`/`UpdateLimits` refuse any whole-tree cap on it in the first place), so unlike the Job Object it has no "nothing was capped" case to answer `NotTripped` from either. |
+| POSIX process group / macOS / the other BSDs / the FreeBSD process reaper | `Unknown` on every axis, **unconditionally** — including one this group never capped. This mechanism has no whole-tree resource accounting to read at all (the same reason `Create`/`UpdateLimits` refuse any whole-tree cap on it in the first place), so unlike the Job Object it has no "nothing was capped" case to answer `NotTripped` from either. |
 
 `Cpu` answers for `ResourceLimits.CpuQuota` specifically. When a group **also**
 carries a `ResourceLimits.CpuTimeMax` cap (Windows Job-time, or POSIX
