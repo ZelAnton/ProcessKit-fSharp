@@ -506,6 +506,58 @@ process-group mechanism (macOS/BSD, or Linux without cgroup v2) returns
 `ProcessError.ResourceLimit` — never a silent no-op. See
 [process-groups.md](process-groups.md) for the API and semantics.
 
+**Post-run limit evidence (`ProcessGroup.LimitEvidence()`)**
+
+The post-mortem counterpart to the admission matrix above: `ProcessError.ResourceLimit` answers *could
+the cap be applied at all*, `LimitEvidence()` answers *did a cap this group carried then actually fire* —
+the question an exit code or signal cannot, since a cap-driven kill and a self-inflicted crash look
+identical from the outside. Each cell is the `LimitVerdict` an axis can produce on that mechanism and the
+counter it is read from; nothing here is re-derived from the requested `ResourceLimits` or inferred from
+the run's outcome:
+
+| Axis | Windows (Job Object) | Linux cgroup v2 | POSIX process group |
+|---|:---:|:---:|:---:|
+| `Memory` (`WithMemoryMax`) | 🟡 `Unknown` on an axis ever capped; `NotTripped` on one never capped | ✅ `memory.events.local` (preferred) / `memory.events`, key `oom` | ❌ `Unknown`, unconditionally |
+| `Processes` (`WithMaxProcesses`) | 🟡 same qualification | ✅ `pids.events.local` (preferred) / `pids.events`, key `max` | ❌ `Unknown`, unconditionally |
+| `Cpu` (`WithCpuQuota`) | 🟡 same qualification | ✅ `cpu.stat`, key `nr_throttled` | ❌ `Unknown`, unconditionally |
+| Read **before** teardown has completed | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` |
+
+Linux cgroup v2 is the only mechanism with real evidence to read. For an axis this group actually capped,
+the first listed counter file that reads successfully decides: a non-zero value is `Tripped`, a
+present-but-zero one is an authoritative `NotTripped`, and a file that reads but lacks the key — or every
+candidate failing to read at all (an older kernel, a controller this hierarchy never enabled, a cgroup
+already gone) — is the honest `Unknown`. An axis it never capped is `NotTripped` with no read at all,
+exactly as on the Job Object below, so a limit-free group costs no counter reads.
+The memory axis reads `oom` deliberately, not `oom_kill`: the latter also counts a *global* host OOM kill
+of a member, which would misattribute a system-wide event to this group's own cap.
+
+The **Windows Job Object** keeps no post-mortem record that any of these caps fired — no `memory.events` /
+`pids.events` / `cpu.stat` analogue exists — so every axis it ever capped reads `Unknown`: a measured
+conclusion about what a Job actually preserves, not an unimplemented reader. An axis it never capped still
+reads `NotTripped` without touching native at all (nothing was capped, so nothing could fire). The **POSIX
+process group** answers `Unknown` on every axis *unconditionally*, including one this group never capped:
+it has no whole-tree resource-accounting apparatus whatsoever — the same reason `Create`/`UpdateLimits`
+refuse any whole-tree cap on it — so unlike the Job Object it has no "nothing was capped" case to report
+`NotTripped` from either.
+
+On **every** mechanism, a `NotTripped` the `Cpu` axis would otherwise report is downgraded to `Unknown`
+whenever the group also carries a `ResourceLimits.CpuTimeMax`: that cap (Windows job-time, POSIX per-child
+`RLIMIT_CPU`) has no post-mortem counter anywhere, and neither a Job's accounting nor `cpu.stat`'s
+`nr_throttled` can attribute a trip of it — so "the quota did not throttle" is not the same honest "no"
+once a `CpuTimeMax` is in play. A real `Tripped` from quota-throttle evidence is never downgraded.
+`ResourceLimits.IoMax` and `WithCpuAffinity` have **no** `LimitEvidence` axis at all on any mechanism — no
+containment primitive here keeps a "this whole-tree I/O rate or affinity cap engaged" record, so there is
+nothing honest to report for them, not even `Unknown`.
+
+The evidence is available **only after the group has been torn down** (`ShutdownAsync`/`Dispose`/
+`DisposeAsync`, or the finalizer) — the opposite lifetime rule `Stats()` follows. It is captured exactly
+once, from the still-live container, in the instant before its counters (and, on cgroup v2, the cgroup
+directory itself) are destroyed, then cached, so every later read returns that same snapshot. Which axes
+are queried is a **sticky** record: an axis an `UpdateLimits` call names joins it whether that call then
+succeeds or fails, so a cap that fired and was later lifted is still answered from the real counter rather
+than a guessed `NotTripped`. See [Limit Evidence](process-groups.md#limit-evidence) for the API and
+examples.
+
 **`argv[0]` override (`Command.Arg0`)**
 
 | Capability | Windows | Linux / macOS / BSD (POSIX) |
