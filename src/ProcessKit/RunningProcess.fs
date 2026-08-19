@@ -178,16 +178,19 @@ type RunningProcess
     let stderrChunksUnsupported () : ProcessError option =
         stderrStreamUnsupported "StderrChunksAsync" "stream the merged bytes with StdoutChunksAsync"
 
-    // Hand `stdoutStream`/`stderrStream` to a readiness probe (`WaitForPortAsync`/`WaitForAsync`) for
-    // its background drain — but only a still-`Fresh` handle's pipes: if a buffered verb or a
-    // streaming session already claimed them, that consumer's own pump already drains them, and
-    // handing the same streams to the probe as well would start a second, racing reader on the same
-    // pipe. A snapshot read, not a claim (the gate's `IsFresh`, taken once before the probe's first
-    // attempt): the consumption is left untouched, so a real verb can still claim the pipes normally
-    // once the probe stops draining.
+    // Hand this handle's pipes to a readiness probe (`WaitForPortAsync`/`WaitForAsync`) for its
+    // background drain — but only a still-`Fresh` handle's: if a buffered verb or a streaming session
+    // already claimed them, that consumer's own pump already drains them, and handing the same streams
+    // to the probe as well would start a second, racing reader on the same pipe. A snapshot read, not a
+    // claim (the gate's `IsFresh`, taken once before the probe's first attempt): the consumption is
+    // left untouched, so a real verb can still claim the pipes normally once the probe stops draining.
+    //
+    // The METERED views (`OutputSessions`' own, the very streams its sessions pump), so the bytes a
+    // probe's drain reads are counted into `StdoutBytesSeen`/`StderrBytesSeen` like every other read of
+    // these pipes — a drain that discards its bytes still read them off the child.
     let probeDrainStreams () : Stream option * Stream option =
         if gate.IsFresh then
-            stdoutStream, stderrStream
+            sessions.MeteredStdoutStream, sessions.MeteredStderrStream
         else
             None, None
 
@@ -550,6 +553,28 @@ type RunningProcess
 
     /// Total stderr lines pumped so far.
     member _.StderrLineCount = sessions.StderrLineCount
+
+    /// Cumulative **raw** stdout bytes this handle has read from the child — exactly what
+    /// `Stream.ReadAsync` returned on the parent's side, counted **before** decoding, line framing, or
+    /// any buffering/streaming policy could drop or refuse them. So it counts the bytes of a line a
+    /// bounded `StreamBuffer` policy dropped, of output an `OutputBuffer` cap refused as oversized, and
+    /// of a run whose output is discarded (`WaitAsync`) just the same: it measures what came off the
+    /// child, not what was kept. Monotonic, cheap to read at any time — mid-stream, and afterwards: it
+    /// keeps its final total once the pumps end, including after `FinishAsync`/`DisposeAsync`.
+    ///
+    /// **`0` means "the parent never reads this stream"**, honestly and without blocking: a `StdioMode`
+    /// `Null`/`Inherit` stdout, one redirected straight to a file (`Command.StdoutToFile`), or a stream
+    /// this command did not configure. It is the byte-level counterpart of `StdoutLineCount`, and a
+    /// different quantity from the byte totals a capture reports (`ProcessResult`'s truncation totals
+    /// count what was RETAINED, post-decode, in the currency of the cap that bounds it).
+    member _.StdoutBytesSeen: int64 = sessions.StdoutBytesSeen
+
+    /// The stderr twin of `StdoutBytesSeen`. A run with **one merged stream** — `Command.MergeStderr()`
+    /// or a `Command.Pty()` run, where the child has a single terminal device — has no separate
+    /// parent-side stderr stream at all, so every byte it produced is counted in `StdoutBytesSeen` and
+    /// this counter stays `0` (the same boundary `StderrChunksAsync` and the stderr readiness waits
+    /// report as unsupported). `0` likewise for stderr redirected to a file or set to `Null`/`Inherit`.
+    member _.StderrBytesSeen: int64 = sessions.StderrBytesSeen
 
     /// Stream items dropped so far by a bounded streaming policy's `StreamFullMode.DropOldest`/
     /// `DropNewest` (always `0` unless `Command.StreamBuffer` is configured with one of those modes).

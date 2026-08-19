@@ -88,9 +88,9 @@ Consume the handle **exactly one way** — stdout is read once:
 there is nothing to stream. `StderrChunksAsync()` likewise needs a **piped, unmerged** stderr, and
 says so with a typed error when the run has none (see
 [Streaming stderr as byte chunks](#streaming-stderr-as-byte-chunks)). The live gauges `Pid`, `Elapsed`, `StartTime`,
-`StdoutLineCount`, and `StderrLineCount` are cheap to read at any time, including
-mid-stream. There is also `Kill()` — "stop it now, I'll `WaitAsync()` for the
-`Outcome` myself" — which begins teardown without blocking.
+`StdoutLineCount`, `StderrLineCount`, `StdoutBytesSeen`, and `StderrBytesSeen` are cheap to read at any
+time, including mid-stream ([live counters](#live-counters) below). There is also `Kill()` — "stop it
+now, I'll `WaitAsync()` for the `Outcome` myself" — which begins teardown without blocking.
 
 To stop a long-running child *cleanly* — let it flush logs, release locks, and run its
 shutdown hooks — use `StopAsync(gracePeriod)` (or `StopAsync()` for a 2-second default,
@@ -654,6 +654,52 @@ side. Two things to know before opting in:
 
 If you can't reason about your consumer always resuming, prefer `DropOldest`/`DropNewest` (never
 blocks the child) or `Error` (fails loud instead of stalling) over `Backpressure`.
+
+## Live counters
+
+A `RunningProcess` publishes four live counters. All are cheap to read at any time — mid-stream, and
+afterwards: each keeps its final value once the pumps end, including after `FinishAsync()` and after
+the handle is disposed.
+
+| Counter | Counts |
+|---|---|
+| `StdoutLineCount` / `StderrLineCount` | framed lines pumped so far (including lines that were then dropped) |
+| `DroppedStreamLineCount` | items a dropping `StreamBuffer` policy discarded (lines/events, or chunks for the byte streams) |
+| `StdoutBytesSeen` / `StderrBytesSeen` | **raw bytes read from the child**, as `Int64` |
+
+`StdoutBytesSeen`/`StderrBytesSeen` are byte-level progress, counted at the parent's own read of the
+pipe — *before* decoding, before line framing, and before any policy could drop or refuse anything. So
+they measure what came off the child, not what was kept: the bytes of a line a dropping `StreamBuffer`
+policy discarded, of output an `OutputBuffer` ceiling refused as too large, and of a run whose output
+is discarded entirely (`WaitAsync()`) all count. They are unaffected by the stream's encoding and line
+terminator — a UTF-16 stream counts wire bytes, not characters — and by every consumption mode alike:
+buffered captures, line/chunk/event streaming, and a readiness probe's background drain.
+
+A counter is `0` — deterministically, with no waiting and no error — when the parent never reads that
+stream: `StdioMode.Null` or `StdioMode.Inherit`, a stream redirected straight to a file
+(`Command.StdoutToFile`), or a stream this command did not configure. A **merged** run
+(`Command.MergeStderr()`, or `Command.Pty()`, where the child has a single terminal device) has one
+parent-side stream: every byte counts into `StdoutBytesSeen`, and `StderrBytesSeen` stays `0` — the
+same boundary [`StderrChunksAsync()`](#streaming-stderr-as-byte-chunks) reports as unsupported.
+
+These counters are also what a fail-loud streaming overflow quotes as its total: when a bounded
+`StreamFullMode.Error` backlog trips, the `ProcessError.OutputTooLarge` it raises reports the raw bytes
+read so far (both pipes' together, for the merged event stream), so the diagnostic and the handle agree
+on one number. A **capture's** own totals are a different quantity and stay one: `ProcessResult`
+reports what the capture *retained*, post-decode, in the currency of the `OutputBuffer` cap that
+bounds it.
+
+**F#**
+
+```fsharp
+printfn $"{proc.StdoutLineCount} lines, {proc.StdoutBytesSeen} bytes off stdout so far"
+```
+
+**C#**
+
+```csharp
+Console.WriteLine($"{proc.StdoutLineCount} lines, {proc.StdoutBytesSeen} bytes off stdout so far");
+```
 
 ## Finishing a streamed run
 

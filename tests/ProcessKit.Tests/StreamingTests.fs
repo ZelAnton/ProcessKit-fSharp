@@ -3278,6 +3278,382 @@ type StreamingTests() =
         }
         :> Task
 
+    // --- The live raw-byte counters: `StdoutBytesSeen` / `StderrBytesSeen` (T-386) ------------------
+    //
+    // They are taken at the parent's own read (`Pump.MeteredStream` wraps this handle's two read ends),
+    // so every mode that reads a pipe counts in the same currency — before decoding, before line
+    // framing, and before any policy can drop or refuse a line — and a mode that reads nothing reports
+    // an honest, immediate `0`.
+
+    [<Test>]
+    member _.``BytesSeen counts the raw bytes a buffered capture read from both pipes``() : Task =
+        task {
+            let stdoutPayload = "out-1\nout-2\n"
+            let stderrPayload = "err-1\n"
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes stdoutPayload)
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes stderrPayload)
+
+            let running =
+                syntheticProcessOverStreams
+                    (Command.create "test").Config
+                    (Some(stdout :> Stream))
+                    (Some(stderr :> Stream))
+
+            match! running.OutputStringAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok result -> Assert.That(result.Stdout, Is.EqualTo "out-1\nout-2")
+
+            let expectedStdout = int64 (Encoding.UTF8.GetByteCount stdoutPayload)
+            let expectedStderr = int64 (Encoding.UTF8.GetByteCount stderrPayload)
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo expectedStdout)
+            Assert.That(running.StderrBytesSeen, Is.EqualTo expectedStderr)
+
+            // The counters keep their final totals past the end of the run: the pumps are over, the
+            // handle is disposed, and reading them is still just a volatile read of a settled value.
+            do! (running :> IAsyncDisposable).DisposeAsync()
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo expectedStdout)
+            Assert.That(running.StderrBytesSeen, Is.EqualTo expectedStderr)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``BytesSeen counts wire bytes regardless of the stdout encoding and line terminator``() : Task =
+        task {
+            // UTF-16 content framed on a bare CR: two decoded lines, and twice as many bytes on the
+            // wire as characters. The counter must report what the pipe delivered, not the size of the
+            // decoded text or anything the framing produced.
+            let text = "alpha\rbeta\r"
+            let payload = Encoding.Unicode.GetBytes text
+            use stdout = new MemoryStream(payload)
+
+            let config =
+                (Command.create "test"
+                 |> Command.stdoutEncoding Encoding.Unicode
+                 |> Command.stdoutLineTerminator LineTerminator.Cr)
+                    .Config
+
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            let! lines = collect (running.StdoutLinesAsync())
+
+            CollectionAssert.AreEqual([ "alpha"; "beta" ], lines)
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo(int64 payload.Length))
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo(int64 (2 * text.Length)))
+            Assert.That(running.StderrBytesSeen, Is.EqualTo 0L, "this run has no stderr stream to read")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``BytesSeen counts the bytes of lines a bounded stream policy dropped``() : Task =
+        task {
+            let total = 20
+            let capacity = 5
+            let payload = linesPayload total
+
+            let config =
+                (Command.create "test"
+                 |> Command.streamBuffer (StreamBufferPolicy.Bounded(capacity, StreamFullMode.DropNewest)))
+                    .Config
+
+            use running = syntheticStdoutProcess config payload
+            let enumerable = running.StdoutLinesAsync()
+            // Let the in-memory producer run to completion unread, so the drops are deterministic (the
+            // same reason the DropNewest test above waits here).
+            do! Task.Delay 200
+            let! lines = collect enumerable
+
+            Assert.That(lines.Count, Is.EqualTo capacity)
+            Assert.That(running.DroppedStreamLineCount, Is.EqualTo(total - capacity))
+
+            Assert.That(
+                running.StdoutBytesSeen,
+                Is.EqualTo(int64 (Encoding.UTF8.GetByteCount payload)),
+                "a dropped line's bytes still came off the child, so they are still seen"
+            )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``BytesSeen counts output an oversized-capture refusal never retained``() : Task =
+        task {
+            let payload = linesPayload 10
+
+            let config =
+                (Command.create "test"
+                 |> Command.outputBuffer ((OutputBufferPolicy.Unbounded.WithMaxBytes 8).WithOverflow OverflowMode.Error))
+                    .Config
+
+            use running = syntheticStdoutProcess config payload
+
+            match! running.OutputStringAsync() with
+            | Ok result -> Assert.Fail $"expected the fail-loud refusal, got '{result.Stdout}'"
+            | Error(ProcessError.OutputTooLarge _) -> ()
+            | Error other -> Assert.Fail $"expected OutputTooLarge, got {other}"
+
+            // The pipe is still drained past a fail-loud ceiling (the child must never block on it), and
+            // every byte drained is a byte seen — retention policy has no say here.
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount payload)))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``BytesSeen counts output a discarding WaitAsync never retained``() : Task =
+        task {
+            let stdoutPayload = linesPayload 4
+            let stderrPayload = "err-1\nerr-2\n"
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes stdoutPayload)
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes stderrPayload)
+
+            use running =
+                syntheticProcessOverStreams
+                    (Command.create "test").Config
+                    (Some(stdout :> Stream))
+                    (Some(stderr :> Stream))
+
+            let! outcome = running.WaitAsync()
+
+            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount stdoutPayload)))
+            Assert.That(running.StderrBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount stderrPayload)))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``BytesSeen counts every raw chunk a stdout chunk session read``() : Task =
+        task {
+            let stdoutChunks = [ [| 1uy; 2uy; 3uy |]; [| 4uy |] ]
+            let stderrPayload = "err-1\n"
+            use stdout = new ChunkedByteStream(stdoutChunks)
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes stderrPayload)
+
+            use running =
+                syntheticProcessOverStreams
+                    (Command.create "test").Config
+                    (Some(stdout :> Stream))
+                    (Some(stderr :> Stream))
+
+            let! chunks = collect (running.StdoutChunksAsync())
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+
+            Assert.That(chunks.Count, Is.EqualTo 2)
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo 4L)
+            Assert.That(running.StderrBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount stderrPayload)))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``BytesSeen counts every raw chunk a stderr chunk session read``() : Task =
+        task {
+            let stderrChunks = [ [| 9uy; 8uy |]; [| 7uy |] ]
+            let stdoutPayload = "out-1\n"
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes stdoutPayload)
+            use stderr = new ChunkedByteStream(stderrChunks)
+
+            use running =
+                syntheticProcessOverStreams
+                    (Command.create "test").Config
+                    (Some(stdout :> Stream))
+                    (Some(stderr :> Stream))
+
+            let! chunks = collect (running.StderrChunksAsync())
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+
+            Assert.That(chunks.Count, Is.EqualTo 2)
+            Assert.That(running.StderrBytesSeen, Is.EqualTo 3L)
+
+            // This session retains no stdout at all, and still saw every stdout byte it drained.
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount stdoutPayload)))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``BytesSeen counts both pipes during merged event streaming``() : Task =
+        task {
+            let stdoutPayload = "out-1\nout-2\n"
+            let stderrPayload = "err-1\n"
+            use stdout = new MemoryStream(Encoding.UTF8.GetBytes stdoutPayload)
+            use stderr = new MemoryStream(Encoding.UTF8.GetBytes stderrPayload)
+
+            use running =
+                syntheticProcessOverStreams
+                    (Command.create "test").Config
+                    (Some(stdout :> Stream))
+                    (Some(stderr :> Stream))
+
+            let! events = collect (running.OutputEventsAsync())
+
+            Assert.That(events.Count, Is.EqualTo 3)
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount stdoutPayload)))
+            Assert.That(running.StderrBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount stderrPayload)))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a MergeStderr run counts every byte on stdout and leaves StderrBytesSeen zero``() : Task =
+        task {
+            // A merged run has ONE parent-side stream, so there is no stderr counter to fill: its bytes
+            // are stdout's, exactly as `StderrChunksAsync`/the stderr readiness waits report no separate
+            // stderr to read. The double folds scripted stderr into the merged stream after a newline
+            // separator (see `FakeProcess.WithStderr`), so the merged payload is "out-1\nerr-1".
+            let command = Command.create "fake" |> Command.mergeStderr
+            let merged = "out-1\nerr-1"
+
+            use running =
+                FakeProcess.OfCommand(command).WithStdout("out-1\n").WithStderr("err-1").Build()
+
+            match! running.OutputStringAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok result -> Assert.That(result.Stdout, Is.EqualTo merged)
+
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount merged)))
+            Assert.That(running.StderrBytesSeen, Is.EqualTo 0L)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a PTY-backed run counts the merged terminal stream on stdout``() : Task =
+        task {
+            // The PTY shape of the case above: one terminal device, so one parent-side stream. The
+            // metering sits on whatever stream the spawn handed the parent, so a real pty master view
+            // is counted through the very same path this double exercises.
+            let merged = "out-1\nerr-1"
+
+            use running =
+                FakeProcess.Create("fake").WithPty().WithStdout("out-1\n").WithStderr("err-1").Build()
+
+            match! running.OutputStringAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok result -> Assert.That(result.Stdout, Is.EqualTo merged)
+
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount merged)))
+            Assert.That(running.StderrBytesSeen, Is.EqualTo 0L)
+
+            // The same shape driven by a `Command.Pty()` CONFIGURATION over one merged stream, so the
+            // handle's own pseudo-terminal path (not just the double's recorded-resize one) is covered.
+            let ptyConfig = (Command.create "test" |> Command.pty).Config
+            use terminal = new MemoryStream(Encoding.UTF8.GetBytes merged)
+
+            use ptyRun = syntheticProcessOverStreams ptyConfig (Some(terminal :> Stream)) None
+
+            let! outcome = ptyRun.WaitAsync()
+
+            Assert.That(outcome, Is.EqualTo(Outcome.Exited 0))
+            Assert.That(ptyRun.StdoutBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount merged)))
+            Assert.That(ptyRun.StderrBytesSeen, Is.EqualTo 0L)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a run the parent never reads reports zero bytes seen instead of failing``() : Task =
+        task {
+            // `Null`/`Inherit` destinations and a file redirect all leave the parent with no stream to
+            // read, so the honest answer is a deterministic `0` — never a hang, never an error.
+            let nullAndInherit =
+                Command.create "fake"
+                |> Command.stdout StdioMode.Null
+                |> Command.stderr StdioMode.Inherit
+
+            use unread =
+                FakeProcess.OfCommand(nullAndInherit).WithStdout("ignored").WithStderr("ignored").Build()
+
+            match! unread.OutputStringAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok result ->
+                Assert.That(result.Stdout, Is.Empty)
+                Assert.That(result.Stderr, Is.Empty)
+
+            Assert.That(unread.StdoutBytesSeen, Is.EqualTo 0L)
+            Assert.That(unread.StderrBytesSeen, Is.EqualTo 0L)
+
+            // The file-redirect case: the child writes straight to the file, so the parent reads nothing
+            // on that stream (the double never touches the path).
+            let redirected =
+                Command.create "fake"
+                |> Command.stdoutToFile (Path.Combine(Path.GetTempPath(), "processkit-bytes-seen-unused.log")) false
+
+            use redirectedRun = FakeProcess.OfCommand(redirected).WithStderr("err-1").Build()
+
+            match! redirectedRun.OutputStringAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok result -> Assert.That(result.Stdout, Is.Empty)
+
+            Assert.That(redirectedRun.StdoutBytesSeen, Is.EqualTo 0L)
+            Assert.That(redirectedRun.StderrBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount "err-1")))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a ScriptedRunner handle counts its scripted bytes like a real spawn``() : Task =
+        task {
+            // Test-double parity: `ScriptedRunner` (and, through the same `FakeProcess` spawn path, a
+            // replayed cassette) builds a real `RunningProcess` over in-memory streams, so it counts
+            // through the very same metered read ends a live spawn does — no double-specific plumbing.
+            let scripted: IProcessRunner =
+                ScriptedRunner().Fallback(Reply.Ok("out-1\nout-2").WithStderr "err-1")
+
+            match! scripted.SpawnAsync(Command.create "fake", CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok started ->
+                use running = started
+
+                match! running.OutputStringAsync() with
+                | Error error -> Assert.Fail $"{error}"
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "out-1\nout-2")
+
+                Assert.That(running.StdoutBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount "out-1\nout-2")))
+                Assert.That(running.StderrBytesSeen, Is.EqualTo(int64 (Encoding.UTF8.GetByteCount "err-1")))
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the byte counters stay monotonic and exact under concurrent readers``() : Task =
+        task {
+            // Race safety, not timing: several threads read the counter while the pump is filling it.
+            // A read must never go backwards or overshoot what the stream can produce (`Interlocked.Add`
+            // publishes each read's count, `Volatile.Read` takes a fresh one), and the settled total must
+            // be exactly what the child produced.
+            let lineCount = 2_000
+            use stdout = new GeneratedLinesStream(String('x', 200), lineCount)
+
+            use running =
+                syntheticProcessOverStreams (Command.create "test").Config (Some(stdout :> Stream)) None
+
+            use polling = new CancellationTokenSource()
+
+            let poll () =
+                Task.Run(fun () ->
+                    let mutable previous = 0L
+
+                    while not polling.IsCancellationRequested do
+                        let current = running.StdoutBytesSeen
+
+                        Assert.That(current, Is.GreaterThanOrEqualTo previous, "a live byte counter went backwards")
+
+                        Assert.That(
+                            current,
+                            Is.LessThanOrEqualTo stdout.TotalBytes,
+                            "a live byte counter reported more than the stream could produce"
+                        )
+
+                        previous <- current
+                        Thread.Yield() |> ignore)
+
+            let pollers = [| for _ in 1..3 -> poll () |]
+            let! lines = collect (running.StdoutLinesAsync())
+            polling.Cancel()
+            do! Task.WhenAll pollers
+
+            Assert.That(lines.Count, Is.EqualTo lineCount)
+            Assert.That(running.StdoutBytesSeen, Is.EqualTo stdout.TotalBytes)
+        }
+        :> Task
+
     [<Test>]
     member _.``StreamBuffer DropOldest on OutputEvents does not livelock when a sibling pump faults``() : Task =
         task {
@@ -3355,8 +3731,9 @@ type StreamingTests() =
 
             // T-297: one stdout streaming channel item is one framed line, 1:1, so the channel's item
             // capacity genuinely IS a line limit and the running line count genuinely IS the total lines
-            // produced — both must stay honest. `TotalBytes` used to be hardcoded `0`; it must now report
-            // the real (UTF-8) size of the lines produced before the cap tripped.
+            // produced — both must stay honest. `TotalBytes` used to be hardcoded `0`; it must report
+            // the real volume of stdout behind the overflow — since T-386, the raw bytes actually read
+            // from the child, which is the same number the handle publishes as `StdoutBytesSeen`.
             match error with
             | Some(ProcessError.OutputTooLarge(_, lineLimit, byteLimit, totalLines, totalBytes)) ->
                 Assert.That(lineLimit, Is.EqualTo(Some capacity), "the channel's item capacity is the line limit here")
@@ -3364,6 +3741,12 @@ type StreamingTests() =
                 Assert.That(totalLines, Is.EqualTo total, "the triggering line must be included exactly once")
                 Assert.That(totalLines, Is.GreaterThan capacity)
                 Assert.That(totalBytes, Is.EqualTo(Encoding.UTF8.GetByteCount payload))
+
+                Assert.That(
+                    int64 totalBytes,
+                    Is.EqualTo running.StdoutBytesSeen,
+                    "the overflow diagnostic must quote the same raw byte total the handle publishes"
+                )
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"
         }
         :> Task
@@ -3418,6 +3801,13 @@ type StreamingTests() =
                 Assert.That(totalLines, Is.EqualTo total, "stdout and stderr events must both contribute")
                 Assert.That(totalLines, Is.EqualTo(capacity + 1))
                 Assert.That(totalBytes, Is.EqualTo expectedBytes)
+
+                Assert.That(
+                    int64 totalBytes,
+                    Is.EqualTo(running.StdoutBytesSeen + running.StderrBytesSeen),
+                    "the merged overflow diagnostic must quote both pipes' raw byte totals (T-386)"
+                )
+
                 Assert.That(overflow.Message, Does.Contain("too many events"))
                 Assert.That(overflow.Message, Does.Not.Contain("line output"))
             | other -> Assert.Fail $"expected OutputTooLarge, got {other}"

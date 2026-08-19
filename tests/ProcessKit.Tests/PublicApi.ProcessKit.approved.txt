@@ -1505,7 +1505,9 @@ class ProcessKit.RunningProcess
   property PeakMemoryBytes : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property Pid : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
   property StartTime : System.DateTime { get }
+  property StderrBytesSeen : System.Int64 { get }
   property StderrLineCount : System.Int32 { get }
+  property StdoutBytesSeen : System.Int64 { get }
   property StdoutLineCount : System.Int32 { get }
   static member WaitAllAsync(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<ProcessKit.Outcome[]>
   static member WaitAnyAsync(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<ProcessKit.WaitAnyResult>

@@ -381,6 +381,84 @@ module internal Pump =
         }
         :> Task
 
+    /// A transparent read-only wrapper that reports every non-empty read's byte count to `onBytesRead`
+    /// — the ONE hook behind the live raw-byte counters a handle publishes
+    /// (`RunningProcess.StdoutBytesSeen`/`StderrBytesSeen`), and deliberately the only one.
+    ///
+    /// **Why one wrapper rather than a counter at each read site.** Every parent-side read of a child's
+    /// stdout/stderr in this library goes through a `stream.ReadAsync` in this module — the two
+    /// line-framing loops (`readLinesBody`), the raw-text loop (`readTextBody`), the byte-chunk loop
+    /// (`readBytesBody`), the discard drain (`drainDiscard`), the raw capture (`captureRawInto`) — or
+    /// through `ContentLengthSession`'s own framed reader. Metering the STREAM rather than each of
+    /// those loops puts the count at exactly the point the OS handed the bytes back, which is what
+    /// makes it honest in all three ways the counter promises: it is taken **before** any decoding,
+    /// line framing, retention policy or drop decision can touch those bytes; it covers **every** mode
+    /// by construction (buffered capture, line/event streaming, byte chunks, PTY-backed and merged
+    /// runs, a readiness probe's background drain) rather than each mode a call site remembered to
+    /// thread a counter into; and a pump added later cannot silently escape it. It is also the shape
+    /// this library already uses for the idle watchdog — `Timeouts.ActivityStream` wraps the same
+    /// streams to observe activity at byte granularity, uniformly across every pump, for exactly the
+    /// same reason.
+    ///
+    /// A zero-length read is EOF (or a spurious empty completion), never bytes seen. The wrapper owns
+    /// no resources and deliberately does NOT dispose `inner`: the run's teardown owns the pipe, as it
+    /// does for `SeverableStream` — the layer directly beneath this one — whose read-only surface this
+    /// mirrors so wrapping changes nothing a consumer can observe apart from the count.
+    type MeteredStream(inner: Stream, onBytesRead: int -> unit) =
+        inherit Stream()
+
+        // Report a completed read, returning its count so it threads straight through the read.
+        let note (read: int) =
+            if read > 0 then
+                onBytesRead read
+
+            read
+
+        override _.CanRead = inner.CanRead
+        override _.CanSeek = false
+        override _.CanWrite = false
+
+        override _.Length = raise (NotSupportedException "a metered output stream has no length")
+
+        override _.Position
+            with get () = raise (NotSupportedException "a metered output stream is not seekable")
+            and set _ = raise (NotSupportedException "a metered output stream is not seekable")
+
+        override _.Flush() = inner.Flush()
+
+        override _.Seek(_, _) =
+            raise (NotSupportedException "a metered output stream is not seekable")
+
+        override _.SetLength _ =
+            raise (NotSupportedException "a metered output stream has no length")
+
+        override _.Write(_, _, _) =
+            raise (NotSupportedException "a metered output stream is read-only")
+
+        // Nothing in this library reads these pipes synchronously (every pump goes through
+        // `ReadAsync`); the override exists so the wrapper stays a faithful `Stream` — and counts.
+        override _.Read(buffer, offset, count) =
+            note (inner.Read(buffer, offset, count))
+
+        override this.ReadAsync(buffer: byte[], offset: int, count: int, cancellationToken: CancellationToken) =
+            this.ReadAsync(Memory<byte>(buffer, offset, count), cancellationToken).AsTask()
+
+        override _.ReadAsync(buffer: Memory<byte>, cancellationToken: CancellationToken) =
+            let pending = inner.ReadAsync(buffer, cancellationToken)
+
+            if pending.IsCompletedSuccessfully then
+                // A read that completed synchronously (an in-memory stream, or a pipe that already had
+                // bytes buffered) is counted without allocating a continuation for it, exactly as
+                // `SeverableStream` avoids one on the same path.
+                ValueTask<int>(note pending.Result)
+            else
+                ValueTask<int>(
+                    task {
+                        let! read = pending
+                        return note read
+                    }
+                )
+
     /// Read `stream` to EOF: tee the raw bytes (if a sink is set), decode with `encoding`, split into
     /// lines under `terminator`, and pass each complete line — including a final unterminated one — to
     /// `onLine`. `terminator` decides where a line ends: `Lf` (the default) splits on `\n` only,

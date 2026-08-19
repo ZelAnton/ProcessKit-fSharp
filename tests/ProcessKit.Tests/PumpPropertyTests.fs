@@ -378,3 +378,56 @@ type PumpPropertyTests() =
                 lengthsOk && reconstructed = expected)
 
         Check.QuickThrowOnFailure property
+
+    // --- Property 5: the raw-byte meter behind `RunningProcess.StdoutBytesSeen`/`StderrBytesSeen`
+    // (`Pump.MeteredStream`) counts exactly the bytes the stream delivered — independent of how the
+    // stream is chunked, of the encoding it is decoded with, and of the line terminator it is framed
+    // on, because it counts at the read and nothing downstream can add to or subtract from it. ---
+
+    [<Test>]
+    member _.``MeteredStream counts exactly the delivered bytes, whatever the chunking, encoding or framing``() =
+        let case =
+            gen {
+                let! terminator = Gen.elements allTerminators
+                // Free-form content, '\r'/'\n' included at any position: the framing this produces is
+                // irrelevant to the count, which is exactly the point of the property.
+                let! chars = Gen.nonEmptyListOf (Gen.elements ('\r' :: '\n' :: contentPool))
+                let! chunkSizes = chunkSizesGen
+                let! utf16 = Gen.elements [ true; false ]
+
+                return
+                    {| Terminator = terminator
+                       Text = String(List.toArray chars)
+                       ChunkSizes = chunkSizes
+                       Utf16 = utf16 |}
+            }
+
+        let property =
+            Prop.forAll (Arb.fromGen case) (fun case ->
+                let encoding: Encoding = if case.Utf16 then Encoding.Unicode else Encoding.UTF8
+
+                let bytes = encoding.GetBytes case.Text
+                let seen = ref 0L
+                use inner = new ChunkedStream(bytes, case.ChunkSizes)
+
+                use metered =
+                    new Pump.MeteredStream(inner, (fun read -> Interlocked.Add(&seen.contents, int64 read) |> ignore))
+                    :> Stream
+
+                let lines = ResizeArray<string>()
+
+                (Pump.readLines
+                    metered
+                    encoding
+                    case.Terminator
+                    None
+                    (fun line ->
+                        lines.Add line
+                        ValueTask.CompletedTask)
+                    None
+                    CancellationToken.None)
+                    .Wait()
+
+                Volatile.Read(&seen.contents) = int64 bytes.Length)
+
+        Check.QuickThrowOnFailure property

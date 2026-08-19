@@ -4,7 +4,6 @@ open System
 open System.Collections.Generic
 open System.IO
 open System.Runtime.ExceptionServices
-open System.Text
 open System.Threading
 open System.Threading.Tasks
 
@@ -130,19 +129,62 @@ type internal OutputSessions
 
     let isTearingDown () = terminal.IsTearingDown()
 
+    // ---- the live raw-byte counters (`RunningProcess.StdoutBytesSeen`/`StderrBytesSeen`) ----------
+    //
+    // Cumulative RAW bytes this handle has actually read from the child's stdout/stderr — what
+    // `Stream.ReadAsync` returned on the PARENT's side, counted at the read itself (see
+    // `Pump.MeteredStream`, which is where the count is taken) and therefore BEFORE any decoding, line
+    // framing, retention policy or drop decision can touch those bytes. So a line a bounded streaming
+    // policy drops, one the buffer policy refuses as oversized, and output a discarding drain throws
+    // away are all still counted here, and the counters mean the same thing in every mode: buffered
+    // capture, line/event streaming, byte chunks, a PTY-backed or `MergeStderr` run (one merged stream,
+    // so its bytes are stdout's), and a readiness probe's background drain.
+    //
+    // Deliberately NOT the same quantity as `Pump.LineBuffer.TotalBytes` or the chunk counters below,
+    // which measure what a capture RETAINED (post-decode, in the currency of the cap that bounds it).
+    // A stream this run never reads on the parent side — `file`/`null`/`inherit` redirection, a stream
+    // this command did not configure, the absent stderr of a merged run — has no metered stream at all,
+    // so its counter honestly stays `0` rather than blocking or failing.
+    //
+    // `int64` (see the sibling byte counters below): a long-running stream can plausibly exceed
+    // `Int32.MaxValue` bytes. Written by a pump task, read from the consumer's thread, so
+    // `Interlocked.Add` publishes each read's count and `Volatile.Read` takes a fresh one — the atomic
+    // pattern every counter in this type uses. Nothing resets them: the value stays readable, at its
+    // final total, long after the pumps have ended and the handle has been finished or disposed.
+    let mutable stdoutBytesSeen = 0L
+    let mutable stderrBytesSeen = 0L
+
+    let bumpStdoutBytesSeen (read: int) =
+        Interlocked.Add(&stdoutBytesSeen, int64 read) |> ignore
+
+    let bumpStderrBytesSeen (read: int) =
+        Interlocked.Add(&stderrBytesSeen, int64 read) |> ignore
+
+    // The METERED views of this handle's two parent read ends — the streams every session below
+    // actually pumps. They deliberately shadow the constructor's arguments: metering must not be
+    // bypassable from inside this type, and a pump added later then counts without having to remember
+    // to. A stream that isn't piped stays `None`, so nothing is wrapped and nothing is counted.
+    let stdoutStream =
+        stdoutStream
+        |> Option.map (fun stream -> new Pump.MeteredStream(stream, bumpStdoutBytesSeen) :> Stream)
+
+    let stderrStream =
+        stderrStream
+        |> Option.map (fun stream -> new Pump.MeteredStream(stream, bumpStderrBytesSeen) :> Stream)
+
     let mutable stdoutLineCount = 0L
     let mutable stdoutChunkCount = 0
     let mutable stderrLineCount = 0L
     let mutable droppedStreamLineCount = 0
 
-    // Cumulative bytes actually pumped into the stdout LINE streaming channel / the raw stdout CHUNK
-    // channel, tracked only to feed an honest `ProcessError.OutputTooLarge.TotalBytes` on
-    // `StreamFullMode.Error` overflow (T-297) — neither channel's own consumption path needs them.
-    // `int64` because a long-running stream can plausibly exceed `Int32.MaxValue` bytes before the cap
-    // (if any) ever trips; the saturating reads below take them back down to `int` the same way
-    // `Pump.LineBuffer.TotalBytes` does.
-    let mutable stdoutStreamedByteCount = 0L
-    let mutable stderrStreamedByteCount = 0L
+    // Cumulative bytes actually pumped into the raw stdout/stderr CHUNK channels, tracked only to feed
+    // an honest `ProcessError.OutputTooLarge.TotalBytes` on `StreamFullMode.Error` overflow (T-297) —
+    // neither channel's own consumption path needs them. They stay separate from the raw-byte counters
+    // above on purpose: a chunk channel's overflow is about what was QUEUED for the consumer, which is
+    // the quantity its capacity bounds, whereas `stdoutBytesSeen` also counts what the pump had already
+    // read past that point. `int64` because a long-running stream can plausibly exceed `Int32.MaxValue`
+    // bytes before the cap (if any) ever trips; the saturating reads below take them back down to `int`
+    // the same way `Pump.LineBuffer.TotalBytes` does.
     let mutable stdoutChunkStreamedByteCount = 0L
     let mutable stderrChunkStreamedByteCount = 0L
 
@@ -227,12 +269,6 @@ type internal OutputSessions
         else
             int (min (stdout + stderr) (int64 Int32.MaxValue))
 
-    let bumpStdoutStreamedBytes (delta: int64) =
-        Interlocked.Add(&stdoutStreamedByteCount, delta) |> ignore
-
-    let bumpStderrStreamedBytes (delta: int64) =
-        Interlocked.Add(&stderrStreamedByteCount, delta) |> ignore
-
     let bumpStdoutChunkStreamedBytes (delta: int) =
         Interlocked.Add(&stdoutChunkStreamedByteCount, int64 delta) |> ignore
 
@@ -241,12 +277,12 @@ type internal OutputSessions
 
     // Saturating reads, mirroring `Pump.LineBuffer.TotalBytes` — these only ever feed an `int`-typed
     // `ProcessError.OutputTooLarge.TotalBytes`.
-    let readStdoutStreamedByteCount () =
-        Volatile.Read(&stdoutStreamedByteCount) |> saturateInt64ToInt
+    let readStdoutBytesSeenSaturated () =
+        Volatile.Read(&stdoutBytesSeen) |> saturateInt64ToInt
 
-    let readCombinedStreamedByteCount () =
-        let stdout = Volatile.Read(&stdoutStreamedByteCount)
-        let stderr = Volatile.Read(&stderrStreamedByteCount)
+    let readCombinedBytesSeenSaturated () =
+        let stdout = Volatile.Read(&stdoutBytesSeen)
+        let stderr = Volatile.Read(&stderrBytesSeen)
 
         if stdout >= int64 Int32.MaxValue || stderr >= int64 Int32.MaxValue then
             Int32.MaxValue
@@ -475,6 +511,23 @@ type internal OutputSessions
     /// Total stderr lines pumped so far.
     member _.StderrLineCount = readStderrLineCount ()
 
+    /// Cumulative RAW stdout bytes read from the child so far, counted at the read itself (see the
+    /// counters' note above): before decoding, before line framing, and before any policy could drop
+    /// or refuse them. `0` for a run whose stdout the parent never reads.
+    member _.StdoutBytesSeen: int64 = Volatile.Read(&stdoutBytesSeen)
+
+    /// The stderr twin of `StdoutBytesSeen`. `0` for a run with no separate parent-side stderr stream
+    /// (a `MergeStderr`/PTY run, whose bytes are counted on stdout, or a redirected/unconfigured one).
+    member _.StderrBytesSeen: int64 = Volatile.Read(&stderrBytesSeen)
+
+    /// The METERED views of this handle's parent read ends. Handed to a readiness probe's background
+    /// drain (`RunningProcess.probeDrainStreams`) so that drain's reads are counted like every other
+    /// read of these pipes — it is the same stream the sessions here pump, never a second, unmetered
+    /// view of it.
+    member _.MeteredStdoutStream = stdoutStream
+
+    member _.MeteredStderrStream = stderrStream
+
     /// Stream items dropped so far by a bounded streaming policy's `StreamFullMode.DropOldest`/
     /// `DropNewest`. For line/event streams this counts dropped lines/events; for the chunk session it
     /// counts dropped chunks.
@@ -635,30 +688,31 @@ type internal OutputSessions
         // create one (that refusal is what keeps this drop from being a silent one). Nothing being
         // queued also means the channel's `StreamBuffer` capacity has nothing left to overflow: no
         // fail-loud `OutputTooLarge` and no drop bookkeeping can fire from a stream that retains
-        // nothing, so the byte counter feeding that diagnostic is left alone too.
+        // nothing. (The raw-byte counter is unaffected either way: it counts at the read, not here.)
         let sinkStdoutLine (line: string) : ValueTask =
             if discardingStdoutStream () then
                 ValueTask.CompletedTask
             else
-                bumpStdoutStreamedBytes (int64 (Encoding.UTF8.GetByteCount line) + 1L)
-
                 writeStreamItem
                     stdoutChannel
                     (fun policy ->
                         // One channel item is one framed stdout line, 1:1, so the channel's item
                         // capacity IS a genuine line limit and `readStdoutLineCount()` is the true
                         // count of lines produced before the cap tripped — both stayed honest
-                        // already. `TotalBytes` was hardcoded `0` before T-297; it now reports the
-                        // UTF-8 size of those lines using the same "own bytes + 1 separator byte"
-                        // accounting `Pump.LineBuffer`'s doc comment explains (a small, deliberate
-                        // over-count, never an under-count) — this streaming channel retains
-                        // nothing to re-scan, so the cost is tracked incrementally instead.
+                        // already. `TotalBytes` has no `ByteLimit` to be in the currency of here —
+                        // what overflowed is a LINE backlog — so it reports the one exact byte
+                        // total this site has: the raw stdout bytes actually READ from the child so
+                        // far, the very number `RunningProcess.StdoutBytesSeen` publishes. T-297
+                        // (which first made it non-zero) had to re-derive it from the re-encoded
+                        // UTF-8 size of the lines queued, over-counting each by its separator byte
+                        // and under-counting the tail already read but not yet framed; a live
+                        // raw-byte counter now measures it exactly, at the read.
                         ProcessError.OutputTooLarge(
                             config.Program,
                             Some policy.Capacity,
                             None,
                             readStdoutLineCount (),
-                            readStdoutStreamedByteCount ()
+                            readStdoutBytesSeenSaturated ()
                         ))
                     bumpDroppedStreamLine
                     line
@@ -961,7 +1015,6 @@ type internal OutputSessions
             tee
             (onLine: Action<string> option)
             (bump: unit -> unit)
-            (bumpBytes: int64 -> unit)
             (wrap: OutputLine -> OutputEvent)
             =
             task {
@@ -986,7 +1039,6 @@ type internal OutputSessions
 
                                 invokeLine onLine line
                                 bump ()
-                                bumpBytes (int64 (Encoding.UTF8.GetByteCount line) + 1L)
 
                                 writeStreamItem
                                     eventChannel
@@ -1001,15 +1053,17 @@ type internal OutputSessions
                                         // framed lines both pumps have produced so far (each event
                                         // wraps exactly one line, so this total is real — just not
                                         // tied to a channel-capacity-shaped limit). `ByteLimit`
-                                        // stays `None`; `TotalBytes` uses the same UTF-8-plus-
-                                        // separator accounting as stdout line streaming, summed
-                                        // across both event producers including this event.
+                                        // stays `None`, so — exactly as on stdout line streaming —
+                                        // `TotalBytes` reports the exact raw bytes both pipes have
+                                        // been READ for so far (`StdoutBytesSeen` +
+                                        // `StderrBytesSeen`), the same totals the handle publishes,
+                                        // rather than a re-derived post-decode approximation.
                                         ProcessError.OutputTooLarge(
                                             config.Program,
                                             None,
                                             None,
                                             readCombinedLineCount (),
-                                            readCombinedStreamedByteCount ()
+                                            readCombinedBytesSeenSaturated ()
                                         ))
                                     bumpDroppedStreamLine
                                     (wrap outputLine))
@@ -1031,7 +1085,6 @@ type internal OutputSessions
                 config.StdoutTee
                 config.OnStdoutLine
                 bumpStdoutLine
-                bumpStdoutStreamedBytes
                 OutputEvent.Stdout
 
         let stderrPump =
@@ -1042,7 +1095,6 @@ type internal OutputSessions
                 config.StderrTee
                 config.OnStderrLine
                 bumpStderrLine
-                bumpStderrStreamedBytes
                 OutputEvent.Stderr
 
         // A fault in either pump kills the tree at once, so a still-producing child can't wedge the
