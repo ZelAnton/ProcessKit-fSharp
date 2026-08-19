@@ -203,12 +203,18 @@ type ProcessLookupTests() =
                 Posix.processIdentityReaderAvailableForTests <- originalAvailable
 
     [<Test>]
-    member _.``processIsAlive reports typed Unsupported, never a guessed "alive", when this platform has no start-time reader at all``
+    member _.``processIsAlive reports typed Io, never Unsupported, when the current start time is unreadable even on a reader-less host (R-05 regression)``
         ()
         =
-        // Same false-positive guard as above, but for a platform with NO reader at all (a BSD other than
-        // macOS): a saved token can never be verified there, so the honest answer is `Unsupported`, never
-        // a silently degraded `Ok true`.
+        // R-05: `processIsAlive`'s `Some _, None` classification is gated on the wrong reader —
+        // `Native.Posix.processIdentityReaderAvailable` answers about the raw jiffies/`proc_pidinfo`
+        // identity reader `readProcessIdentity` (Linux/macOS only), not about the reader that actually
+        // fills `MemberInfo.StartTime` (`Native.Common.readProcessStartTime`, a best-effort
+        // `Process.StartTime` attempted on EVERY platform, `other` BSDs included per
+        // `readBareProcessInfoChecked`). So even simulating a reader-less host (the old
+        // `processIdentityReaderAvailableForTests <- false` seam, modeling a bare BSD) must still produce
+        // `ProcessError.Io`, never `ProcessError.Unsupported` — there is no platform where the start-time
+        // reader is categorically absent rather than momentarily unable to answer for one pid.
         if isWindows then
             Assert.Ignore "POSIX-only: models a reader-less POSIX host"
         else
@@ -220,8 +226,8 @@ type ProcessLookupTests() =
                 Posix.processInfoForTests <- Some(fun pid -> Ok(Some(MemberInfo(pid, None, None, None))))
 
                 match ProcessLookup.processIsAlive 4242 (Some(DateTime.Now.AddMinutes -5.0)) with
-                | Error(ProcessError.Unsupported _) -> ()
-                | other -> Assert.Fail $"expected Error(ProcessError.Unsupported _), got {other}"
+                | Error(ProcessError.Io _) -> ()
+                | other -> Assert.Fail $"expected Error(ProcessError.Io _), got {other}"
             finally
                 Posix.processInfoForTests <- originalInfo
                 Posix.processIdentityReaderAvailableForTests <- originalAvailable

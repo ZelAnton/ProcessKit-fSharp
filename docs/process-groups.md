@@ -806,11 +806,12 @@ time — fixed at creation, distinct for a later occupant — tells the two apar
 saved** (`saved = None`), the check honestly degrades to bare-pid liveness rather than reporting a false
 "dead" it cannot prove. But when a token **was** saved and the *current* process's start time cannot be
 read right now, `processIsAlive` never falls back to "alive" just because the pid still exists — that is
-exactly the reuse false positive this API exists to prevent — it returns a typed `Error` instead:
-`ProcessError.Unsupported` on a platform with no start-time reader at all, `ProcessError.Io` when this
-one pid's current start time specifically could not be read. Both functions reuse exactly the same
-per-platform readers `MembersInfo()` uses — no second, parallel identity-reading mechanism — so the two
-APIs can never disagree about the same pid.
+exactly the reuse false positive this API exists to prevent — it returns a typed `ProcessError.Io`
+instead: the start-time reader is attempted on every platform (a best-effort `Process.StartTime` even on
+a BSD other than macOS), so a failed read is always about this one pid right now, never a platform
+lacking the mechanism (`ProcessError.Unsupported`). Both functions reuse exactly the same per-platform
+readers `MembersInfo()` uses — no second, parallel identity-reading mechanism — so the two APIs can never
+disagree about the same pid.
 
 ## Resource limits
 

@@ -423,7 +423,7 @@ known-live membership:
 |---|:---:|:---:|:---:|:---:|
 | Existence/permission oracle | `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` | `/proc/<pid>/stat` read | `proc_pidinfo(PROC_PIDTBSDINFO)` | zero-signal `kill(pid, 0)` probe |
 | A process that may exist but cannot be inspected | ✅ typed `ProcessError.Io` (denied `OpenProcess`) | ✅ typed `ProcessError.Io` (`EACCES` — `hidepid=1` only, see below) | ✅ typed `ProcessError.Io` (any errno but `ESRCH`) | ✅ typed `ProcessError.Io` (any errno but `ESRCH`/`EPERM`) |
-| `processIsAlive` reuse protection (`Some startTime` verified against the live process) | ✅ | ✅ | ✅ | ❌ `ProcessError.Unsupported` — no start-time reader, so a saved token can never be verified |
+| `processIsAlive` reuse protection (`Some startTime` verified against the live process) | ✅ | ✅ | ✅ | 🟡 best-effort, same as the `StartTime` row above — a `Process.StartTime` read that fails for this one pid right now is `ProcessError.Io`, never `Unsupported` (there is no platform where the reader is categorically absent) |
 
 Two divergences to read before relying on either outcome:
 
