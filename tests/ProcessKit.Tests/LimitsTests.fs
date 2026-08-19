@@ -106,7 +106,14 @@ type internal LimitContractBackend(initial: ResourceLimits, shouldFail: Resource
         member _.PidOf(_spawned) = None
         member _.KillChild(_spawned) = ()
         member _.KillTree() = Ok()
-        member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
+
+        member _.GracefulKillTree (_signal) (_grace) =
+            Task.FromResult
+                { Soft = SoftDelivery.Sent
+                  Drained = true
+                  Escalated = false }
+
+        member _.SoftStopScope() = SoftStopScope.Unsupported
         member _.SignalChild(_spawned, _signal) = Ok()
         member _.Members() = Ok []
         member _.Signal(_signal) = Ok()
@@ -167,7 +174,14 @@ type internal LimitEvidenceEchoBackend(updateLimitsFails: bool) =
         member _.PidOf(_spawned) = None
         member _.KillChild(_spawned) = ()
         member _.KillTree() = Ok()
-        member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
+
+        member _.GracefulKillTree (_signal) (_grace) =
+            Task.FromResult
+                { Soft = SoftDelivery.Sent
+                  Drained = true
+                  Escalated = false }
+
+        member _.SoftStopScope() = SoftStopScope.Unsupported
         member _.SignalChild(_spawned, _signal) = Ok()
         member _.Members() = Ok []
         member _.Signal(_signal) = Ok()

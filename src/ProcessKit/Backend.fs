@@ -6,6 +6,42 @@ open System.Collections.Generic
 open System.Diagnostics
 open System.Threading.Tasks
 
+/// The observed fate of one containment backend's best-effort graceful "soft signal" attempt — the
+/// shared, backend-agnostic core behind the public `SoftSignalDelivery` (which additionally carries the
+/// `Signal` attempted; that lives in `ProcessGroup.ShutdownReportAsync`, the one place that knows the
+/// group's configured `Options.StopSignal`). Mirrors ProcessKit-rs's `sys::graceful::SoftDelivery`.
+type internal SoftDelivery =
+
+    /// The soft signal was delivered best-effort to the tree (a POSIX signal on Unix; at least one
+    /// `WM_CLOSE` posted on the Windows soft tier).
+    | Sent
+
+    /// This platform/target has no soft-signal tier for the group, so the teardown could only hard-kill: a
+    /// windowless Windows Job Object with no live windowed member. Every Unix backend always has a real
+    /// `SIGTERM` tier, so this is never produced there.
+    | Unsupported
+
+    /// A soft-signal tier exists but the best-effort delivery failed for every target (a uid-changed
+    /// member rejecting the signal on Unix).
+    | Failed
+
+/// The observed facts of one whole-tree graceful teardown, gathered by a single `IContainmentBackend`
+/// call to `GracefulKillTree`. The always-available, feature-agnostic core the public `ShutdownReport` is
+/// built from (`ProcessGroup.ShutdownReportAsync` adds the member counts, before/after, and the elapsed
+/// time — see that method's own comment for why those are measured at the caller rather than here).
+/// Mirrors ProcessKit-rs's `sys::graceful::GracefulOutcome`.
+type internal GracefulOutcome =
+    {
+        /// The fate of the best-effort soft-signal tier.
+        Soft: SoftDelivery
+
+        /// Whether the tree drained within the grace window, before any hard kill.
+        Drained: bool
+
+        /// Whether the driver escalated to a hard kill because the tree had not drained by the deadline.
+        Escalated: bool
+    }
+
 /// Shared graceful-teardown shape for all containment backends: request the platform/configured soft
 /// stop, poll until the tree is dead or `grace` elapses, then force-kill whatever remains.
 module internal GracefulTeardown =
@@ -13,13 +49,13 @@ module internal GracefulTeardown =
     let internal pollUsing
         (startClock: unit -> (unit -> TimeSpan))
         (delay: TimeSpan -> Task)
-        (terminate: unit -> unit)
+        (softSignal: unit -> SoftDelivery)
         (alive: unit -> bool)
         (forceKill: unit -> unit)
         (grace: TimeSpan)
-        : Task =
+        : Task<GracefulOutcome> =
         task {
-            terminate ()
+            let soft = softSignal ()
             let elapsed = startClock ()
             let deadline = grace
             let pollInterval = TimeSpan.FromMilliseconds 50.0
@@ -36,18 +72,29 @@ module internal GracefulTeardown =
 
                 do! delay armableDelay
 
-            if alive () then
-                forceKill ()
-        }
-        :> Task
+            let stillAlive = alive ()
 
-    let poll (terminate: unit -> unit) (alive: unit -> bool) (forceKill: unit -> unit) (grace: TimeSpan) : Task =
+            if stillAlive then
+                forceKill ()
+
+            return
+                { Soft = soft
+                  Drained = not stillAlive
+                  Escalated = stillAlive }
+        }
+
+    let poll
+        (softSignal: unit -> SoftDelivery)
+        (alive: unit -> bool)
+        (forceKill: unit -> unit)
+        (grace: TimeSpan)
+        : Task<GracefulOutcome> =
         pollUsing
             (fun () ->
                 let stopwatch = Stopwatch.StartNew()
                 fun () -> stopwatch.Elapsed)
             (fun duration -> Task.Delay duration)
-            terminate
+            softSignal
             alive
             forceKill
             grace
@@ -299,8 +346,17 @@ type internal IContainmentBackend =
     /// best-effort through `HardRelease`.
     abstract KillTree: unit -> Result<unit, ProcessError>
 
-    /// Gracefully kill the tree (configured soft signal → grace → hard kill) without releasing it.
-    abstract GracefulKillTree: Signal -> TimeSpan -> Task
+    /// Gracefully kill the tree (configured soft signal → grace → hard kill) without releasing it. The
+    /// returned `GracefulOutcome` is the observed-facts core `ProcessGroup.ShutdownReportAsync` builds its
+    /// public `ShutdownReport` from; every other caller (`ShutdownAsync`, the per-run graceful-timeout
+    /// path) simply discards it, exactly as before this member started reporting anything.
+    abstract GracefulKillTree: Signal -> TimeSpan -> Task<GracefulOutcome>
+
+    /// How far a soft stop (`Signal.Int`/`Signal.Term`) reaches on this backend's CURRENT live membership,
+    /// right now — the answer `ProcessGroup.SoftStopScope()` reports. Side-effect-free: it must deliver no
+    /// signal and touch no native mutation, only read the same live state `Signal`/`GracefulKillTree`
+    /// consult, so asking never changes what a later soft stop would do.
+    abstract SoftStopScope: unit -> SoftStopScope
 
     /// Deliver a signal to one tracked child's own containment unit.
     abstract SignalChild: Native.Common.Spawned * Signal -> Result<unit, ProcessError>
@@ -482,20 +538,45 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
             match Native.Windows.duplicateJobHandle jobHandle with
             | None ->
                 Native.Windows.terminateWindowsJob jobHandle |> ignore
-                Task.CompletedTask
+
+                Task.FromResult
+                    { Soft = SoftDelivery.Unsupported
+                      Drained = false
+                      Escalated = true }
             | Some ownedJob ->
                 task {
                     try
-                        do!
+                        return!
                             GracefulTeardown.poll
-                                (fun () -> Native.Windows.postCloseToJobWindows ownedJob |> ignore)
+                                (fun () ->
+                                    // A post reaching at least one windowed member is `Sent`; nothing to post
+                                    // to (a windowless tree, or one already empty) is `Unsupported` — this
+                                    // path never sends a CTRL+BREAK (see `Signal(Int/Term)` for that), so
+                                    // there is no `Failed` case here: WM_CLOSE either reaches a window or
+                                    // finds none.
+                                    if Native.Windows.postCloseToJobWindows ownedJob > 0 then
+                                        SoftDelivery.Sent
+                                    else
+                                        SoftDelivery.Unsupported)
                                 (fun () -> Native.Windows.jobTreeAliveWindows ownedJob)
                                 (fun () -> Native.Windows.terminateWindowsJob ownedJob |> ignore)
                                 grace
                     finally
                         Native.Windows.closeWindowsHandle ownedJob
                 }
-                :> Task
+
+        member _.SoftStopScope() =
+            // Side-effect-free: read the SAME live state `Signal(Int/Term)` acts on — the CTRL-capable
+            // leaders this backend already tracks, plus a fresh (non-mutating) windowed-member probe —
+            // without posting anything. A group with either kind of live member can receive a soft stop
+            // (`OptInMembers`); a group with neither has nothing to receive one at all (`Unsupported`).
+            if
+                not (Seq.isEmpty ctrlGroups.Values)
+                || Native.Windows.hasWindowedMemberWindows jobHandle
+            then
+                SoftStopScope.OptInMembers
+            else
+                SoftStopScope.Unsupported
 
         member _.SignalChild(spawned, signal) =
             match signal with
@@ -932,10 +1013,19 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             let signalNum = Native.Posix.signalNumber signal
 
             GracefulTeardown.poll
-                (fun () -> Native.Cgroup.signalCgroup cgroupPath signalNum |> ignore)
+                (fun () ->
+                    match Native.Cgroup.signalCgroup cgroupPath signalNum with
+                    | Native.Common.SignalDelivery.Delivered
+                    | Native.Common.SignalDelivery.TargetGone -> SoftDelivery.Sent
+                    | Native.Common.SignalDelivery.DeliveryFailed _ -> SoftDelivery.Failed)
                 (fun () -> Native.Cgroup.cgroupAlive cgroupPath)
                 (fun () -> Native.Cgroup.killCgroup cgroupPath |> ignore)
                 grace
+
+        member _.SoftStopScope() =
+            // `Signal(Int/Term)` writes to every process in the cgroup unconditionally — always the whole
+            // tree, on every live membership, so this needs no native read at all.
+            SoftStopScope.WholeTree
 
         member _.SignalChild(spawned, signal) =
             let pid = int spawned.Handle
@@ -1436,18 +1526,29 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
             GracefulTeardown.poll
                 // The soft sweep: `signalTracked` sends an OBSERVABLE signal, so a `LeaderPid` verdict
                 // reaches exactly one of the two targets — the group if it exists by now, the pid only on
-                // its `ESRCH` — never both. No child is asked to handle the same stop signal twice.
+                // its `ESRCH` — never both. No child is asked to handle the same stop signal twice. The
+                // fate reported is `Sent` unless the delivery genuinely failed for at least one live
+                // target (an `Ok` sweep, including an already-empty tree, is `Sent`) — mirroring
+                // `ProcessGroupBackend.Signal`'s own `sweep` verdict.
                 (fun () ->
+                    let mutable anyFailed = false
+
                     for pgid in pgids do
                         let target = targetSnap pgid
 
                         if not (TrackedTargets.isGone target) then
-                            Native.Posix.signalTracked target pgid (Native.Posix.signalNumber signal)
-                            |> ignore
+                            match Native.Posix.signalTracked target pgid (Native.Posix.signalNumber signal) with
+                            | Native.Common.SignalDelivery.Delivered
+                            | Native.Common.SignalDelivery.TargetGone -> ()
+                            | Native.Common.SignalDelivery.DeliveryFailed _ -> anyFailed <- true
 
                     for pid, anchor in adoptedPids do
-                        Native.Posix.signalAdopted pid anchor (Native.Posix.signalNumber signal)
-                        |> ignore)
+                        match Native.Posix.signalAdopted pid anchor (Native.Posix.signalNumber signal) with
+                        | Native.Common.SignalDelivery.Delivered
+                        | Native.Common.SignalDelivery.TargetGone -> ()
+                        | Native.Common.SignalDelivery.DeliveryFailed _ -> anyFailed <- true
+
+                    if anyFailed then SoftDelivery.Failed else SoftDelivery.Sent)
                 anyChildAliveSnap
                 // The escalation. `killTracked` is what makes this whole-tree even for a child still in
                 // its pre-`setsid()` window: the `LeaderPid` route SIGKILLs the pid and sweeps `killpg`
@@ -1468,6 +1569,13 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                     for pid, anchor in adoptedPids do
                         Native.Posix.killAdopted pid anchor |> ignore)
                 grace
+
+        member _.SoftStopScope() =
+            // `killpg`/`signalTracked` reaches every tracked group leader and its descendants
+            // unconditionally — always the whole tracked tree, on every live membership (the one
+            // documented escapee, a `setsid`'d child, is the same weakening the kill-on-drop guarantee
+            // already has — not new to the soft stop), so this needs no native read at all.
+            SoftStopScope.WholeTree
 
         member _.SignalChild(spawned, signal) =
             let pgid = int spawned.Handle

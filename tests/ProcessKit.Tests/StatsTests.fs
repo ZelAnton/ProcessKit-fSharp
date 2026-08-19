@@ -29,7 +29,14 @@ type internal MemberStatsSeamBackend(memberStats: unit -> Result<MemberStats lis
         member _.PidOf(spawned) = Some(int spawned.Handle)
         member _.KillChild(_spawned) = ()
         member _.KillTree() = Ok()
-        member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
+
+        member _.GracefulKillTree (_signal) (_grace) =
+            Task.FromResult
+                { Soft = SoftDelivery.Sent
+                  Drained = true
+                  Escalated = false }
+
+        member _.SoftStopScope() = SoftStopScope.WholeTree
         member _.SignalChild(_spawned, _signal) = Ok()
         member _.Members() = Ok []
         member _.Signal(_signal) = Ok()

@@ -2056,6 +2056,28 @@ module internal Windows =
     /// application's window), and the window must still be owned by that same, handle-pinned process
     /// (`postCloseIfStillOwnedBy` — a member window that was destroyed and whose HWND value was recycled
     /// onto a foreign window can never be closed either).
+    /// Side-effect-free: whether `job` currently has at least one top-level window belonging to a live
+    /// member — the same "windowed member" test `postCloseToJobWindows` acts on, without posting anything
+    /// (no `EnumWindows` post-processing beyond membership matching, no `PostMessage`). Used by
+    /// `ProcessGroup.SoftStopScope` so asking never changes the answer a later `Signal`/`GracefulKillTree`
+    /// soft stop would get.
+    let hasWindowedMemberWindows (job: nativeint) : bool =
+        try
+            let memberPids =
+                match membersWindows job with
+                | Ok pids -> Set.ofList pids
+                | Error _ -> Set.empty
+
+            if Set.isEmpty memberPids then
+                false
+            else
+                enumerateTopLevelWindowsHook ()
+                |> List.exists (fun (_, owningPid) -> owningPid <> 0u && Set.contains (int owningPid) memberPids)
+        with _ ->
+            // Best-effort, same contract as `postCloseToJobWindows`: a failed enumeration on a host with no
+            // usable desktop reports "no windowed member" rather than throwing into a capability query.
+            false
+
     let postCloseToJobWindows (job: nativeint) : int =
         try
             let memberPids =

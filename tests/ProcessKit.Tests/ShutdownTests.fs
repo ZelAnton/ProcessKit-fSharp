@@ -43,10 +43,12 @@ type private GracefulFaultBackend() =
         member _.KillChild(_spawned) = ()
         member _.KillTree() = Ok()
 
-        member _.GracefulKillTree (_signal) (_grace) : Task =
+        member _.GracefulKillTree (_signal) (_grace) : Task<GracefulOutcome> =
             // The fault this backend exists to inject: `ShutdownAsync`'s graceful stage must still
             // guarantee `hardRelease()` runs, and must still propagate this exception to the caller.
             raise (InvalidOperationException "synthetic graceful-kill failure")
+
+        member _.SoftStopScope() = SoftStopScope.WholeTree
 
         member _.Members() = Ok []
         member _.SignalChild(_spawned, _signal) = Ok()
@@ -428,6 +430,223 @@ type ShutdownTests() =
                 Is.EqualTo 1,
                 "a later idempotent Shutdown/Dispose call re-ran hardRelease()"
             )
+        }
+        :> Task
+
+    // ---- T-384: ShutdownReportAsync + SoftStopScope -----------------------------------------------
+
+    [<Test>]
+    member _.``ShutdownReportAsync rejects negative grace and accepts zero and positive grace``() : Task =
+        task {
+            use zeroGraceGroup = createGroup ()
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                Action(fun () -> zeroGraceGroup.ShutdownReportAsync(TimeSpan.FromMilliseconds -1.0) |> ignore)
+            )
+            |> ignore
+
+            match! zeroGraceGroup.ShutdownReportAsync(TimeSpan.Zero) with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"ShutdownReportAsync(Zero) failed: {error}"
+
+            use positiveGraceGroup = createGroup ()
+
+            match! positiveGraceGroup.ShutdownReportAsync(TimeSpan.FromMilliseconds 1.0) with
+            | Ok _ -> ()
+            | Error error -> Assert.Fail $"ShutdownReportAsync failed: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ShutdownReportAsync on an already-released group returns an honest error, not a report``() : Task =
+        task {
+            let group = createGroup ()
+            do! group.ShutdownAsync(TimeSpan.FromMilliseconds 1.0)
+
+            match! group.ShutdownReportAsync(TimeSpan.FromMilliseconds 1.0) with
+            | Error(ProcessError.Unsupported _) -> ()
+            | Error error -> Assert.Fail $"expected Unsupported, got {error}"
+            | Ok report ->
+                Assert.Fail $"a group already released by ShutdownAsync fabricated a report: {report.SoftSignal}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ShutdownReportAsync reports a clean drain within the grace window``() : Task =
+        if isWindows then
+            Assert.Ignore "A soft SIGTERM has no Windows equivalent; the group's soft phase there is WM_CLOSE only."
+
+        task {
+            use group = createGroup ()
+
+            // Trap SIGTERM and exit cleanly, announcing "ready" only AFTER the trap is installed — the
+            // same readiness gate `StopAsync lets a signal-handling child exit cleanly...` uses, so the
+            // soft signal deterministically hits an installed trap rather than racing it.
+            let trapping =
+                shell "trap 'exit 0' TERM; echo ready; while :; do sleep 0.2 & wait $!; done"
+
+            match! group.StartAsync trapping with
+            | Error error -> Assert.Fail $"StartAsync failed: {error}"
+            | Ok running ->
+                match! running.WaitForLineAsync((fun line -> line = "ready"), TimeSpan.FromSeconds 10.0) with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail $"child never signalled readiness: {error}"
+
+                match! group.ShutdownReportAsync(TimeSpan.FromSeconds 5.0) with
+                | Error error -> Assert.Fail $"ShutdownReportAsync failed: {error}"
+                | Ok report ->
+                    Assert.That(
+                        report.SoftSignal,
+                        Is.EqualTo(SoftSignalDelivery.Sent Signal.Term),
+                        "the configured StopSignal (Term) must be the one reported as attempted"
+                    )
+
+                    Assert.That(report.AttemptedSignal, Is.EqualTo(Some Signal.Term))
+                    Assert.That(report.MembersBefore, Is.EqualTo(Some 1), "one child was live before the soft signal")
+                    Assert.That(report.DrainedWithinGrace, Is.True, "the trapping child drained on its own")
+                    Assert.That(report.Escalated, Is.False, "a clean drain must never need the hard kill")
+                    Assert.That(report.MembersAfter, Is.EqualTo(Some 0), "the drained tree has no members left")
+
+                    Assert.That(
+                        report.Elapsed,
+                        Is.LessThan(TimeSpan.FromSeconds 5.0),
+                        "an early drain must not spend the whole grace window"
+                    )
+        }
+        :> Task
+
+    [<Test>]
+    member _.``ShutdownReportAsync reports escalation when the child ignores the soft signal``() : Task =
+        if isWindows then
+            Assert.Ignore "Ignoring SIGTERM to force the SIGKILL escalation is a POSIX scenario."
+
+        task {
+            use group = createGroup ()
+            let stubborn = shell "trap '' TERM; while :; do sleep 0.2 & wait $!; done"
+
+            match! group.StartAsync stubborn with
+            | Error error -> Assert.Fail $"StartAsync failed: {error}"
+            | Ok _ ->
+                match! group.ShutdownReportAsync(TimeSpan.FromMilliseconds 300.0) with
+                | Error error -> Assert.Fail $"ShutdownReportAsync failed: {error}"
+                | Ok report ->
+                    Assert.That(report.DrainedWithinGrace, Is.False, "the tree ignored SIGTERM and never drained")
+                    Assert.That(report.Escalated, Is.True, "a survivor past the grace must be hard-killed")
+                    Assert.That(report.MembersAfter, Is.EqualTo(Some 0), "the hard kill must have cleared the tree")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: ShutdownReportAsync reports Sent and a clean drain for a windowed child``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "The best-effort WM_CLOSE soft close is a Windows-only concern."
+
+            use group = createGroup ()
+
+            match! group.StartAsync windowedChild with
+            | Error error -> Assert.Fail $"StartAsync failed: {error}"
+            | Ok running ->
+                let! ready = awaitWindowReady running
+
+                if not ready then
+                    Assert.Ignore "the test host could not bring up a WinForms window (no interactive desktop)."
+                else
+                    match! group.ShutdownReportAsync(TimeSpan.FromSeconds 5.0) with
+                    | Error error -> Assert.Fail $"ShutdownReportAsync failed: {error}"
+                    | Ok report ->
+                        Assert.That(
+                            report.SoftSignal,
+                            Is.EqualTo(SoftSignalDelivery.Sent Signal.Term),
+                            "the WM_CLOSE post must be reported as Sent"
+                        )
+
+                        Assert.That(report.DrainedWithinGrace, Is.True, "the form closed itself on WM_CLOSE")
+                        Assert.That(report.Escalated, Is.False)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``Windows: ShutdownReportAsync reports Unsupported and escalation for a windowless child``() : Task =
+        task {
+            if not isWindows then
+                Assert.Ignore "This pins the Windows windowless-child regression specifically."
+
+            use group = createGroup ()
+
+            match! group.StartAsync longSleeper with
+            | Error error -> Assert.Fail $"StartAsync failed: {error}"
+            | Ok _ ->
+                match! group.ShutdownReportAsync(TimeSpan.FromMilliseconds 300.0) with
+                | Error error -> Assert.Fail $"ShutdownReportAsync failed: {error}"
+                | Ok report ->
+                    Assert.That(
+                        report.SoftSignal,
+                        Is.EqualTo SoftSignalDelivery.Unsupported,
+                        "a windowless console child has no WM_CLOSE target"
+                    )
+
+                    Assert.That(report.AttemptedSignal, Is.EqualTo None)
+                    Assert.That(report.Escalated, Is.True, "the windowless child is still hard-killed after the grace")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``SoftStopScope reports the honest reach on each mechanism``() : Task =
+        task {
+            use group = createGroup ()
+
+            if isWindows then
+                // An empty, freshly-created group has neither a CTRL-capable leader nor a windowed
+                // member: nothing here can receive a soft stop at all.
+                match group.SoftStopScope() with
+                | Ok SoftStopScope.Unsupported -> ()
+                | Ok other -> Assert.Fail $"expected Unsupported for an empty Windows group, got {other}"
+                | Error error -> Assert.Fail $"SoftStopScope failed: {error}"
+
+                match! group.StartAsync windowedChild with
+                | Error error -> Assert.Fail $"StartAsync failed: {error}"
+                | Ok running ->
+                    let! ready = awaitWindowReady running
+
+                    if not ready then
+                        Assert.Ignore "the test host could not bring up a WinForms window (no interactive desktop)."
+                    else
+                        match group.SoftStopScope() with
+                        | Ok SoftStopScope.OptInMembers -> ()
+                        | Ok other -> Assert.Fail $"expected OptInMembers with a live windowed member, got {other}"
+                        | Error error -> Assert.Fail $"SoftStopScope failed: {error}"
+
+                        do! group.ShutdownAsync(TimeSpan.FromSeconds 5.0)
+            else
+                // The POSIX process-group and Linux cgroup v2 mechanisms always reach the whole tracked
+                // tree — a fixed answer, unconditioned on whether anything has been spawned yet.
+                match group.SoftStopScope() with
+                | Ok SoftStopScope.WholeTree -> ()
+                | Ok other -> Assert.Fail $"expected WholeTree, got {other}"
+                | Error error -> Assert.Fail $"SoftStopScope failed: {error}"
+
+                match! (group :> IProcessRunner).OutputStringAsync(shell "true", CancellationToken.None) with
+                | Error error -> Assert.Fail $"spawn failed: {error}"
+                | Ok _ -> ()
+
+                match group.SoftStopScope() with
+                | Ok SoftStopScope.WholeTree -> ()
+                | Ok other -> Assert.Fail $"expected WholeTree after a spawn, got {other}"
+                | Error error -> Assert.Fail $"SoftStopScope failed: {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``SoftStopScope on an already-released group returns an honest error``() : Task =
+        task {
+            let group = createGroup ()
+            do! group.ShutdownAsync(TimeSpan.FromMilliseconds 1.0)
+
+            match group.SoftStopScope() with
+            | Error(ProcessError.Unsupported _) -> ()
+            | Error error -> Assert.Fail $"expected Unsupported, got {error}"
+            | Ok scope -> Assert.Fail $"a released group answered a live SoftStopScope query: {scope}"
         }
         :> Task
 

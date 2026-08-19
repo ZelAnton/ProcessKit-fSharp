@@ -1005,7 +1005,10 @@ class ProcessKit.ProcessGroup
   member SampleStatsAsync(System.TimeSpan) : System.Collections.Generic.IAsyncEnumerable<ProcessKit.ProcessGroupStats>
   member ShutdownAsync() : System.Threading.Tasks.Task
   member ShutdownAsync(System.TimeSpan) : System.Threading.Tasks.Task
+  member ShutdownReportAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ShutdownReport, ProcessKit.ProcessError>>
+  member ShutdownReportAsync(System.TimeSpan) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ShutdownReport, ProcessKit.ProcessError>>
   member Signal(ProcessKit.Signal) : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
+  member SoftStopScope() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.SoftStopScope, ProcessKit.ProcessError>
   member StartAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.RunningProcess, ProcessKit.ProcessError>>
   member Stats() : Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessGroupStats, ProcessKit.ProcessError>
   member Suspend() : Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>
@@ -1392,6 +1395,15 @@ class ProcessKit.RunningProcess
   static member WaitAllAsync(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<ProcessKit.Outcome[]>
   static member WaitAnyAsync(ProcessKit.RunningProcess[]) : System.Threading.Tasks.Task<ProcessKit.WaitAnyResult>
 
+class ProcessKit.ShutdownReport
+  property AttemptedSignal : Microsoft.FSharp.Core.FSharpOption<ProcessKit.Signal> { get }
+  property DrainedWithinGrace : System.Boolean { get }
+  property Elapsed : System.TimeSpan { get }
+  property Escalated : System.Boolean { get }
+  property MembersAfter : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property MembersBefore : Microsoft.FSharp.Core.FSharpOption<System.Int32> { get }
+  property SoftSignal : ProcessKit.SoftSignalDelivery { get }
+
 class ProcessKit.Signal
   :> System.Collections.IStructuralEquatable
   :> System.IEquatable<ProcessKit.Signal>
@@ -1456,6 +1468,77 @@ class ProcessKit.SignalCapabilities
   property Arbitrary : ProcessKit.Capability { get }
   property Kill : ProcessKit.Capability { get }
   property SoftStop : ProcessKit.Capability { get }
+
+class ProcessKit.SoftSignalDelivery
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.SoftSignalDelivery>
+  member Equals(ProcessKit.SoftSignalDelivery) : System.Boolean
+  member Equals(ProcessKit.SoftSignalDelivery, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsFailed() : System.Boolean
+  member get_IsSent() : System.Boolean
+  member get_IsUnsupported() : System.Boolean
+  member get_Tag() : System.Int32
+  property AttemptedSignal : Microsoft.FSharp.Core.FSharpOption<ProcessKit.Signal> { get }
+  property IsFailed : System.Boolean { get }
+  property IsSent : System.Boolean { get }
+  property IsUnsupported : System.Boolean { get }
+  property Tag : System.Int32 { get }
+  property Unsupported : ProcessKit.SoftSignalDelivery { get }
+  static member NewFailed(ProcessKit.Signal) : ProcessKit.SoftSignalDelivery
+  static member NewSent(ProcessKit.Signal) : ProcessKit.SoftSignalDelivery
+  static member get_Unsupported() : ProcessKit.SoftSignalDelivery
+
+class ProcessKit.SoftSignalDelivery+Failed : ProcessKit.SoftSignalDelivery
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.SoftSignalDelivery>
+  member get_Signal() : ProcessKit.Signal
+  property Signal : ProcessKit.Signal { get }
+
+class ProcessKit.SoftSignalDelivery+Sent : ProcessKit.SoftSignalDelivery
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.SoftSignalDelivery>
+  member get_Signal() : ProcessKit.Signal
+  property Signal : ProcessKit.Signal { get }
+
+module ProcessKit.SoftSignalDelivery+Tags
+  field literal Failed : System.Int32
+  field literal Sent : System.Int32
+  field literal Unsupported : System.Int32
+
+class ProcessKit.SoftStopScope
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.SoftStopScope>
+  member Equals(ProcessKit.SoftStopScope) : System.Boolean
+  member Equals(ProcessKit.SoftStopScope, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsOptInMembers() : System.Boolean
+  member get_IsUnsupported() : System.Boolean
+  member get_IsWholeTree() : System.Boolean
+  member get_Tag() : System.Int32
+  property IsOptInMembers : System.Boolean { get }
+  property IsUnsupported : System.Boolean { get }
+  property IsWholeTree : System.Boolean { get }
+  property OptInMembers : ProcessKit.SoftStopScope { get }
+  property Tag : System.Int32 { get }
+  property Unsupported : ProcessKit.SoftStopScope { get }
+  property WholeTree : ProcessKit.SoftStopScope { get }
+  static member get_OptInMembers() : ProcessKit.SoftStopScope
+  static member get_Unsupported() : ProcessKit.SoftStopScope
+  static member get_WholeTree() : ProcessKit.SoftStopScope
+
+module ProcessKit.SoftStopScope+Tags
+  field literal OptInMembers : System.Int32
+  field literal Unsupported : System.Int32
+  field literal WholeTree : System.Int32
 
 class ProcessKit.Stdin
   property Empty : ProcessKit.Stdin { get }

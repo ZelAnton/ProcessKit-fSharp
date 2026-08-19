@@ -442,6 +442,7 @@ There are three ways out, from blunt to graceful:
 | dispose (`use` / `Dispose()` / `DisposeAsync()`) | Immediate **hard kill** of the whole tree, then releases the container | The safety net — always on, even on an exception or early return |
 | `group.KillAll()` | The same hard kill, but the group **stays usable** for further spawns; idempotent | Explicit teardown mid-flight when you want to keep the group |
 | `group.ShutdownAsync()` / `group.ShutdownAsync(grace)` | **Graceful**: on Unix the configured `Options.StopSignal` → wait the grace window → `SIGKILL` survivors; on Windows the default uses best-effort `WM_CLOSE` → wait → atomic Job kill. Releases the group | A clean service stop |
+| `group.ShutdownReportAsync()` / `group.ShutdownReportAsync(grace)` | The exact same teardown as `ShutdownAsync`, additionally returning a `ShutdownReport` of what it actually observed | A clean service stop where the caller wants to know what actually happened, not just that it finished |
 
 `ProcessGroup` implements both `IDisposable` and `IAsyncDisposable`, so a `use`
 binding reaps the tree deterministically on scope exit — disposing is a pure hard
@@ -489,6 +490,91 @@ group you also `ShutdownAsync` explicitly is safe. Note that a *suspended* tree 
 still be hard-killed (dispose / `KillAll`), but a graceful `ShutdownAsync` opens
 with a `SIGTERM` a frozen tree cannot act on — `Resume` first for a clean stop
 (see below).
+
+### `ShutdownReportAsync`: what the graceful teardown actually observed
+
+`ShutdownAsync` only ever reports success (or a thrown exception): it does not say
+whether the soft signal actually landed, how many members were alive, or whether
+the tree drained on its own or had to be hard-killed. `ShutdownReportAsync` drives
+the identical teardown — same soft signal, same grace, same unconditional hard kill
+of any survivor, same release — and additionally returns a `ShutdownReport`:
+
+**F#**
+
+```fsharp
+task {
+    use group = group
+    let! _service = group.StartAsync(Command.create "my-service")
+
+    match! group.ShutdownReportAsync(TimeSpan.FromSeconds 5.0) with
+    | Ok report ->
+        printfn $"soft signal: {report.SoftSignal}"
+        printfn $"members before/after: {report.MembersBefore}/{report.MembersAfter}"
+        printfn $"drained within grace: {report.DrainedWithinGrace}, escalated: {report.Escalated}"
+        printfn $"elapsed: {report.Elapsed}"
+    | Error err -> eprintfn $"{err.Message}"
+}
+```
+
+**C#**
+
+```csharp
+using var group = created.GetValueOrThrow();
+await group.StartAsync(new Command("my-service"));
+
+var reported = await group.ShutdownReportAsync(TimeSpan.FromSeconds(5));
+if (reported is { IsOk: true, ResultValue: var report })
+{
+    Console.WriteLine($"soft signal: {report.SoftSignal}");
+    Console.WriteLine($"members before/after: {report.MembersBefore}/{report.MembersAfter}");
+    Console.WriteLine($"drained within grace: {report.DrainedWithinGrace}, escalated: {report.Escalated}");
+    Console.WriteLine($"elapsed: {report.Elapsed}");
+}
+```
+
+`ShutdownReport.SoftSignal` is a `SoftSignalDelivery`: `Sent(signal)` when the soft
+signal was delivered best-effort (a member that ignores it and keeps running still
+counts as *sent to* — whether the tree then drained is `DrainedWithinGrace`, not
+this), `Unsupported` when the platform had no soft-signal tier at all for this group
+(a windowless Windows Job Object with no windowed member — every Unix mechanism
+always has a real `SIGTERM` tier), or `Failed(signal)` when a soft-signal tier
+existed but delivery genuinely failed for every target (a uid-changed member that
+rejected it with `EPERM`) — the teardown still proceeds to its grace/escalation
+regardless. `MembersBefore`/`MembersAfter` count the same member set `Members()`
+reports and are `None` only if that membership read itself failed, never a
+fabricated `0`. `Escalated` is `true` only when the grace elapsed with survivors
+still alive and they were hard-killed; `Elapsed` reports the real wall-clock time,
+so an early drain reads far below the requested grace.
+
+This port deliberately does **not** offer ProcessKit-rs's non-escalating
+`stop(grace, escalate = false)` — a mode that leaves survivors running and keeps the
+group usable. `ShutdownAsync`/`ShutdownReportAsync` both always release the
+container at the end, and on Windows closing the Job handle unconditionally kills
+whatever it still holds (`KILL_ON_JOB_CLOSE`); there is no way to report a spared
+survivor honestly on a call that is about to kill it anyway. The kill-on-drop tree
+guarantee stays unconditional either way — see the four teardown needs (dispose,
+`KillAll`, `ShutdownAsync`/`ShutdownReportAsync`) at the top of this section.
+
+### `SoftStopScope`: how far a soft stop reaches, before you try it
+
+`group.SoftStopScope()` answers "if I call `Signal(Signal.Term)` (or
+`ShutdownAsync`/`ShutdownReportAsync`) right now, which of this group's *current*
+members would actually receive that soft signal?" — a side-effect-free capability
+query read from the group's live membership, so asking never changes what a later
+soft stop does:
+
+| Mechanism | `SoftStopScope` |
+|---|---|
+| Linux cgroup v2 | `WholeTree` — the signal reaches every process in the cgroup |
+| POSIX process group (macOS / BSD / Linux without cgroup v2) | `WholeTree` — `killpg` reaches every tracked leader and its descendants (a `setsid`'d child escapes, the same documented weakness kill-on-drop already has) |
+| Windows Job Object | `OptInMembers` when the group has a live console-CTRL leader (`Command.WindowsCtrlSignals()`) or a live windowed member, else `Unsupported` |
+
+Unlike `ContainmentCapabilities` (a fixed, pre-creation snapshot for a set of
+`ProcessGroupOptions`), this is read from the group's *live membership* on every
+call — the same reason `ProcessGroup.Mechanism` is per-group rather than a platform
+constant. It only ever describes the soft tier: the unconditional hard kill
+(`Signal.Kill`, `KillAll`, disposing the group) always reaches the whole tree
+regardless of what this reports.
 
 ## Signals and suspend/resume
 

@@ -49,7 +49,9 @@
 		<Compile Include="RunTelemetryScope.fs" />
 		<Compile Include="Mechanism.fs" />
 		<Compile Include="KillOnParentDeathScope.fs" />
+		<Compile Include="SoftStopScope.fs" />
 		<Compile Include="Signal.fs" />
+		<Compile Include="ShutdownReport.fs" />
 		<Compile Include="CgroupCpuMax.fs" />
 		<Compile Include="Limits.fs" />
 		<Compile Include="ProcessResult.fs" />
