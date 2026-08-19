@@ -149,7 +149,8 @@ type internal IContainmentBackend =
     abstract PidOf: Native.Common.Spawned -> int option
     abstract KillChild: Native.Common.Spawned -> unit
     abstract KillTree: unit -> unit
-    abstract GracefulKillTree: Signal -> TimeSpan -> Task
+    abstract GracefulKillTree: Signal -> TimeSpan -> Task<GracefulOutcome>
+    abstract SoftStopScope: unit -> SoftStopScope
     abstract SignalChild: Native.Common.Spawned * Signal -> Result<unit, ProcessError>
     abstract Members: unit -> Result<int list, ProcessError>
     abstract Signal: Signal -> Result<unit, ProcessError>
@@ -162,7 +163,7 @@ type internal IContainmentBackend =
     abstract HardRelease: unit -> unit
 ```
 
-The current interface has 21 abstract members:
+The current interface has 22 abstract members:
 
 - `Mechanism` identifies the primitive honestly.
 - `Spawn` starts a child, initially not in the backend's tracking collection.
@@ -174,7 +175,8 @@ The current interface has 21 abstract members:
 - `PidOf` retrieves a known PID.
 - `KillChild` kills one child's containment subtree where applicable.
 - `KillTree` immediately kills the whole container without releasing it.
-- `GracefulKillTree` requests termination, waits for the grace period, then escalates where supported.
+- `GracefulKillTree` requests termination, waits for the grace period, then escalates where supported, returning a `GracefulOutcome` (the soft-signal fate, whether the tree drained within grace, whether it escalated) that `ProcessGroup.ShutdownReportAsync` turns into the public `ShutdownReport`; every other caller (`ShutdownAsync`, the per-run graceful-timeout path) discards it exactly as it discarded the bare `Task` before T-384.
+- `SoftStopScope` (T-384) reports how far a soft stop reaches on the backend's CURRENT live membership, read from the same state `Signal`/`GracefulKillTree` consult and side-effect-free by contract — `SoftStopScope.WholeTree` unconditionally on the process-group and cgroup v2 backends, `OptInMembers`/`Unsupported` on the Job Object backend depending on whether a live CTRL-capable leader (`ctrlGroups`) or windowed member (`Native.Windows.hasWindowedMemberWindows`, a non-mutating sibling of `postCloseToJobWindows`) is present.
 - `Members` snapshots membership.
 - `Signal` broadcasts a signal.
 - `Suspend` and `Resume` control the tree.
@@ -195,7 +197,7 @@ The current interface has 21 abstract members:
 
 `TrackedChildren<'T>` serializes `Add`, `Remove`, `Snapshot`, and `Drain` behind one lock. `Drain` is essential during teardown: it atomically transfers ownership of every recorded child to the teardown path. A mere snapshot would allow a racing cleanup to act twice on a recycled PID or handle.
 
-`GracefulTeardown.poll` supplies the graceful-stop shape shared by all three backends: post the soft stop, poll with each delay bounded by the lesser of 50 ms and the remaining grace budget until empty or the grace period expires, then force-kill survivors. POSIX/cgroup delivery uses the command or group's configured `StopSignal` (default `Signal.Term`); Windows posts `WM_CLOSE` to members' top-level windows for its default soft phase. The poll-then-unconditional-hard-kill escalation is otherwise identical. `PosixReap.leader` pairs `killpg` with `waitpid`; killing a process group does not reap the direct child that ProcessKit owns.
+`GracefulTeardown.poll` supplies the graceful-stop shape shared by all three backends: post the soft stop (reporting its `SoftDelivery` fate — `Sent`/`Unsupported`/`Failed`), poll with each delay bounded by the lesser of 50 ms and the remaining grace budget until empty or the grace period expires, then force-kill survivors, returning a `GracefulOutcome` (soft-signal fate, drained-within-grace, escalated) rather than a bare `Task` (T-384). POSIX/cgroup delivery uses the command or group's configured `StopSignal` (default `Signal.Term`); Windows posts `WM_CLOSE` to members' top-level windows for its default soft phase. The poll-then-unconditional-hard-kill escalation is otherwise identical. `PosixReap.leader` pairs `killpg` with `waitpid`; killing a process group does not reap the direct child that ProcessKit owns.
 
 The implementation is split across four files. `Native.Windows.fs`, `Native.Posix.fs`, and `Native.Cgroup.fs` provide the OS-specific operations; `Backend.fs` composes them into `JobObjectBackend`, `ProcessGroupBackend`, and `CgroupBackend`, respectively, behind `IContainmentBackend`.
 
@@ -217,7 +219,7 @@ Both Windows spawn paths (the contained `spawnWindowsCore` and the detached `spa
 
 `Signal.Kill` terminates the Job atomically. `Signal.Int` and `Signal.Term` are not Unix signals: they map to a best-effort soft stop built from two complementary, individually pid-targeted deliveries. For children explicitly started with `Command.WindowsCtrlSignals()`, ProcessKit sends `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` — the child has `CREATE_NEW_PROCESS_GROUP`, so its PID is its console group ID and only CTRL+BREAK (not CTRL+C) can be group-targeted; this reaches *console* children. ConPTY children receive that creation flag unconditionally to isolate the pseudoconsole child from stray shared-console CTRL+C broadcasts, but only an explicit `WindowsCtrlSignals()` registers the leader in `ctrlGroups` for this directed API. In addition, a `WM_CLOSE` is posted to the top-level windows of every member that has one (located by pid via `GetWindowThreadProcessId`, so no window outside the group is hit); this reaches *windowed* children (Electron/GUI tools) that have no console to signal. Delivery is a best-effort `Ok` when either mechanism reaches at least one member — delivery, not the child's compliance (a child may install a handler or a window may veto the close). It returns `Unsupported` only when the group has *neither* a CTRL-capable child *nor* any windowed member, and never silently becomes a hard kill. Other signals are unsupported.
 
-Tracked process handles pin PID identity until release, preventing a stored console-group ID (or the pid used to locate a member's windows) from becoming a wrong target. Windows has no Job-wide soft signal, but `GracefulKillTree` still runs a best-effort soft phase around the same poll shape the Unix backends use: it posts a `WM_CLOSE` to every member's top-level windows, polls up to the grace period for the tree to drain, then *unconditionally* terminates the Job whatever survives. The hard kill is never removed or weakened — a child with no window, or one that vetoes the close, is force-killed exactly as before — and `grace = 0` skips the wait and hard-kills at once.
+Tracked process handles pin PID identity until release, preventing a stored console-group ID (or the pid used to locate a member's windows) from becoming a wrong target. Windows has no Job-wide soft signal, but `GracefulKillTree` still runs a best-effort soft phase around the same poll shape the Unix backends use: it posts a `WM_CLOSE` to every member's top-level windows, polls up to the grace period for the tree to drain, then *unconditionally* terminates the Job whatever survives. The hard kill is never removed or weakened — a child with no window, or one that vetoes the close, is force-killed exactly as before — and `grace = 0` skips the wait and hard-kills at once. `SoftStopScope` (T-384) answers up front, side-effect-free, whether a soft-stop target currently exists: `OptInMembers` when `ctrlGroups` holds a live CTRL-capable leader or `Native.Windows.hasWindowedMemberWindows` finds a live windowed member, else `Unsupported` — read from exactly the liveness state `GracefulKillTree`'s `WM_CLOSE` post and `Signal(Int/Term)`'s combined CTRL+BREAK/`WM_CLOSE` delivery both act on. It is a capability report, not a delivery guarantee: a live CTRL-capable leader can still see `GenerateConsoleCtrlEvent` fail for reasons this read does not probe (such as the caller having no console to share), in which case `Signal(Int/Term)` returns `ProcessError.Unsupported` even though `SoftStopScope` reported `OptInMembers`.
 
 ### POSIX process groups
 

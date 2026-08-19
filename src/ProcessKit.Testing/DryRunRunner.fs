@@ -55,8 +55,15 @@ type DryRunRunner() =
 
     /// Render `command` deterministically: the program, ordinarily quoted arguments, Windows raw fragments
     /// verbatim, then `(argv0: <value>)` when `Command.Arg0` overrode the child's `argv[0]`, then
-    /// `(cwd: <directory>)` when the command set a working directory. Two commands built the same way
+    /// `(rlimits: <resource>=<soft>:<hard>, ...)` when `Command.Rlimit` capped any per-process resource,
+    /// then `(cwd: <directory>)` when the command set a working directory. Two commands built the same way
     /// always render identically.
+    ///
+    /// The rlimits are part of the render on purpose: a dry run is what a consumer inspects INSTEAD of
+    /// launching anything, so a cap that would have been applied to the real child has to be visible here
+    /// too — a preview that silently omitted it would report a weaker command than the one that would
+    /// actually run. Each entry is `Rlimit.ToString()`, so the render carries the same stable resource
+    /// names the builder accepts, in the order they were configured, and no argv or environment value.
     static member Render(command: Command) : string =
         ArgumentNullException.ThrowIfNull command
 
@@ -70,6 +77,14 @@ type DryRunRunner() =
             match command.Config.Arg0 with
             | Some arg0 -> $"{line} (argv0: {quoteIfNeeded arg0})"
             | None -> line
+
+        let line =
+            if command.Config.Rlimits.IsEmpty then
+                line
+            else
+                let rendered = command.Config.Rlimits |> Seq.map string |> String.concat ", "
+
+                $"{line} (rlimits: {rendered})"
 
         match command.WorkingDirectory with
         | Some dir -> $"{line} (cwd: {dir})"

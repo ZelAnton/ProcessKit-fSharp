@@ -3251,6 +3251,15 @@ module internal Posix =
     [<Literal>]
     let private cttyHelper = "setsid"
 
+    /// The util-linux per-process resource-limit helper (`Command.Rlimit`, invoked as
+    /// `prlimit --<resource>=<soft>:<hard> -- <program> <args>`), resolved only from a trusted directory.
+    /// It belongs on this list for the same reason as the other two rather than a weaker one: on the
+    /// ordinary path (no privilege drop requested) it runs with the caller's own credentials and then
+    /// `exec`s the caller's program, so a same-named binary picked up from `PATH` would both hold those
+    /// credentials and get to substitute the target outright.
+    [<Literal>]
+    let private rlimitHelper = "prlimit"
+
     /// The only directories either POSIX security helper may be loaded from, searched in this order (see
     /// the section comment). Deliberately a fixed list rather than `PATH`.
     let private trustedHelperDirectories = [ "/usr/bin"; "/bin"; "/usr/sbin"; "/sbin" ]
@@ -4524,7 +4533,12 @@ module internal Posix =
     /// while the real program (reached only through `exec`) observes its unmodified `resolvedProgram` name
     /// instead — exactly the silent-misapplication failure `arg0HelperConflict` refuses for `setpriv`/
     /// `setsid --ctty`, and the same refusal `spawnPosixIntoCgroup` gives its own `/bin/sh` launcher.
-    let withCpuTimeLimit (duration: TimeSpan) (command: Command) : Result<Command, ProcessError> =
+    ///
+    /// This is the CPU-time-only path, kept exactly as it was because it is the one whole-tree cap POSIX
+    /// can honour WITHOUT util-linux: it needs `/bin/sh` and nothing else, so `CpuTimeMax` keeps working
+    /// on macOS/BSD and on a minimal image. A command that ALSO carries `Command.Rlimit` values takes the
+    /// `prlimit` path below instead, which applies both in one step — see `withProcessLimits`.
+    let private withCpuTimeLimitShim (duration: TimeSpan) (command: Command) : Result<Command, ProcessError> =
         let command = applyPreferLocal command
 
         if command.Config.Arg0.IsSome then
@@ -4564,6 +4578,152 @@ module internal Posix =
                             Arg0 = None }
                     )
                 )
+
+    // ----------------------------------------------------------------------------------
+    // Per-process rlimits (`Command.Rlimit`) — applied before the child's program starts
+    // ----------------------------------------------------------------------------------
+    //
+    // `setrlimit(2)` has to be called by the process that is about to become the child, between the fork
+    // and the exec — the same constraint that makes the uid/gid drop a helper (`setpriv`) here rather
+    // than managed code in a forked child: no .NET code may run post-fork on CoreCLR, and `posix_spawn`
+    // exposes no rlimit attribute of its own. So the limits ride the SAME pattern the rest of this file
+    // already uses: a tiny trusted helper sets them on ITSELF and then `exec`s the real program in place
+    // (same pid — containment, `Priority`, cgroup membership, and any controlling pty are all unaffected).
+    //
+    // The helper is util-linux's `prlimit`, NOT a `/bin/sh` `ulimit` shim like the `CpuTimeMax` one above.
+    // That is a deliberate, load-bearing choice: `ulimit`'s numeric argument is in shell-defined BLOCKS
+    // for the size resources (512 bytes in dash/BusyBox `ash` and in bash's POSIX mode, 1024 in bash's
+    // default mode), so a byte value handed to it would be applied at half or double what the caller asked
+    // for depending on which shell happens to be `/bin/sh` on that host — a silent, unobservable, and
+    // undetectable-at-runtime divergence in a value whose whole point is to be exact. `prlimit` takes
+    // BYTES for every size resource and seconds/counts for the others, so the number the caller passes is
+    // the number the kernel gets, on every host that has the helper. Hosts that do not have it are refused
+    // honestly (`ProcessError.ResourceLimit`) rather than served a shell approximation.
+
+    /// The `prlimit` long option that carries each resource. Kept next to the helper rather than on
+    /// `RlimitResource` itself: the stable `Name` identifiers are the library's own compatibility surface,
+    /// this is one tool's CLI spelling, and the two must be free to differ (`file_size` / `--fsize`).
+    let private rlimitOption (resource: RlimitResource) : string =
+        match resource with
+        | RlimitResource.Cpu -> "--cpu"
+        | RlimitResource.Core -> "--core"
+        | RlimitResource.Data -> "--data"
+        | RlimitResource.FileSize -> "--fsize"
+        | RlimitResource.NoFile -> "--nofile"
+        | RlimitResource.Stack -> "--stack"
+
+    /// The typed refusal for a POSIX host that holds `prlimit` in no trusted directory — macOS/BSD (no
+    /// util-linux at all) or a minimal image. `ResourceLimit` rather than `Unsupported` on purpose, per the
+    /// split `ResourceLimits` already draws: the OS itself HAS this cap (`setrlimit(2)` is POSIX), it is the
+    /// applying that cannot be done here — whereas Windows, which has no such concept at all, gets
+    /// `Unsupported` from `Native.Windows.spawnWindows`. Either way the child never runs uncapped.
+    let private rlimitHelperMissing () : ProcessError =
+        ProcessError.ResourceLimit
+            $"Command.Rlimit needs the util-linux '{rlimitHelper}' helper to apply per-process resource limits before the child's program starts; no trusted directory ({trustedHelperDirectoriesText ()}) holds it (macOS/BSD have no util-linux, and a PATH copy is deliberately not used)"
+
+    /// The `(soft, hard)` seconds a whole-tree `ResourceLimits.CpuTimeMax` means as an `RLIMIT_CPU` pair —
+    /// the same rounding the `/bin/sh` shim applies, in one place, so the two paths cannot drift: the soft
+    /// value is the duration rounded up to whole seconds (at least one), and the hard value gets one extra
+    /// second so the child can observe `SIGXCPU` before the unblockable kill.
+    let private cpuTimeMaxPair (duration: TimeSpan) : int64 * int64 =
+        let soft = max 1L (int64 (Math.Ceiling duration.TotalSeconds))
+        soft, soft + 1L
+
+    /// Merge a group's `ResourceLimits.CpuTimeMax` into a command's own per-process rlimits, resolving the
+    /// one axis they share. Both cap CPU time, and applying them in sequence would let whichever ran LAST
+    /// overwrite the other — so they are folded here, before anything is applied, into a single pair that
+    /// takes the STRICTER (smaller) of the two soft values and the stricter of the two hard values. Adding
+    /// either cap can then only tighten the effective limit, never relax it, whichever order the caller
+    /// configured them in. Every other resource passes through untouched, keeping the caller's order.
+    let private foldCpuTimeMax (cpuTimeMax: TimeSpan option) (limits: Rlimit seq) : Rlimit list =
+        match cpuTimeMax with
+        | None -> List.ofSeq limits
+        | Some duration ->
+            let groupSoft, groupHard = cpuTimeMaxPair duration
+            let configured = List.ofSeq limits
+
+            if configured |> List.exists (fun limit -> limit.Resource = RlimitResource.Cpu) then
+                configured
+                |> List.map (fun limit ->
+                    if limit.Resource = RlimitResource.Cpu then
+                        Rlimit(RlimitResource.Cpu, min limit.Soft groupSoft, min limit.Hard groupHard)
+                    else
+                        limit)
+            else
+                configured @ [ Rlimit(RlimitResource.Cpu, groupSoft, groupHard) ]
+
+    /// Apply everything that has to reach the child as a `setrlimit(2)` pair before its program starts:
+    /// the command's own `Command.Rlimit` values and, when the spawning group carries one, its whole-tree
+    /// `ResourceLimits.CpuTimeMax` (see `foldCpuTimeMax` for how the shared CPU axis is resolved).
+    ///
+    /// Three outcomes, and nothing in between: no limits at all leaves `command` untouched; CPU time alone
+    /// takes the `/bin/sh` shim that has always applied it (so `CpuTimeMax` keeps working on a host without
+    /// util-linux); anything else is rewritten to launch through the trusted `prlimit` helper, which sets
+    /// the whole set on itself and `exec`s the resolved target in place. The target is resolved FIRST
+    /// (`resolveCommandProgram`), exactly as the CPU shim does, so `PreferLocal`, the command's effective
+    /// child `PATH`, and the typed `NotFound` contract all survive the rewrite and the helper `exec`s an
+    /// absolute path that no `PATH` entry can interpose on. `--` separates the limits from the target, so a
+    /// program whose name begins with `-` can never be read as an option.
+    ///
+    /// `Command.Arg0` is refused (typed `Unsupported`) for the same reason every other re-`exec`ing helper
+    /// here refuses it: `prlimit`'s own `exec` has no seam for a distinct `argv[0]`, so honouring the
+    /// override would silently apply it to the HELPER instead of the program the caller named. The
+    /// rewritten config clears both `Arg0` and `Rlimits`, so a second pass over the same command (each
+    /// POSIX spawn entry point calls this defensively, whether or not a backend already did) is a no-op
+    /// rather than a second helper layer.
+    ///
+    /// Applied AFTER a requested `Uid`/`Gid` drop, because the drop rewrite wraps whatever this produces —
+    /// the same order the `CpuTimeMax` shim has always been applied in. Lowering a limit is unprivileged,
+    /// so that order is invisible for what this knob is for; RAISING a hard limit above the inherited one
+    /// needs privilege the drop has just given up, and `prlimit` then fails BEFORE `exec`ing anything, so
+    /// the child never runs with the cap silently unapplied.
+    let withProcessLimits (cpuTimeMax: TimeSpan option) (command: Command) : Result<Command, ProcessError> =
+        if command.Config.Rlimits.IsEmpty then
+            match cpuTimeMax with
+            | None -> Ok command
+            | Some duration -> withCpuTimeLimitShim duration command
+        else
+            let command = applyPreferLocal command
+            let config = command.Config
+
+            if config.Arg0.IsSome then
+                Error(
+                    ProcessError.Unsupported
+                        $"Command.Arg0 combined with Command.Rlimit: the {rlimitHelper} helper re-execs the target by name and has no seam for a distinct argv[0]"
+                )
+            else
+                match trustedHelperPath rlimitHelper with
+                | None -> Error(rlimitHelperMissing ())
+                | Some helperPath ->
+                    match resolveCommandProgram command with
+                    | Error error -> Error error
+                    | Ok resolvedProgram ->
+                        let effective = foldCpuTimeMax cpuTimeMax config.Rlimits
+
+                        let args =
+                            seq {
+                                for limit in effective do
+                                    yield $"{rlimitOption limit.Resource}={limit.Soft}:{limit.Hard}"
+
+                                yield "--"
+                                yield resolvedProgram
+                                yield! config.Args
+                            }
+
+                        Ok(
+                            Command(
+                                { config with
+                                    Program = helperPath
+                                    Args = ImmutableList.CreateRange args
+                                    // Cleared for the same reason the CPU shim clears `Arg0`: the check above
+                                    // already refuses one, and a stale value must never reach the HELPER's own
+                                    // `argv[0]`. `Rlimits` is cleared because they are now encoded in the argv
+                                    // above — so the defensive second call every spawn entry point makes sees
+                                    // nothing left to apply and cannot wrap a second helper around this one.
+                                    Arg0 = None
+                                    Rlimits = ImmutableList<Rlimit>.Empty }
+                            )
+                        )
 
     /// Rewrite a `setpriv`-helper `NotFound` into the same typed `ProcessError.Spawn` against the ORIGINAL
     /// program that an up-front trusted-resolution miss produces (`setprivHelperMissing`), so a caller who
@@ -4640,7 +4800,9 @@ module internal Posix =
     /// Everything else — including a lone `Setsid` — spawns directly. `KillOnParentDeath` off Linux
     /// (macOS/BSD have no `PR_SET_PDEATHSIG`) is a typed `ProcessError.Unsupported`; a refused drop by a
     /// non-root caller is rejected up front; a missing `setpriv` helper becomes a typed `ProcessError.Spawn`,
-    /// never a silently un-dropped / un-armed child.
+    /// never a silently un-dropped / un-armed child. Any `Command.Rlimit` values are applied here too, by
+    /// the `prlimit` rewrite every POSIX entry point performs (`withProcessLimits`) — a no-op for a command
+    /// carrying none, and already spent when a backend folded a group `CpuTimeMax` into it beforehand.
     let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
         // Resolve any prefer-local program to its absolute path first, so every downstream helper rewrite
         // (setpriv / setsid --ctty) carries the substituted path (T-182).
@@ -4669,33 +4831,49 @@ module internal Posix =
                         ProcessError.Unsupported
                             "KillOnParentDeath needs Linux's PR_SET_PDEATHSIG (armed via setpriv); macOS/BSD have no parent-death-signal analog"
                     )
-                elif config.Pty.IsSome then
-                    // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper (see
-                    // `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe (D9). A
-                    // `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`, via `setpriv`).
-                    spawnPosixPty command
                 else
+                    // Per-process rlimits are applied before the remaining dispatch, so whatever helper chain
+                    // that dispatch builds (`setpriv`, the `setsid --ctty` pty shim) wraps the `prlimit` layer
+                    // rather than the other way round — the same position the `CpuTimeMax` shim has always
+                    // occupied. A command carrying no rlimits comes back untouched.
+                    match withProcessLimits None command with
+                    | Error error -> Error error
+                    | Ok limited ->
+                        let config = limited.Config
 
-                    match groupsRequireDropError command with
-                    | Some error -> Error error
-                    | None ->
-                        if needsSetpriv config then
-                            // A uid/gid drop needs the non-root precheck; a lone `KillOnParentDeath` (no credential
-                            // change) does not, so the precheck runs only when a drop is actually requested.
-                            let precheck =
-                                if config.Uid.IsSome || config.Gid.IsSome then
-                                    privilegeDropPrecheck command
-                                else
-                                    None
+                        if config.Pty.IsSome then
+                            // A PTY gives the child a real controlling pseudo-terminal via the `setsid --ctty` helper
+                            // (see `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe
+                            // (D9). A `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`,
+                            // via `setpriv`).
+                            spawnPosixPty limited
+                        else
 
-                            match precheck with
+                            // Both guards are asked about the ORIGINAL command: their verdicts depend only on
+                            // knobs the rlimit rewrite preserves, and both name `command.Program` in the error
+                            // they raise — which must stay the program the caller asked for, never the helper
+                            // that would have launched it.
+                            match groupsRequireDropError command with
                             | Some error -> Error error
                             | None ->
-                                match setprivCommand command with
-                                | Error error -> Error error
-                                | Ok dropping -> spawnPosixViaSpawn dropping |> remapSetprivNotFound command
-                        else
-                            spawnPosixViaSpawn command
+                                if needsSetpriv config then
+                                    // A uid/gid drop needs the non-root precheck; a lone `KillOnParentDeath` (no
+                                    // credential change) does not, so the precheck runs only when a drop is actually
+                                    // requested.
+                                    let precheck =
+                                        if config.Uid.IsSome || config.Gid.IsSome then
+                                            privilegeDropPrecheck command
+                                        else
+                                            None
+
+                                    match precheck with
+                                    | Some error -> Error error
+                                    | None ->
+                                        match setprivCommand limited with
+                                        | Error error -> Error error
+                                        | Ok dropping -> spawnPosixViaSpawn dropping |> remapSetprivNotFound command
+                                else
+                                    spawnPosixViaSpawn limited
 
     // ----------------------------------------------------------------------------------
     // Linux cgroup v2: place the child INSIDE its cgroup atomically with its own execution
@@ -4748,8 +4926,10 @@ module internal Posix =
         let config = command.Config
 
         // Build and spawn the `/bin/sh` migration launcher around an already-resolved inner argv (the
-        // target, with any trusted-path `setpriv`/`setsid --ctty` helper already pinned into it).
-        let launchWith (innerArgv: string list) =
+        // target, with any trusted-path `setpriv`/`setsid --ctty`/`prlimit` helper already pinned into it).
+        // `baseConfig` is the config the rlimit rewrite left behind (identical to `config` when the command
+        // carried none), so the launcher never re-carries limits that are already encoded in `innerArgv`.
+        let launchWith (baseConfig: CommandConfig) (innerArgv: string list) =
             let launcherArgs = "-c" :: cgroupLauncherScript :: "sh" :: cgroupProcs :: innerArgv
 
             // Every other knob (stdio, cwd, env, Priority, Umask, Setsid) is preserved and applied by
@@ -4757,7 +4937,7 @@ module internal Posix =
             // cleared so `spawnPosixViaSpawn` does not ALSO wrap the launcher in a second `setpriv` layer
             // (the drop, and its `--groups`/`--clear-groups`, is already nested in `innerArgv` above).
             let launcherConfig =
-                { config with
+                { baseConfig with
                     Program = "/bin/sh"
                     Args = System.Collections.Immutable.ImmutableList.CreateRange launcherArgs
                     Uid = None
@@ -4785,33 +4965,43 @@ module internal Posix =
             | other -> other
 
         let launch () =
-            // The argv the launcher `exec`s after migrating: the real program (and its args), or — when a
-            // uid/gid drop and/or `Command.KillOnParentDeath` is requested — the trusted, absolute-path
-            // `setpriv` helper wrapping it, so the drop (and the in-place `--pdeathsig` arming) happens
-            // AFTER the privileged cgroup join. Shares `setprivWrappedArgv` with the `setsid --ctty` pty
-            // shim, so this path pins (and refuses) the helper exactly as the other two do — the `exec` of
-            // an absolute path performs no `PATH` search, so nothing on `PATH` can interpose here either.
-            let innerArgv =
-                match setprivWrappedArgv command with
-                | Error error -> Error error
-                | Ok dropOrPlain ->
-                    if config.Pty.IsSome then
-                        // PTY under a cgroup: the launcher joins `cgroup.procs`, then `exec`s the
-                        // `setsid --ctty` controlling-terminal shim (with any privilege drop nested inside it,
-                        // after the privileged join). The cgroup membership is by the launcher's `$$` — which is
-                        // still the target's pid after the whole exec chain and after the helper's `setsid()` —
-                        // so limits and the controlling pty compose; `Mechanism.CgroupV2` is reported unchanged.
-                        // `ptyHostUnsupported` already resolved this helper below; re-resolving here keeps the
-                        // pinned path and the capability answer from drifting apart if it vanishes in between.
-                        match trustedHelperPath cttyHelper with
-                        | None -> Error(cttyHelperUnsupported ())
-                        | Some cttyPath -> Ok(cttyPath :: "--ctty" :: dropOrPlain)
-                    else
-                        Ok dropOrPlain
-
-            match innerArgv with
+            // Per-process rlimits (`Command.Rlimit`) are folded into the target BEFORE the drop/pty argv is
+            // built, so the launcher `exec`s `[setpriv ...] [setsid --ctty] prlimit ... -- program ...`: the
+            // privileged cgroup join still happens first (it is the launcher's own `$$` write), then the
+            // credential drop, then the limits, then the program — every step in the same pid. A command
+            // carrying no rlimits comes back untouched, so this path is byte-identical to before for it.
+            match withProcessLimits None command with
             | Error error -> Error error
-            | Ok innerArgv -> launchWith innerArgv
+            | Ok limited ->
+                // The argv the launcher `exec`s after migrating: the real program (and its args), or — when
+                // a uid/gid drop and/or `Command.KillOnParentDeath` is requested — the trusted,
+                // absolute-path `setpriv` helper wrapping it, so the drop (and the in-place `--pdeathsig`
+                // arming) happens AFTER the privileged cgroup join. Shares `setprivWrappedArgv` with the
+                // `setsid --ctty` pty shim, so this path pins (and refuses) the helper exactly as the other
+                // two do — the `exec` of an absolute path performs no `PATH` search, so nothing on `PATH`
+                // can interpose here either.
+                let innerArgv =
+                    match setprivWrappedArgv limited with
+                    | Error error -> Error error
+                    | Ok dropOrPlain ->
+                        if config.Pty.IsSome then
+                            // PTY under a cgroup: the launcher joins `cgroup.procs`, then `exec`s the
+                            // `setsid --ctty` controlling-terminal shim (with any privilege drop nested inside
+                            // it, after the privileged join). The cgroup membership is by the launcher's `$$` —
+                            // which is still the target's pid after the whole exec chain and after the helper's
+                            // `setsid()` — so limits and the controlling pty compose; `Mechanism.CgroupV2` is
+                            // reported unchanged. `ptyHostUnsupported` already resolved this helper below;
+                            // re-resolving here keeps the pinned path and the capability answer from drifting
+                            // apart if it vanishes in between.
+                            match trustedHelperPath cttyHelper with
+                            | None -> Error(cttyHelperUnsupported ())
+                            | Some cttyPath -> Ok(cttyPath :: "--ctty" :: dropOrPlain)
+                        else
+                            Ok dropOrPlain
+
+                match innerArgv with
+                | Error error -> Error error
+                | Ok innerArgv -> launchWith limited.Config innerArgv
 
         // The Windows-only token knobs have no POSIX equivalent and are refused first (the same gate
         // `spawnPosix` applies); a PTY then gates the same unsupported-host check as `spawnPosixPty` before
@@ -5240,15 +5430,22 @@ module internal Posix =
                 match groupsRequireDropError command with
                 | Some error -> Error error
                 | None ->
-                    if config.Uid.IsSome || config.Gid.IsSome then
-                        match privilegeDropPrecheck command with
-                        | Some error -> Error error
-                        | None ->
-                            match setprivCommand command with
-                            | Error error -> Error error
-                            | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
-                    else
-                        spawnDetachedPosixCore command
+                    // A detached child is unowned, never contained, and nobody watches it — which makes the
+                    // caps it was asked to run under matter MORE, not less, so the same `prlimit` rewrite the
+                    // contained paths perform is applied here too rather than silently skipped. A command
+                    // carrying no rlimits comes back untouched.
+                    match withProcessLimits None command with
+                    | Error error -> Error error
+                    | Ok limited ->
+                        if config.Uid.IsSome || config.Gid.IsSome then
+                            match privilegeDropPrecheck command with
+                            | Some error -> Error error
+                            | None ->
+                                match setprivCommand limited with
+                                | Error error -> Error error
+                                | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
+                        else
+                            spawnDetachedPosixCore limited
 
     // ----------------------------------------------------------------------------------
     // Capability probes — read-only, no spawn, no side effects
@@ -5272,6 +5469,12 @@ module internal Posix =
     /// Whether the `setsid` controlling-terminal helper resolves in a trusted system directory. This is the
     /// helper's presence alone; `ptyHostSupport` is the full `Command.Pty` gate.
     let controllingTerminalHelperAvailable () : bool = (trustedHelperPath cttyHelper).IsSome
+
+    /// Whether the `prlimit` per-process resource-limit helper resolves in a trusted system directory — the
+    /// very resolution `withProcessLimits` performs, so what this reports and what a `Command.Rlimit` spawn
+    /// would really do here cannot drift apart. `false` is what turns any `Command.Rlimit` into a typed
+    /// `ProcessError.ResourceLimit` (macOS/BSD, which ship no util-linux, and minimal images).
+    let processLimitHelperAvailable () : bool = (trustedHelperPath rlimitHelper).IsSome
 
     /// Whether `/bin/sh` is present and directly executable — the interpreter the cgroup v2 self-migrating
     /// launcher, the `CpuTimeMax` (`RLIMIT_CPU`) shim, and the `KillOnParentDeath` pre-arm guard all `exec`

@@ -1070,11 +1070,13 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// On Windows only the default soft-stop contract is representable.
     member internal _.GracefulKillTree(signal: Signal, grace: TimeSpan) : Task = backend.GracefulKillTree signal grace
 
-    // Deliberate divergence from ProcessKit-rs (`shutdown(escalate_to_kill = false)`): we do NOT offer a
-    // graceful shutdown that *keeps the group usable* by sparing processes that ignore the soft signal. That
-    // mode makes kill-on-drop conditional (spared survivors outlive a drop), and this port keeps the
-    // kill-on-drop tree guarantee UNCONDITIONAL. The four teardown needs are still covered without it:
-    // immediate+terminal = `Dispose`; immediate+keep-usable = `KillAll`; graceful+terminal = `ShutdownAsync`.
+    // Deliberate divergence from ProcessKit-rs (`shutdown(escalate_to_kill = false)` / `stop(grace,
+    // escalate)`): we do NOT offer a graceful shutdown that *keeps the group usable* by sparing processes
+    // that ignore the soft signal. That mode makes kill-on-drop conditional (spared survivors outlive a
+    // drop), and this port keeps the kill-on-drop tree guarantee UNCONDITIONAL. The four teardown needs are
+    // still covered without it: immediate+terminal = `Dispose`; immediate+keep-usable = `KillAll`;
+    // graceful+terminal = `ShutdownAsync` / `ShutdownReportAsync` (T-384's reporting sibling, same
+    // unconditional teardown, richer observation — see its own doc comment).
 
     /// Tear the group down gracefully, then release it. On Unix: the configured `Options.StopSignal`,
     /// then SIGKILL if still alive after `gracePeriod`. On Windows: best-effort `WM_CLOSE`, then the
@@ -1098,7 +1100,11 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             // the wait, so the one-shot teardown that follows runs exactly once.
             if claimRelease () then
                 try
-                    do! backend.GracefulKillTree currentOptions.StopSignal gracePeriod
+                    // `GracefulKillTree` now returns `Task<GracefulOutcome>` (the observed-facts core
+                    // `ShutdownReportAsync` reads); `ShutdownAsync` discards the outcome exactly as it
+                    // discarded the bare `Task` before, hence the explicit upcast — a plain `do!` cannot
+                    // bind a non-unit result to `()`.
+                    do! (backend.GracefulKillTree currentOptions.StopSignal gracePeriod :> Task)
                 finally
                     // Guarantee `hardRelease`/`GC.SuppressFinalize` even if `GracefulKillTree` throws
                     // synchronously or its `Task` faults — mirroring how `RunTelemetryScope.Conclude`
@@ -1117,6 +1123,113 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// `ShutdownAsync` using the group's configured `Options.ShutdownTimeout`.
     member this.ShutdownAsync() : Task =
         this.ShutdownAsync currentOptions.ShutdownTimeout
+
+    /// Gracefully tear the group down, additionally reporting what the teardown **actually observed** —
+    /// the introspective sibling of `ShutdownAsync(gracePeriod)`.
+    ///
+    /// Drives the EXACT SAME teardown as `ShutdownAsync(gracePeriod)` — the configured
+    /// `Options.StopSignal` (a best-effort `WM_CLOSE` on Windows), then up to `gracePeriod` for the tree
+    /// to drain, then an UNCONDITIONAL hard kill of any survivor, then release — and is purely additive:
+    /// it changes nothing about `ShutdownAsync`'s own behaviour or signature. What it adds is the
+    /// `ShutdownReport`: the soft signal's fate, the member counts before/after, whether the tree drained
+    /// within the grace or needed the hard kill, and how long it actually took — so a caller that owns
+    /// its own end-of-run race (a deadline that is not a fixed timeout, but a timeout x Ctrl-C x
+    /// control-socket race) can report the OBSERVED tier instead of re-deriving it from `ShutdownAsync`'s
+    /// bare success.
+    ///
+    /// # Deliberately NOT a "keep the group usable, spare survivors" mode
+    ///
+    /// ProcessKit-rs's `ProcessGroup::stop` additionally takes an `escalate: bool` that, when `false`,
+    /// leaves any survivor running and keeps the group usable — seemingly the Rust source this method
+    /// otherwise mirrors closely. This port deliberately does not offer that combination — see the
+    /// "Deliberate divergence" note above `GracefulKillTree` for why: this port's kill-on-drop guarantee
+    /// is unconditional, and there is no honest way to offer "spare the survivors" on a teardown that
+    /// still releases the container the way `ShutdownAsync`/this method both document. On Windows in
+    /// particular, closing the Job handle unconditionally kills whatever the Job still holds
+    /// (`KILL_ON_JOB_CLOSE`), so a "spared" survivor would be silently killed anyway by the very release
+    /// this method still performs at the end — reporting `Escalated = false` there would misrepresent a
+    /// kill this call itself causes as a spare. `Escalated` instead answers an honest, narrower question:
+    /// did THIS teardown's grace window need the hard kill, or did the tree drain on the soft signal
+    /// alone.
+    ///
+    /// See `ShutdownAsync(gracePeriod)`'s own doc comment for the full teardown/idempotency contract this
+    /// shares (negative-grace rejection, `Dispose`/`ShutdownAsync` idempotency, the "only the winner
+    /// awaits the in-flight teardown" rule). A caller that loses the underlying release race — a
+    /// concurrent `Dispose`/`ShutdownAsync`/`ShutdownReportAsync`/finalizer already claimed it — gets
+    /// `ProcessError.Unsupported` here rather than a fabricated report, since there is no teardown left
+    /// for THIS call to have observed.
+    member this.ShutdownReportAsync(gracePeriod: TimeSpan) : Task<Result<ShutdownReport, ProcessError>> =
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
+
+        task {
+            if claimRelease () then
+                let stopwatch = Stopwatch.StartNew()
+
+                // Read BEFORE the soft signal, directly on the still-live backend (not through `WhenLive`):
+                // `claimRelease` already won the release transition above, so — exactly like
+                // `hardRelease`'s `LimitEvidence` capture — no other op can reach the backend concurrently
+                // from here.
+                let membersBefore =
+                    match backend.Members() with
+                    | Ok members -> Some(List.length members)
+                    | Error _ -> None
+
+                let mutable outcome = Unchecked.defaultof<GracefulOutcome>
+                let mutable membersAfter = None
+
+                try
+                    let! result = backend.GracefulKillTree currentOptions.StopSignal gracePeriod
+                    outcome <- result
+
+                    // Read AFTER the grace/kill decision but BEFORE `hardRelease` below closes the native
+                    // container — the container is still live here (see `hardRelease`'s own comment on why
+                    // `LimitEvidence` must likewise read before it runs), the same window
+                    // ProcessKit-rs's `GracefulOutcome::members_after` is read in.
+                    membersAfter <-
+                        match backend.Members() with
+                        | Ok members -> Some(List.length members)
+                        | Error _ -> None
+                finally
+                    hardRelease ()
+                    GC.SuppressFinalize this
+
+                let softSignal =
+                    match outcome.Soft with
+                    | SoftDelivery.Sent -> SoftSignalDelivery.Sent currentOptions.StopSignal
+                    | SoftDelivery.Unsupported -> SoftSignalDelivery.Unsupported
+                    | SoftDelivery.Failed -> SoftSignalDelivery.Failed currentOptions.StopSignal
+
+                return
+                    Ok(
+                        ShutdownReport(
+                            softSignal,
+                            membersBefore,
+                            membersAfter,
+                            outcome.Drained,
+                            outcome.Escalated,
+                            stopwatch.Elapsed
+                        )
+                    )
+            else
+                return
+                    Error(
+                        ProcessError.Unsupported
+                            "the process group has already been released by another Dispose/ShutdownAsync/ShutdownReportAsync/finalizer call, which owns that teardown (or already discarded its report); this call observed no teardown of its own"
+                    )
+        }
+
+    /// `ShutdownReportAsync` using the group's configured `Options.ShutdownTimeout`.
+    member this.ShutdownReportAsync() : Task<Result<ShutdownReport, ProcessError>> =
+        this.ShutdownReportAsync currentOptions.ShutdownTimeout
+
+    /// How far a soft stop (`Signal.Int`/`Signal.Term`) reaches on this group's CURRENT live membership,
+    /// right now — see `SoftStopScope` for the full per-mechanism table. A capability report, not an
+    /// action: side-effect-free, delivering no signal and mutating nothing, so asking never changes the
+    /// answer a later `Signal`/`ShutdownAsync`/`ShutdownReportAsync` soft stop gets. Errors the same
+    /// honest way every other control verb does once the group is released
+    /// (`ProcessError.Unsupported`) — there is no live membership left to read.
+    member this.SoftStopScope() : Result<SoftStopScope, ProcessError> =
+        this.WhenLive(fun () -> Ok(backend.SoftStopScope()))
 
     // The finalizer is the GC-time safety net for a group that was never disposed: it reaps the
     // tree. Deterministic teardown still comes from `use`/`Dispose`.

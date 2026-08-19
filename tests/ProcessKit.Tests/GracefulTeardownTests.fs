@@ -81,8 +81,11 @@ type private FakeTeardownClock() =
 
 [<TestFixture>]
 type GracefulTeardownTests() =
-    let run (clock: FakeTeardownClock) grace alive forceKill =
-        GracefulTeardown.pollUsing clock.Start clock.Delay ignore alive forceKill grace
+    let run (clock: FakeTeardownClock) grace alive forceKill : Task =
+        // These tests exercise only the polling/timing shape, so the soft-signal fate and the returned
+        // `GracefulOutcome` (T-384) are irrelevant here — a fixed `Sent`, discarded via the upcast, keeps
+        // every existing `do! run ...` call site unchanged.
+        GracefulTeardown.pollUsing clock.Start clock.Delay (fun () -> SoftDelivery.Sent) alive forceKill grace :> Task
 
     [<Test>]
     member _.``zero grace escalates immediately without delaying``() : Task =

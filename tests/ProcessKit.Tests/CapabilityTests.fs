@@ -26,6 +26,7 @@ module private CapabilityFacts =
           PtyHostRefusal = None
           PrivilegeDropHelperAvailable = false
           ControllingTerminalHelperAvailable = false
+          ProcessLimitHelperAvailable = false
           SystemShellAvailable = false
           TrustedHelperDirectories = ""
           ProcessIdentityReaderAvailable = false
@@ -44,6 +45,7 @@ module private CapabilityFacts =
           PtyHostRefusal = None
           PrivilegeDropHelperAvailable = true
           ControllingTerminalHelperAvailable = true
+          ProcessLimitHelperAvailable = true
           SystemShellAvailable = true
           TrustedHelperDirectories = "/usr/bin, /bin, /usr/sbin, /sbin"
           ProcessIdentityReaderAvailable = true
@@ -74,6 +76,7 @@ module private CapabilityFacts =
             )
           PrivilegeDropHelperAvailable = false
           ControllingTerminalHelperAvailable = false
+          ProcessLimitHelperAvailable = false
           SystemShellAvailable = true
           TrustedHelperDirectories = "/usr/bin, /bin, /usr/sbin, /sbin"
           ProcessIdentityReaderAvailable = true
@@ -296,9 +299,12 @@ type CapabilityTests() =
         // The CPU-time rlimit is the deliberate POSIX exception and survives the absent container.
         available "CpuTimeMax" caps.ResourceLimits.CpuTimeMax
 
-        // Both util-linux helpers are listed as missing WITH their precondition, rather than omitted.
+        // Every util-linux helper is listed as missing WITH its precondition, rather than omitted — the
+        // per-process rlimit helper (`Command.Rlimit`) included, since a host that cannot load it cannot
+        // apply those caps either and a snapshot that stayed silent about it would overstate this host.
         unsupported "setpriv" "trusted system directory" (helperEntry "setpriv" caps).Availability
         unsupported "setsid" "trusted system directory" (helperEntry "setsid" caps).Availability
+        unsupported "prlimit" "trusted system directory" (helperEntry "prlimit" caps).Availability
         available "/bin/sh" (helperEntry "/bin/sh" caps).Availability
 
     [<Test>]
@@ -332,6 +338,24 @@ type CapabilityTests() =
         unsupported "KillOnParentDeath" "'setpriv' helper" withoutSetpriv.KillOnParentDeath
         // A missing privilege-drop helper says nothing about the pseudo-terminal.
         available "Pty" withoutSetpriv.Pty
+        // ...nor about the per-process rlimit helper, which is a separate binary.
+        available "prlimit" (helperEntry "prlimit" withoutSetpriv).Availability
+
+        // The per-process rlimit helper is reported on its own axis: a host holding `setpriv`/`setsid` but
+        // not `prlimit` (a minimal image) is exactly the case a caller must be able to see BEFORE a
+        // `Command.Rlimit` spawn refuses with ProcessError.ResourceLimit.
+        let withoutPrlimit =
+            CapabilityProbe.snapshot
+                { CapabilityFacts.linux with
+                    ProcessLimitHelperAvailable = false }
+                (CapabilityFacts.noLimits ())
+
+        unsupported "prlimit" "'prlimit' helper" (helperEntry "prlimit" withoutPrlimit).Availability
+        available "setpriv" (helperEntry "setpriv" withoutPrlimit).Availability
+        available "setsid" (helperEntry "setsid" withoutPrlimit).Availability
+        // The helper applies per-process caps only, so no whole-tree limit dimension moves with it.
+        available "CpuTimeMax" withoutPrlimit.ResourceLimits.CpuTimeMax
+        qualified "MemoryMax" "memory.max" withoutPrlimit.ResourceLimits.MemoryMax
 
         let withoutShell =
             CapabilityProbe.snapshot
@@ -358,6 +382,7 @@ type CapabilityTests() =
               { CapabilityFacts.linux with
                   PrivilegeDropHelperAvailable = false
                   ControllingTerminalHelperAvailable = false
+                  ProcessLimitHelperAvailable = false
                   SystemShellAvailable = false }
               "macos", CapabilityFacts.macOs
               "bsd", CapabilityFacts.bsd ]
@@ -523,5 +548,15 @@ type CapabilityTests() =
                 unsupported "AdoptionByPid" "start-time identity reader" caps.AdoptionByPid
 
             // The helper list is the POSIX one; whether each is present depends on the host.
-            for name in [ "setpriv"; "setsid"; "/bin/sh" ] do
+            for name in [ "setpriv"; "setsid"; "prlimit"; "/bin/sh" ] do
                 helperEntry name caps |> ignore
+
+            // ...and the `prlimit` answer is cross-checked against the very resolution a `Command.Rlimit`
+            // spawn performs, so the snapshot cannot advertise a helper this host would refuse to load
+            // (or hide one it holds) — the same shape the `AdoptionByPid` pairing above uses.
+            let prlimitAvailability = (helperEntry "prlimit" caps).Availability
+
+            if (Native.Posix.trustedHelperPathForTests "prlimit").IsSome then
+                available "prlimit" prlimitAvailability
+            else
+                unsupported "prlimit" "'prlimit' helper" prlimitAvailability

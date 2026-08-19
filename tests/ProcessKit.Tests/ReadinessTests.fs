@@ -14,6 +14,7 @@ open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+open ProcessKit.Testing
 
 type private ReadinessHttpHandler() =
     inherit HttpMessageHandler()
@@ -1828,6 +1829,229 @@ type ReadinessTests() =
             match! running.WaitForSocketAsync("/nonexistent/path.sock", TimeSpan.FromSeconds 5.0) with
             | Error(ProcessError.Unsupported _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 1.0))
             | other -> Assert.Fail $"expected Unsupported, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPath succeeds immediately when the path already exists``() : Task =
+        task {
+            let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.ready")
+            File.WriteAllText(path, "")
+
+            try
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForPathAsync(path, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.Pass()
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                File.Delete path
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPath succeeds once a file is created while polling``() : Task =
+        task {
+            let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.ready")
+
+            try
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+                let createLate =
+                    task {
+                        do! Task.Delay 200
+                        File.WriteAllText(path, "")
+                    }
+
+                match! running.WaitForPathAsync(path, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.That(createLate.IsCompletedSuccessfully, Is.True, "the file was never created")
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                File.Delete path
+        }
+        :> Task
+
+    // The existence-only contract (task.md/K-043): a directory counts as "ready" too, not just a
+    // regular file — mirrors `wait_for_path`'s Rust contract this port follows.
+    [<Test>]
+    member _.``WaitForPath counts an existing directory as ready, not files only``() : Task =
+        task {
+            let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.dir")
+            Directory.CreateDirectory path |> ignore
+
+            try
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForPathAsync(path, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.Pass()
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                Directory.Delete path
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPath returns NotReady when the path never appears``() : Task =
+        task {
+            let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.never")
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForPathAsync(path, TimeSpan.FromMilliseconds 250.0) with
+            | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPath is cancelled by the external token while the path never appears``() : Task =
+        task {
+            let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.never")
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 100.0)
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForPathAsync(path, TimeSpan.FromSeconds 30.0, cts.Token) with
+            | Error(ProcessError.Cancelled _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task
+
+    // Early-exit contract, path probe: a child that has already exited must resolve to `NotReady`
+    // promptly rather than polling the path out for the full timeout — the same behaviour
+    // `WaitForPortAsync`/`WaitForSocketAsync` give (see the equivalent tests above). `Wait` resolves to
+    // an exited outcome, so the shared exit wait the probe races against completes at once and cancels
+    // the still-polling path probe.
+    [<Test>]
+    member _.``WaitForPath returns NotReady promptly when the child has already exited``() : Task =
+        task {
+            let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.never")
+            use running = syntheticProcess (Task.FromResult(Outcome.Exited 1))
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForPathAsync(path, TimeSpan.FromSeconds 5.0) with
+            | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected early NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForPath rejects a null path``() : Task =
+        task {
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            let nullPath = Unchecked.defaultof<string>
+
+            Assert.Throws<ArgumentNullException>(
+                Action(fun () -> running.WaitForPathAsync(nullPath, TimeSpan.FromSeconds 1.0) |> ignore)
+            )
+            |> ignore
+        }
+        :> Task
+
+    // A filesystem lookup failure is treated as "not yet ready", not a probe fault: `waitForPathUsing`
+    // is exercised directly (bypassing the real `File.Exists`/`Directory.Exists` wiring `waitForPath`
+    // does) with an `exists` stand-in that throws on its first two calls, mirroring how
+    // `WaitForPort respects the shared deadline while a connect attempt itself is still in flight`
+    // above exercises the injectable connect seam directly rather than through the production wiring.
+    [<Test>]
+    member _.``WaitForPath treats an exists-check failure as not-ready and keeps retrying``() : Task =
+        task {
+            let mutable calls = 0
+
+            let flakyExists (_: string) : bool =
+                calls <- calls + 1
+
+                if calls < 3 then
+                    raise (IOException "synthetic lookup failure")
+                else
+                    true
+
+            match!
+                ReadinessProbe.waitForPathUsing
+                    TimeProvider.System
+                    flakyExists
+                    "test"
+                    "irrelevant"
+                    ReadinessAttempts.PollUntilDeadline
+                    (TimeSpan.FromSeconds 3.0)
+                    CancellationToken.None
+            with
+            | Ok() -> Assert.That(calls, Is.GreaterThanOrEqualTo 3)
+            | other -> Assert.Fail $"expected Ok, got {other}"
+        }
+        :> Task
+
+    // FakeProcess/cassette parity (T-374): a fake handle IS a real `RunningProcess` built over
+    // in-memory streams (`FakeProcess.Build`), so it inherits every readiness verb — including this
+    // new one — through the same construction path `WaitForPort`/`WaitForSocket` already rely on, with
+    // no separate wiring needed in `FakeProcess`/`Cassette` themselves.
+    [<Test>]
+    member _.``WaitForPath works against a FakeProcess double, same as a real handle``() : Task =
+        task {
+            let path = Path.Combine(Path.GetTempPath(), $"processkit-{Guid.NewGuid():N}.ready")
+            File.WriteAllText(path, "")
+
+            try
+                use running = FakeProcess.Create().Build()
+
+                match! running.WaitForPathAsync(path, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.Pass()
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                File.Delete path
+        }
+        :> Task
+
+    // Relative-path resolution contract (R-01): a relative `path` resolves against the run's own
+    // configured `Command.CurrentDir`, the CHILD's working directory — not against whatever directory
+    // this test process happens to be running from — the same rule `Command.PreferLocal` already
+    // applies to its own relative entries.
+    [<Test>]
+    member _.``WaitForPath resolves a relative path against the configured CurrentDir``() : Task =
+        task {
+            let childDir = Directory.CreateTempSubdirectory("processkit-waitforpath-").FullName
+            let relativeName = $"processkit-{Guid.NewGuid():N}.ready"
+            File.WriteAllText(Path.Combine(childDir, relativeName), "")
+
+            try
+                let config = (Command.create "test" |> Command.currentDir childDir).Config
+                use running = syntheticProcessWith config (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForPathAsync(relativeName, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.Pass()
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                Directory.Delete(childDir, true)
+        }
+        :> Task
+
+    // The other half of the same contract: a same-named relative path sitting in a DIFFERENT
+    // directory must not be mistaken for the configured `CurrentDir`'s own sentinel — proving the
+    // resolution looks exactly where R-01 ratified it should, not "somewhere" that happens to match.
+    [<Test>]
+    member _.``WaitForPath does not consider a relative path ready when it exists only outside the configured CurrentDir``
+        ()
+        : Task =
+        task {
+            let childDir =
+                Directory.CreateTempSubdirectory("processkit-waitforpath-child-").FullName
+
+            let elsewhereDir =
+                Directory.CreateTempSubdirectory("processkit-waitforpath-elsewhere-").FullName
+
+            let relativeName = $"processkit-{Guid.NewGuid():N}.ready"
+            File.WriteAllText(Path.Combine(elsewhereDir, relativeName), "")
+
+            try
+                let config = (Command.create "test" |> Command.currentDir childDir).Config
+                use running = syntheticProcessWith config (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForPathAsync(relativeName, TimeSpan.FromMilliseconds 250.0) with
+                | Error(ProcessError.NotReady _) -> Assert.Pass()
+                | other -> Assert.Fail $"expected NotReady (elsewhere-directory hit must not count), got {other}"
+            finally
+                Directory.Delete(childDir, true)
+                Directory.Delete(elsewhereDir, true)
         }
         :> Task
 

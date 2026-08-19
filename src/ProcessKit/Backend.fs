@@ -6,6 +6,46 @@ open System.Collections.Generic
 open System.Diagnostics
 open System.Threading.Tasks
 
+/// The observed fate of one containment backend's best-effort graceful "soft signal" attempt — the
+/// shared, backend-agnostic core behind the public `SoftSignalDelivery` (which additionally carries the
+/// `Signal` attempted; that lives in `ProcessGroup.ShutdownReportAsync`, the one place that knows the
+/// group's configured `Options.StopSignal`). Mirrors ProcessKit-rs's `sys::graceful::SoftDelivery`.
+type internal SoftDelivery =
+
+    /// The soft signal was delivered best-effort to the tree (a POSIX signal on Unix; at least one
+    /// `WM_CLOSE` posted on the Windows soft tier).
+    | Sent
+
+    /// This platform/target has no soft-signal tier for the group, so the teardown could only hard-kill: a
+    /// windowless Windows Job Object with no live windowed member. Every Unix backend always has a real
+    /// `SIGTERM` tier, so this is never produced there.
+    | Unsupported
+
+    /// A soft-signal tier exists but the best-effort delivery failed for every target this teardown could
+    /// still reach (a uid-changed member rejecting the signal on Unix). Exact ("every") on the POSIX
+    /// process-group mechanism; on Linux cgroup v2 the broadcast primitive reports its first genuine
+    /// per-member failure even when other members received the signal, so there this narrows to "at least
+    /// one member's delivery failed" — see `SoftSignalDelivery.Failed`'s own doc for the full per-mechanism
+    /// caveat this maps onto.
+    | Failed
+
+/// The observed facts of one whole-tree graceful teardown, gathered by a single `IContainmentBackend`
+/// call to `GracefulKillTree`. The always-available, feature-agnostic core the public `ShutdownReport` is
+/// built from (`ProcessGroup.ShutdownReportAsync` adds the member counts, before/after, and the elapsed
+/// time — see that method's own comment for why those are measured at the caller rather than here).
+/// Mirrors ProcessKit-rs's `sys::graceful::GracefulOutcome`.
+type internal GracefulOutcome =
+    {
+        /// The fate of the best-effort soft-signal tier.
+        Soft: SoftDelivery
+
+        /// Whether the tree drained within the grace window, before any hard kill.
+        Drained: bool
+
+        /// Whether the driver escalated to a hard kill because the tree had not drained by the deadline.
+        Escalated: bool
+    }
+
 /// Shared graceful-teardown shape for all containment backends: request the platform/configured soft
 /// stop, poll until the tree is dead or `grace` elapses, then force-kill whatever remains.
 module internal GracefulTeardown =
@@ -13,13 +53,13 @@ module internal GracefulTeardown =
     let internal pollUsing
         (startClock: unit -> (unit -> TimeSpan))
         (delay: TimeSpan -> Task)
-        (terminate: unit -> unit)
+        (softSignal: unit -> SoftDelivery)
         (alive: unit -> bool)
         (forceKill: unit -> unit)
         (grace: TimeSpan)
-        : Task =
+        : Task<GracefulOutcome> =
         task {
-            terminate ()
+            let soft = softSignal ()
             let elapsed = startClock ()
             let deadline = grace
             let pollInterval = TimeSpan.FromMilliseconds 50.0
@@ -36,18 +76,29 @@ module internal GracefulTeardown =
 
                 do! delay armableDelay
 
-            if alive () then
-                forceKill ()
-        }
-        :> Task
+            let stillAlive = alive ()
 
-    let poll (terminate: unit -> unit) (alive: unit -> bool) (forceKill: unit -> unit) (grace: TimeSpan) : Task =
+            if stillAlive then
+                forceKill ()
+
+            return
+                { Soft = soft
+                  Drained = not stillAlive
+                  Escalated = stillAlive }
+        }
+
+    let poll
+        (softSignal: unit -> SoftDelivery)
+        (alive: unit -> bool)
+        (forceKill: unit -> unit)
+        (grace: TimeSpan)
+        : Task<GracefulOutcome> =
         pollUsing
             (fun () ->
                 let stopwatch = Stopwatch.StartNew()
                 fun () -> stopwatch.Elapsed)
             (fun duration -> Task.Delay duration)
-            terminate
+            softSignal
             alive
             forceKill
             grace
@@ -299,8 +350,17 @@ type internal IContainmentBackend =
     /// best-effort through `HardRelease`.
     abstract KillTree: unit -> Result<unit, ProcessError>
 
-    /// Gracefully kill the tree (configured soft signal → grace → hard kill) without releasing it.
-    abstract GracefulKillTree: Signal -> TimeSpan -> Task
+    /// Gracefully kill the tree (configured soft signal → grace → hard kill) without releasing it. The
+    /// returned `GracefulOutcome` is the observed-facts core `ProcessGroup.ShutdownReportAsync` builds its
+    /// public `ShutdownReport` from; every other caller (`ShutdownAsync`, the per-run graceful-timeout
+    /// path) simply discards it, exactly as before this member started reporting anything.
+    abstract GracefulKillTree: Signal -> TimeSpan -> Task<GracefulOutcome>
+
+    /// How far a soft stop (`Signal.Int`/`Signal.Term`) reaches on this backend's CURRENT live membership,
+    /// right now — the answer `ProcessGroup.SoftStopScope()` reports. Side-effect-free: it must deliver no
+    /// signal and touch no native mutation, only read the same live state `Signal`/`GracefulKillTree`
+    /// consult, so asking never changes what a later soft stop would do.
+    abstract SoftStopScope: unit -> SoftStopScope
 
     /// Deliver a signal to one tracked child's own containment unit.
     abstract SignalChild: Native.Common.Spawned * Signal -> Result<unit, ProcessError>
@@ -482,20 +542,69 @@ type internal JobObjectBackend(jobHandle: nativeint, initialLimits: ResourceLimi
             match Native.Windows.duplicateJobHandle jobHandle with
             | None ->
                 Native.Windows.terminateWindowsJob jobHandle |> ignore
-                Task.CompletedTask
+
+                Task.FromResult
+                    { Soft = SoftDelivery.Unsupported
+                      Drained = false
+                      Escalated = true }
             | Some ownedJob ->
                 task {
                     try
-                        do!
+                        return!
                             GracefulTeardown.poll
-                                (fun () -> Native.Windows.postCloseToJobWindows ownedJob |> ignore)
+                                (fun () ->
+                                    // A post reaching at least one windowed member is `Sent`; nothing to post
+                                    // to (a windowless tree, or one already empty) is `Unsupported` — this
+                                    // path never sends a CTRL+BREAK (see `Signal(Int/Term)` for that), so
+                                    // there is no `Failed` case here: WM_CLOSE either reaches a window or
+                                    // finds none.
+                                    if Native.Windows.postCloseToJobWindows ownedJob > 0 then
+                                        SoftDelivery.Sent
+                                    else
+                                        SoftDelivery.Unsupported)
                                 (fun () -> Native.Windows.jobTreeAliveWindows ownedJob)
                                 (fun () -> Native.Windows.terminateWindowsJob ownedJob |> ignore)
                                 grace
                     finally
                         Native.Windows.closeWindowsHandle ownedJob
                 }
-                :> Task
+
+        member _.SoftStopScope() =
+            // Side-effect-free: read the CTRL-capable leaders this backend already tracks, plus a fresh
+            // (non-mutating) windowed-member probe — without posting anything or sending a CTRL+BREAK.
+            //
+            // R-02: `ctrlGroups` entries are NOT a live-membership read by themselves — an entry is added
+            // at `Track` and removed only at `Release`/`HardRelease`, i.e. it survives for as long as the
+            // child's handle stays open, which can outlast the child's REAL exit (the handle is closed by
+            // the owning `RunningProcess`'s own teardown, a separate lifecycle event). Counting a stale
+            // entry would answer `OptInMembers` for a leader whose console process group the OS has
+            // already torn down, where `Signal(Int/Term)`'s `GenerateConsoleCtrlEvent` on that group id
+            // would then fail — exactly the "capability query promises more than delivery can back up"
+            // class this whole report exists to avoid. So each entry is filtered through
+            // `processHasExitedWindows` on its still-open handle (the same handle-based, never-a-pid
+            // liveness read `terminateWindowsProcess` already uses) and only one that has NOT provably
+            // exited counts as a live CTRL-capable leader; `None` (the OS would not say) is treated as
+            // "could still be live" — the same fail-safe direction `MembersAfter` and every other honest
+            // read here uses (never fabricate a negative from an inconclusive probe).
+            //
+            // A group with either a live CTRL-capable leader or a live windowed member can receive a soft
+            // stop (`OptInMembers`); a group with neither has nothing to receive one at all
+            // (`Unsupported`). This is still not a delivery GUARANTEE even for a target that passes both
+            // checks: `GenerateConsoleCtrlEvent` can fail for reasons this read does not probe (e.g. no
+            // console to share) — `OptInMembers` says a live target exists, not that delivery to it is
+            // certain to succeed.
+            let hasLiveCtrlLeader =
+                ctrlGroups.Keys
+                |> Seq.exists (fun handle ->
+                    match Native.Windows.processHasExitedWindows handle with
+                    | Some true -> false
+                    | Some false
+                    | None -> true)
+
+            if hasLiveCtrlLeader || Native.Windows.hasWindowedMemberWindows jobHandle then
+                SoftStopScope.OptInMembers
+            else
+                SoftStopScope.Unsupported
 
         member _.SignalChild(spawned, signal) =
             match signal with
@@ -786,12 +895,12 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             // spawn->migrate window where a descendant forked in that first instant could escape the
             // limits. See `Native.Posix.spawnPosixIntoCgroup`. `Spawned.Handle` is the launcher pid,
             // which becomes the target's pid unchanged across `exec`.
-            let effective =
-                match currentLimits.CpuTimeMax with
-                | Some duration -> Native.Posix.withCpuTimeLimit duration command
-                | None -> Ok command
-
-            effective
+            // One rewrite applies BOTH per-process caps that have to reach the child before its program
+            // starts: this group's whole-tree `CpuTimeMax` and any `Command.Rlimit` the command carries.
+            // Folding them here, in one place, is what keeps the shared CPU-time axis honest — applying
+            // them separately would let whichever ran last overwrite the other (see
+            // `Native.Posix.withProcessLimits`, which takes the stricter of the two).
+            Native.Posix.withProcessLimits currentLimits.CpuTimeMax command
             |> Result.bind (fun wrapped ->
                 Native.Posix.spawnPosixIntoCgroup wrapped (System.IO.Path.Combine(cgroupPath, "cgroup.procs")))
 
@@ -932,10 +1041,38 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             let signalNum = Native.Posix.signalNumber signal
 
             GracefulTeardown.poll
-                (fun () -> Native.Cgroup.signalCgroup cgroupPath signalNum |> ignore)
+                (fun () ->
+                    match Native.Cgroup.signalCgroup cgroupPath signalNum with
+                    | Native.Common.SignalDelivery.Delivered
+                    | Native.Common.SignalDelivery.TargetGone -> SoftDelivery.Sent
+                    | Native.Common.SignalDelivery.DeliveryFailed _ -> SoftDelivery.Failed)
                 (fun () -> Native.Cgroup.cgroupAlive cgroupPath)
-                (fun () -> Native.Cgroup.killCgroup cgroupPath |> ignore)
+                (fun () ->
+                    Native.Cgroup.killCgroup cgroupPath |> ignore
+
+                    // `cgroup.kill` only STARTS the tree leaving (R-01 — the same caveat `HardRelease`'s
+                    // own post-kill drain wait documents, T-363): the kernel drops a member from
+                    // `cgroup.procs` only once it actually exits, which can land after this write
+                    // returns. `ShutdownReportAsync` samples `MembersAfter` right behind this call while
+                    // the cgroup is still live — wait, BOUNDED (the same `DefaultDrainBudget` the final
+                    // `rmdir` wait uses), for the cgroup to actually read empty, so `MembersAfter`
+                    // reflects processes that have REALLY left rather than merely been asked to. No
+                    // removal happens here (that is `HardRelease`'s job, once this method's caller is
+                    // done reading `Members()`); this only waits on the same membership read
+                    // `cgroupAlive`/`Members()` already use. Best-effort like every other bounded wait in
+                    // this file: a cgroup still populated or unreadable at the deadline simply leaves
+                    // `MembersAfter` reporting what is honestly still there.
+                    let deadline = Native.Cgroup.DefaultDrainBudget
+                    let stopwatch = Stopwatch.StartNew()
+
+                    while Native.Cgroup.cgroupAlive cgroupPath && stopwatch.Elapsed < deadline do
+                        System.Threading.Thread.Sleep(TimeSpan.FromMilliseconds 2.0))
                 grace
+
+        member _.SoftStopScope() =
+            // `Signal(Int/Term)` writes to every process in the cgroup unconditionally — always the whole
+            // tree, on every live membership, so this needs no native read at all.
+            SoftStopScope.WholeTree
 
         member _.SignalChild(spawned, signal) =
             let pid = int spawned.Handle
@@ -1260,11 +1397,12 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
         member _.Mechanism = Mechanism.ProcessGroup
 
         member _.Spawn(command) =
-            match initialLimits.CpuTimeMax with
-            | Some duration ->
-                Native.Posix.withCpuTimeLimit duration command
-                |> Result.bind Native.Posix.spawnPosix
-            | None -> Native.Posix.spawnPosix command
+            // Both per-child caps in one rewrite: this group's whole-tree `CpuTimeMax` and any
+            // `Command.Rlimit` the command carries, with the stricter value winning on the CPU-time axis
+            // they share (see `Native.Posix.withProcessLimits`). A command with neither is passed through
+            // untouched.
+            Native.Posix.withProcessLimits initialLimits.CpuTimeMax command
+            |> Result.bind Native.Posix.spawnPosix
 
         member _.Track(spawned) =
             // Each posix_spawn already formed its own process group (pgid = child pid), so the child is
@@ -1437,37 +1575,83 @@ type internal ProcessGroupBackend(initialLimits: ResourceLimits) =
                 // The soft sweep: `signalTracked` sends an OBSERVABLE signal, so a `LeaderPid` verdict
                 // reaches exactly one of the two targets — the group if it exists by now, the pid only on
                 // its `ESRCH` — never both. No child is asked to handle the same stop signal twice.
+                //
+                // R-03: the fate reported here is `SoftDelivery.Failed` — the internal core of the public
+                // `SoftSignalDelivery.Failed`, documented as "the best-effort delivery failed for EVERY
+                // target" — so it must actually mean that, not merely "at least one live target's
+                // delivery failed" (a caller who reads `Failed` for a tree where most members drained
+                // fine would wrongly conclude the whole soft phase was a no-op). `anyDelivered` tracks
+                // whether at least one live target genuinely received the signal; `Failed` fires only when
+                // there was a failure AND nothing was delivered to anyone. A vacuous sweep (every target
+                // already `TargetGone`, including an already-empty tree) has neither a delivery nor a
+                // failure, so it is `Sent` — unchanged from before.
                 (fun () ->
+                    let mutable anyDelivered = false
+                    let mutable anyFailed = false
+
                     for pgid in pgids do
                         let target = targetSnap pgid
 
                         if not (TrackedTargets.isGone target) then
-                            Native.Posix.signalTracked target pgid (Native.Posix.signalNumber signal)
-                            |> ignore
+                            match Native.Posix.signalTracked target pgid (Native.Posix.signalNumber signal) with
+                            | Native.Common.SignalDelivery.Delivered -> anyDelivered <- true
+                            | Native.Common.SignalDelivery.TargetGone -> ()
+                            | Native.Common.SignalDelivery.DeliveryFailed _ -> anyFailed <- true
 
                     for pid, anchor in adoptedPids do
-                        Native.Posix.signalAdopted pid anchor (Native.Posix.signalNumber signal)
-                        |> ignore)
+                        match Native.Posix.signalAdopted pid anchor (Native.Posix.signalNumber signal) with
+                        | Native.Common.SignalDelivery.Delivered -> anyDelivered <- true
+                        | Native.Common.SignalDelivery.TargetGone -> ()
+                        | Native.Common.SignalDelivery.DeliveryFailed _ -> anyFailed <- true
+
+                    if anyFailed && not anyDelivered then
+                        SoftDelivery.Failed
+                    else
+                        SoftDelivery.Sent)
                 anyChildAliveSnap
                 // The escalation. `killTracked` is what makes this whole-tree even for a child still in
                 // its pre-`setsid()` window: the `LeaderPid` route SIGKILLs the pid and sweeps `killpg`
                 // behind it, so a subtree the child forked between the probe and this kill goes with it.
                 // This sweep stands on its own — a graceful `Stop` need not be followed by a
                 // `HardRelease` (the group may keep running), so it cannot borrow teardown's kill.
+                //
+                // REAPS too, via `PosixReap.drain` (R-01): a bare `killpg`/`kill` here would SIGKILL the
+                // leader but leave it a zombie until something `waitpid`s it — and `ShutdownReportAsync`
+                // samples `MembersAfter` (`Members()` -> `stillOurs` -> `killpg(pgid, 0)`) right behind
+                // this call, while the leader is still live, so an unreaped zombie is honestly still
+                // "there" and would count. `PosixReap.drain` is the SAME kill-then-reap-under-one-budget
+                // sequence `HardRelease` runs at final teardown (`children.Drain() |> List.map ... |>
+                // PosixReap.drain`), reused here so `MembersAfter` reflects a tree that has ACTUALLY gone,
+                // not merely been signalled. It is safe to run again from `HardRelease` right after this
+                // returns: a pgid this call already reaped reads `Gone` on the next probe (no member left
+                // to keep the group alive), so the second pass kills nothing and its own reap probe is a
+                // harmless no-op — exactly the reentrant contract `PosixReap`'s own doc describes for the
+                // per-escapee/whole-drain callers.
                 (fun () ->
-                    for pgid in pgids do
-                        let target = targetSnap pgid
-
-                        if not (TrackedTargets.isGone target) then
-                            Native.Posix.killTracked target pgid
+                    pgids
+                    |> List.map (fun pgid ->
+                        pgid,
+                        match Map.tryFind pgid identitySnapshot with
+                        | Some token -> token
+                        | None -> None)
+                    |> PosixReap.drain
 
                     // The adopted half of the escalation: the exact pid, anchor re-read one last time
                     // inside `killAdopted`. Nothing is pruned here — this snapshot is the poll's own copy
                     // (the ledger it came from may have been drained by a concurrent `HardRelease`), so
-                    // the anchor verdict is used only to decide the delivery.
+                    // the anchor verdict is used only to decide the delivery. Never reaped: an adopted
+                    // process is not our child (see `PosixReap`'s own doc on that distinction) — a
+                    // `waitpid` on it would `ECHILD`, so its real parent/`init` reaps it, same as before.
                     for pid, anchor in adoptedPids do
                         Native.Posix.killAdopted pid anchor |> ignore)
                 grace
+
+        member _.SoftStopScope() =
+            // `killpg`/`signalTracked` reaches every tracked group leader and its descendants
+            // unconditionally — always the whole tracked tree, on every live membership (the one
+            // documented escapee, a `setsid`'d child, is the same weakening the kill-on-drop guarantee
+            // already has — not new to the soft stop), so this needs no native read at all.
+            SoftStopScope.WholeTree
 
         member _.SignalChild(spawned, signal) =
             let pgid = int spawned.Handle

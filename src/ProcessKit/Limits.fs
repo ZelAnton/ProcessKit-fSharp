@@ -6,6 +6,140 @@ open System.Collections.Generic
 module internal Limits =
     let DefaultStopGrace = TimeSpan.FromSeconds 2.0
 
+/// A Unix **per-process** resource governed by `setrlimit(2)` and requested through
+/// `Command.Rlimit` — the per-child complement of the whole-tree `ResourceLimits` below.
+///
+/// The two are different instruments and neither replaces the other. A `ResourceLimits` cap is
+/// enforced by the group's kernel container on every process in the tree AT ONCE (one memory budget
+/// shared by all of them); an rlimit is applied to the direct child before its program starts and is
+/// then INHERITED individually by each descendant, so ten descendants each get their own copy of the
+/// cap rather than a shared one. A descendant may lower its own limits further, and may raise its
+/// soft value back up as far as the hard value it inherited — an rlimit is a robustness bound, not a
+/// containment boundary (that is what the group is for).
+///
+/// Every value is in the resource's own native unit, exactly as the syscall takes it: **bytes** for
+/// `Core`/`Data`/`FileSize`/`Stack`, **seconds** for `Cpu`, a **count** for `NoFile`. There is no
+/// "unlimited" value — this API exists to LOWER a limit the child inherited, and raising a hard limit
+/// needs privilege the kernel refuses to an ordinary caller (the refusal is honest: the child never
+/// runs).
+///
+/// **Unix-only**, and honestly so: Windows has no `setrlimit` analogue, so a spawn carrying any rlimit
+/// fails there with `ProcessError.Unsupported` rather than running the child uncapped. On POSIX the
+/// limits are applied before the child's own program starts by the util-linux `prlimit` helper, loaded
+/// only from a trusted system directory; a host that holds it in none of them (macOS/BSD, a minimal
+/// image) fails with `ProcessError.ResourceLimit` — see `Command.Rlimit` for the full mechanism.
+[<RequireQualifiedAccess; NoComparison>]
+type RlimitResource =
+
+    /// Maximum CPU time in **seconds** (`RLIMIT_CPU`). The soft value raises `SIGXCPU` (which
+    /// terminates a child that does not handle it), the hard value is an unblockable `SIGKILL`.
+    /// This is the one axis the whole-tree `ResourceLimits.CpuTimeMax` also targets — see
+    /// `Command.Rlimit` for how the two compose.
+    | Cpu
+
+    /// Maximum size in **bytes** of a core dump (`RLIMIT_CORE`). `0, 0` disables core dumps outright,
+    /// which is the honest default for a child handling secrets: a core file is a verbatim copy of
+    /// its memory, written where the host's core pattern says rather than where this process decides.
+    | Core
+
+    /// Maximum size in **bytes** of the process data segment (`RLIMIT_DATA`) — the `brk`/`mmap`
+    /// allocation arena on Linux, so an allocation past it fails inside the child (an allocator
+    /// error) rather than taking memory from the rest of the host.
+    | Data
+
+    /// Maximum size in **bytes** of a file the process may create or extend (`RLIMIT_FSIZE`). A write
+    /// past the soft value raises `SIGXFSZ`; a child that handles or blocks it gets `EFBIG` instead.
+    /// The cap a runaway log or an unbounded temp file needs.
+    | FileSize
+
+    /// Maximum **number** of simultaneously open file descriptors (`RLIMIT_NOFILE`). Counts the
+    /// descriptors ProcessKit itself hands the child (its stdio, any `Command.ExtraFd` channel), so
+    /// leave headroom for them.
+    | NoFile
+
+    /// Maximum size in **bytes** of the process stack (`RLIMIT_STACK`). Bounds runaway recursion in
+    /// the child's main thread; a thread the child creates itself is governed by whatever stack size
+    /// that child requests.
+    | Stack
+
+    /// Every resource, in a fixed order — the enumerable form of the set `Name`/`TryFromName` map
+    /// between, so a config layer can validate or document the accepted spellings without keeping its
+    /// own copy of the list (which could silently fall behind a new resource).
+    static member All: IReadOnlyList<RlimitResource> =
+        [| RlimitResource.Cpu
+           RlimitResource.Core
+           RlimitResource.Data
+           RlimitResource.FileSize
+           RlimitResource.NoFile
+           RlimitResource.Stack |]
+
+    /// This resource's **stable machine identifier**: a short, lowercase `snake_case` string, part of
+    /// the library's compatibility surface. Use it wherever a resource has to travel as text — a
+    /// config file's key, a CLI flag, a structured log field — instead of hand-maintaining a mapping
+    /// table. It is a diagnostic identifier rather than a wire format, but it is held stable all the
+    /// same: a new resource gets a NEW identifier and an existing one is never renamed within a major
+    /// version. `TryFromName` parses it back.
+    member this.Name: string =
+        match this with
+        | RlimitResource.Cpu -> "cpu"
+        | RlimitResource.Core -> "core"
+        | RlimitResource.Data -> "data"
+        | RlimitResource.FileSize -> "file_size"
+        | RlimitResource.NoFile -> "no_file"
+        | RlimitResource.Stack -> "stack"
+
+    /// Parse a stable `Name` identifier back into a resource, or `None` for anything that is not
+    /// EXACTLY one of them (matching is ordinal and case-sensitive: `"NoFile"` and `"nofile"` are both
+    /// misses, only `"no_file"` hits). An honest miss, never a silent default — a config-driven caller
+    /// that mistypes a resource gets nothing back to apply, instead of a limit quietly landing on the
+    /// wrong axis or on none at all. Round-trips with `Name` for every resource.
+    static member TryFromName(name: string) : RlimitResource option =
+        RlimitResource.All |> Seq.tryFind (fun resource -> resource.Name = name)
+
+    /// `TryFromName` for a caller that wants the miss as an error instead of an option — an unknown
+    /// name raises `ArgumentException` listing every accepted spelling, so a mistyped config key fails
+    /// where it is read rather than silently applying no limit. `null` raises `ArgumentNullException`.
+    static member FromName(name: string) : RlimitResource =
+        ArgumentNullException.ThrowIfNull(name, nameof name)
+
+        match RlimitResource.TryFromName name with
+        | Some resource -> resource
+        | None ->
+            let accepted =
+                RlimitResource.All
+                |> Seq.map (fun resource -> resource.Name)
+                |> String.concat ", "
+
+            raise (
+                ArgumentException($"'{name}' is not a known rlimit resource; expected one of: {accepted}", nameof name)
+            )
+
+/// One per-process rlimit as configured on a `Command`: the resource, and the soft and hard values to
+/// apply to it — the pair `setrlimit(2)` itself takes. Read back from `Command.Rlimits`; built by
+/// `Command.Rlimit`, which validates the pair at the builder boundary.
+///
+/// The **soft** value is the limit actually in force (exceeding it raises this resource's signal or
+/// fails the operation); the **hard** value is the ceiling the child may raise its own soft value back
+/// up to. Both are in the resource's native unit (see `RlimitResource`), and `Soft` never exceeds
+/// `Hard`.
+[<Sealed>]
+type Rlimit internal (resource: RlimitResource, soft: int64, hard: int64) =
+
+    /// The resource this pair caps.
+    member _.Resource = resource
+
+    /// The soft limit — the value in force for the child, in the resource's native unit.
+    member _.Soft = soft
+
+    /// The hard limit — the ceiling the child may raise its own soft value back to, in the resource's
+    /// native unit. Never below `Soft`.
+    member _.Hard = hard
+
+    /// The canonical one-line rendering `<name>=<soft>:<hard>` (e.g. `no_file=64:128`), built from the
+    /// resource's stable `Name` — what a diagnostic (a dry-run render, a log line) shows for this
+    /// limit. Carries no argv or environment value, so it is safe to log.
+    override _.ToString() = $"{resource.Name}={soft}:{hard}"
+
 /// The Windows Job Object **UI restrictions** a process group can impose on its whole tree
 /// (`JOBOBJECT_BASIC_UI_RESTRICTIONS`) — see `ProcessGroupOptions.WithUiRestrictions`.
 ///

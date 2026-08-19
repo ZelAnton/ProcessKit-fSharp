@@ -143,7 +143,15 @@ type internal SyntheticBackend() =
         member _.GracefulKillTree (_signal) (_grace) =
             requireLive "GracefulKillTree"
             lock gate (fun () -> gracefulKillTreeCount <- gracefulKillTreeCount + 1)
-            Task.CompletedTask
+
+            Task.FromResult
+                { Soft = SoftDelivery.Sent
+                  Drained = true
+                  Escalated = false }
+
+        member _.SoftStopScope() =
+            requireLive "SoftStopScope"
+            SoftStopScope.WholeTree
 
         member _.SignalChild(_spawned, _signal) = Ok()
 
@@ -264,7 +272,14 @@ type internal CtrlSignalRaceBackend() =
         member _.PidOf(spawned) = Some(int spawned.Handle)
         member _.KillChild(_spawned) = ()
         member _.KillTree() = Ok()
-        member _.GracefulKillTree (_signal) (_grace) = Task.CompletedTask
+
+        member _.GracefulKillTree (_signal) (_grace) =
+            Task.FromResult
+                { Soft = SoftDelivery.Sent
+                  Drained = true
+                  Escalated = false }
+
+        member _.SoftStopScope() = SoftStopScope.OptInMembers
         member _.SignalChild(_spawned, _signal) = Ok()
 
         member _.Members() =
@@ -385,8 +400,13 @@ type internal InheritedPipeBackend() =
 
         member _.GracefulKillTree (_signal) (_grace) =
             lock gate (fun () -> gracefulKillTreeCount <- gracefulKillTreeCount + 1)
-            Task.CompletedTask
 
+            Task.FromResult
+                { Soft = SoftDelivery.Sent
+                  Drained = true
+                  Escalated = false }
+
+        member _.SoftStopScope() = SoftStopScope.WholeTree
         member _.SignalChild(_spawned, _signal) = Ok()
 
         member _.Members() =
