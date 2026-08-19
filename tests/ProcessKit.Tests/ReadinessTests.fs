@@ -14,6 +14,7 @@ open System.Threading
 open System.Threading.Tasks
 open NUnit.Framework
 open ProcessKit
+open ProcessKit.Native
 open ProcessKit.Testing
 
 type private ReadinessHttpHandler() =
@@ -278,6 +279,38 @@ type ReadinessTests() =
         with :? IOException ->
             // Best-effort cleanup only; leaving a stray temp file behind is not a test failure.
             ()
+
+    // A minimal single-connection Windows named pipe server bound to a fresh, unique pipe name (mirrors
+    // `startUnixSocketListener`'s shape). `WaitForNamedPipeAsync` only probes that a client-side open
+    // succeeds; it never exchanges data or keeps the connection. The caller is responsible for disposing
+    // the returned `NamedPipeServerStream`. Windows-only — every call site guards on
+    // `RuntimeInformation.IsOSPlatform OSPlatform.Windows` first.
+    let startNamedPipeListener () : System.IO.Pipes.NamedPipeServerStream * string =
+        let name = $"processkit-{Guid.NewGuid():N}"
+
+        let server =
+            new System.IO.Pipes.NamedPipeServerStream(name, System.IO.Pipes.PipeDirection.InOut, 1)
+
+        let accept =
+            task {
+                try
+                    do! server.WaitForConnectionAsync()
+                with
+                | :? ObjectDisposedException
+                | :? IOException ->
+                    // Disposed during test cleanup, possibly before a client ever connected; nothing
+                    // left to observe.
+                    ()
+            }
+
+        accept.ContinueWith(
+            (fun (finished: Task) -> finished.Exception |> ignore),
+            TaskContinuationOptions.OnlyOnFaulted
+            ||| TaskContinuationOptions.ExecuteSynchronously
+        )
+        |> ignore
+
+        server, name
 
     // `syntheticProcess` over a caller-supplied `CommandConfig` — the only reason to reach for this
     // overload is to hand the handle a non-default `TimeProvider` (see `ManualReadinessClock`), since the
@@ -2052,6 +2085,257 @@ type ReadinessTests() =
             finally
                 Directory.Delete(childDir, true)
                 Directory.Delete(elsewhereDir, true)
+        }
+        :> Task
+
+    // The platform-support gate (`ReadinessProbe.namedPipeSupported`) is factored out as a predicate
+    // specifically so both branches are testable without depending on the actual host's OS — see its
+    // doc comment. These two tests exercise the gate directly, deterministic on every CI host.
+    [<Test>]
+    member _.``WaitForNamedPipe support gate reports Unsupported when the host has no Windows named-pipe support``() =
+        match ReadinessProbe.namedPipeSupported (fun () -> false) with
+        | Error(ProcessError.Unsupported _) -> Assert.Pass()
+        | other -> Assert.Fail $"expected Unsupported, got {other}"
+
+    [<Test>]
+    member _.``WaitForNamedPipe support gate passes through when the host supports Windows named pipes``() =
+        match ReadinessProbe.namedPipeSupported (fun () -> true) with
+        | Ok() -> Assert.Pass()
+        | other -> Assert.Fail $"expected Ok, got {other}"
+
+    // Name resolution (`ReadinessProbe.resolveNamedPipeName`), pure and cross-platform: a bare name is
+    // resolved under the local `\\.\pipe\` namespace, while an already-qualified path — local or a
+    // remote server's UNC form — passes through unchanged. Mirrors the source Rust crate's
+    // `wait_for_pipe` resolution rule.
+    [<Test>]
+    member _.``WaitForNamedPipe resolves a bare name under the local pipe namespace``() =
+        Assert.That(ReadinessProbe.resolveNamedPipeName "my-service", Is.EqualTo(@"\\.\pipe\my-service"))
+
+    [<Test>]
+    member _.``WaitForNamedPipe leaves an already-qualified local pipe path unchanged``() =
+        let path = @"\\.\pipe\my-service"
+        Assert.That(ReadinessProbe.resolveNamedPipeName path, Is.EqualTo path)
+
+    [<Test>]
+    member _.``WaitForNamedPipe leaves an already-qualified remote pipe path unchanged``() =
+        let path = @"\\server\pipe\my-service"
+        Assert.That(ReadinessProbe.resolveNamedPipeName path, Is.EqualTo path)
+
+    // The native seam (`Native.Windows.classifyNamedPipeOpen`), pure and cross-platform: a testable seed
+    // that classifies a `CreateFileW` attempt's outcome from synthetic `handle`/`lastError` inputs, with
+    // no real named-pipe server involved. See its doc comment for what each case means and why
+    // `ERROR_PIPE_BUSY` classifies as `Ready` rather than `Missing` or a fourth, distinct case.
+    [<Test>]
+    member _.``classifyNamedPipeOpen reports Ready for a valid handle``() =
+        match Windows.classifyNamedPipeOpen (nativeint 1234) 0 with
+        | Windows.NamedPipeProbeOutcome.Ready -> Assert.Pass()
+        | other -> Assert.Fail $"expected Ready, got {other}"
+
+    [<Test>]
+    member _.``classifyNamedPipeOpen reports Ready for ERROR_PIPE_BUSY even though the handle is invalid``() =
+        match Windows.classifyNamedPipeOpen IntPtr.Zero 231 with
+        | Windows.NamedPipeProbeOutcome.Ready -> Assert.Pass()
+        | other -> Assert.Fail $"expected Ready (ERROR_PIPE_BUSY proves a server exists), got {other}"
+
+    [<Test>]
+    member _.``classifyNamedPipeOpen reports Missing for ERROR_FILE_NOT_FOUND``() =
+        match Windows.classifyNamedPipeOpen IntPtr.Zero 2 with
+        | Windows.NamedPipeProbeOutcome.Missing -> Assert.Pass()
+        | other -> Assert.Fail $"expected Missing, got {other}"
+
+    [<Test>]
+    member _.``classifyNamedPipeOpen reports Missing for ERROR_PATH_NOT_FOUND``() =
+        match Windows.classifyNamedPipeOpen IntPtr.Zero 3 with
+        | Windows.NamedPipeProbeOutcome.Missing -> Assert.Pass()
+        | other -> Assert.Fail $"expected Missing, got {other}"
+
+    [<Test>]
+    member _.``classifyNamedPipeOpen reports a distinct OpenFailed for any other error, never folded into Missing``() =
+        // ERROR_ACCESS_DENIED (5) — a genuinely different failure from "not created yet", which must stay
+        // separately classified rather than being silently collapsed into `Missing`.
+        match Windows.classifyNamedPipeOpen IntPtr.Zero 5 with
+        | Windows.NamedPipeProbeOutcome.OpenFailed 5 -> Assert.Pass()
+        | other -> Assert.Fail $"expected OpenFailed 5, got {other}"
+
+    [<Test>]
+    member _.``WaitForNamedPipe connects to a listening named pipe``() : Task =
+        task {
+            if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
+                Assert.Ignore "Windows-only: exercises the named-pipe readiness probe"
+
+            let server, name = startNamedPipeListener ()
+
+            try
+                // A never-completing `Wait` models a child that stays running throughout the probe (KB
+                // K-044): an immediately-resolving one would spuriously trigger the early-exit race this
+                // test is not exercising.
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForNamedPipeAsync(@"\\.\pipe\" + name, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.Pass()
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                server.Dispose()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForNamedPipe accepts a bare pipe name, resolved under the local namespace``() : Task =
+        task {
+            if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
+                Assert.Ignore "Windows-only: exercises the named-pipe readiness probe"
+
+            let server, name = startNamedPipeListener ()
+
+            try
+                use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+                match! running.WaitForNamedPipeAsync(name, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.Pass()
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                server.Dispose()
+        }
+        :> Task
+
+    // `ERROR_PIPE_BUSY` still counts as ready (K-043-style choke point, and the source Rust crate's own
+    // contract): every instance of a single-instance pipe is occupied by another client, but that PROVES
+    // a server created the pipe, so a probe must not report it as absent.
+    [<Test>]
+    member _.``WaitForNamedPipe treats a busy single-instance pipe as ready``() : Task =
+        task {
+            if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
+                Assert.Ignore "Windows-only: exercises the named-pipe readiness probe"
+
+            let name = $"processkit-{Guid.NewGuid():N}"
+
+            use server =
+                new System.IO.Pipes.NamedPipeServerStream(name, System.IO.Pipes.PipeDirection.InOut, 1)
+
+            let acceptTask = server.WaitForConnectionAsync()
+
+            use occupied =
+                new System.IO.Pipes.NamedPipeClientStream(".", name, System.IO.Pipes.PipeDirection.InOut)
+
+            do! occupied.ConnectAsync(2000)
+            do! acceptTask
+
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+
+            match! running.WaitForNamedPipeAsync(name, TimeSpan.FromSeconds 3.0) with
+            | Ok() -> Assert.Pass()
+            | Error error -> Assert.Fail $"expected ERROR_PIPE_BUSY to count as ready, got {error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForNamedPipe returns NotReady when nothing is listening on the pipe name``() : Task =
+        task {
+            if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
+                Assert.Ignore "Windows-only: exercises the named-pipe readiness probe"
+
+            let name = $"processkit-{Guid.NewGuid():N}"
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForNamedPipeAsync(name, TimeSpan.FromMilliseconds 250.0) with
+            | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    // Early-exit contract, named-pipe probe: a child that has already exited must resolve to `NotReady`
+    // promptly rather than polling the pipe name out for the full timeout — the same behaviour
+    // `WaitForPortAsync`/`WaitForSocketAsync`/`WaitForPathAsync` give (see the equivalent tests above).
+    [<Test>]
+    member _.``WaitForNamedPipe returns NotReady promptly when the child has already exited``() : Task =
+        task {
+            if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
+                Assert.Ignore "Windows-only: exercises the named-pipe readiness probe"
+
+            let name = $"processkit-{Guid.NewGuid():N}"
+            use running = syntheticProcess (Task.FromResult(Outcome.Exited 1))
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForNamedPipeAsync(name, TimeSpan.FromSeconds 5.0) with
+            | Error(ProcessError.NotReady _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected early NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForNamedPipe is cancelled by the external token while the pipe never appears``() : Task =
+        task {
+            if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
+                Assert.Ignore "Windows-only: exercises the named-pipe readiness probe"
+
+            let name = $"processkit-{Guid.NewGuid():N}"
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            use cts = new CancellationTokenSource(TimeSpan.FromMilliseconds 100.0)
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForNamedPipeAsync(name, TimeSpan.FromSeconds 30.0, cts.Token) with
+            | Error(ProcessError.Cancelled _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 3.0))
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForNamedPipe rejects a null pipe name``() : Task =
+        task {
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            let nullName = Unchecked.defaultof<string>
+
+            Assert.Throws<ArgumentNullException>(
+                Action(fun () -> running.WaitForNamedPipeAsync(nullName, TimeSpan.FromSeconds 1.0) |> ignore)
+            )
+            |> ignore
+        }
+        :> Task
+
+    // FakeProcess parity (mirrors the WaitForPath test above): a fake handle IS a real `RunningProcess`
+    // built over in-memory streams (`FakeProcess.Build`), so it inherits every readiness verb —
+    // including this new one — through the same construction path, with no separate wiring needed in
+    // `FakeProcess`/`Cassette` themselves.
+    [<Test>]
+    member _.``WaitForNamedPipe works against a FakeProcess double, same as a real handle``() : Task =
+        task {
+            if not (RuntimeInformation.IsOSPlatform OSPlatform.Windows) then
+                Assert.Ignore "Windows-only: exercises the named-pipe readiness probe"
+
+            let server, name = startNamedPipeListener ()
+
+            try
+                use running = FakeProcess.Create().Build()
+
+                match! running.WaitForNamedPipeAsync(name, TimeSpan.FromSeconds 3.0) with
+                | Ok() -> Assert.Pass()
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                server.Dispose()
+        }
+        :> Task
+
+    // The platform gate fires BEFORE the shared exit race starts (KB K-043/K-016), the same contract
+    // `WaitForSocket reports Unsupported promptly...` proves for `AF_UNIX`: a synthetic host whose `Wait`
+    // never completes would hang if `WaitForNamedPipeAsync` ever awaited `raceReadinessAgainstExit`'s
+    // exit race for it, so a prompt result here demonstrates the gate is checked up front. Only
+    // meaningful on a non-Windows host — skipped on Windows, where the tests above already cover the
+    // supported-host wiring.
+    [<Test>]
+    member _.``WaitForNamedPipe reports Unsupported promptly, without racing the child's exit, on a non-Windows host``
+        ()
+        : Task =
+        task {
+            if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                Assert.Ignore "this host is Windows; covered instead by the real-dial tests above"
+
+            use running = syntheticProcess (TaskCompletionSource<Outcome>().Task)
+            let elapsed = Stopwatch.StartNew()
+
+            match! running.WaitForNamedPipeAsync("nonexistent-pipe", TimeSpan.FromSeconds 5.0) with
+            | Error(ProcessError.Unsupported _) -> Assert.That(elapsed.Elapsed, Is.LessThan(TimeSpan.FromSeconds 1.0))
+            | other -> Assert.Fail $"expected Unsupported, got {other}"
         }
         :> Task
 

@@ -617,6 +617,18 @@ fallback to an unhardened child. The cross-platform pair is rejected at the *bui
 the spawn because each half is `Unsupported` on the platform the other half needs, so such a command
 could not run anywhere. See [commands.md](commands.md) and [hardening.md](hardening.md).
 
+**Windows named-pipe readiness probe (`RunningProcess.WaitForNamedPipeAsync`)**
+
+| Capability | Windows | Linux / macOS / BSD (POSIX) |
+|---|:---:|:---:|
+| Wait for a named pipe endpoint to accept a client | ✅ `CreateFileW`, tried against duplex/read-only/write-only client access | ❌ `ProcessError.Unsupported`, checked before any poll attempt |
+| A pipe busy with another client (`ERROR_PIPE_BUSY`) | ✅ counts as **ready** — proves a server created the pipe | n/a |
+
+Symmetric with `WaitForSocketAsync`'s `AF_UNIX` gate: this probe is Windows-only because a Windows
+named pipe has no portable equivalent, and every other platform fails immediately with a typed
+`ProcessError.Unsupported`, never a silent downgrade to some other transport or an inevitable hang. See
+[Readiness probes](streaming.md#readiness-probes).
+
 ### Pseudo-terminal (PTY) capabilities
 
 `Command.Pty` gives a child a controlling terminal and one merged stdout+stderr stream. Every
