@@ -4479,6 +4479,17 @@ module internal Windows =
         ProcessError.Unsupported
             "Command.Rlimit is a Unix per-process setrlimit(2) primitive; Windows has no equivalent (use ProcessGroupOptions resource limits for whole-tree Job Object caps)"
 
+    /// The honest typed refusal for `Command.IoPriority` on Windows — again the ONE message both Windows
+    /// spawn paths give. `Unsupported` for the same reason the rlimit refusal is: Windows has no
+    /// per-process I/O-scheduling class or level to set at all. Its nearest relatives are a whole-Job
+    /// disk bandwidth/IOPS ceiling (`ResourceLimits.WithIoMax`, a rate cap rather than a priority) and a
+    /// process priority class, which `Command.Priority` already covers on the CPU axis — neither is an
+    /// honest stand-in for ordering this child's disk requests against everyone else's, so the request is
+    /// refused before any spawn work rather than quietly dropped.
+    let private ioPriorityUnsupportedOnWindows: ProcessError =
+        ProcessError.Unsupported
+            "Command.IoPriority is a Linux ioprio_set(2) primitive; Windows has no per-process I/O scheduling class (use ProcessGroupOptions.WithIoMax for a whole-tree disk rate cap, or Command.Priority for the CPU axis)"
+
     let spawnWindows (job: nativeint) (command: Command) : Result<Spawned, ProcessError> =
         // `Command.Umask`/`Uid`/`Gid`/`Groups`/`Setsid`/`Arg0`/`Rlimit` are Unix-only primitives with no
         // Windows equivalent (a file-mode creation mask, `setuid`/`setgid`/supplementary-group privilege
@@ -4497,6 +4508,8 @@ module internal Windows =
             )
         elif not config.Rlimits.IsEmpty then
             Error rlimitUnsupportedOnWindows
+        elif config.IoPriority.IsSome then
+            Error ioPriorityUnsupportedOnWindows
         elif config.StopSignal <> Signal.Term then
             Error(
                 ProcessError.Unsupported
@@ -4610,16 +4623,24 @@ module internal Windows =
         let config = command.Config
 
         match
-            config.Umask, config.Uid, config.Gid, config.Setsid, config.Groups, config.Arg0, config.Rlimits.IsEmpty
+            config.Umask,
+            config.Uid,
+            config.Gid,
+            config.Setsid,
+            config.Groups,
+            config.Arg0,
+            config.Rlimits.IsEmpty,
+            config.IoPriority
         with
-        | Some _, _, _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
-        | _, Some _, _, _, _, _, _ -> Error(ProcessError.Unsupported "uid")
-        | _, _, Some _, _, _, _, _ -> Error(ProcessError.Unsupported "gid")
-        | _, _, _, true, _, _, _ -> Error(ProcessError.Unsupported "setsid")
-        | _, _, _, _, Some _, _, _ -> Error(ProcessError.Unsupported "groups")
-        | _, _, _, _, _, Some _, _ -> Error(ProcessError.Unsupported "arg0")
-        | _, _, _, _, _, _, false -> Error rlimitUnsupportedOnWindows
-        | None, None, None, false, None, None, true ->
+        | Some _, _, _, _, _, _, _, _ -> Error(ProcessError.Unsupported "umask")
+        | _, Some _, _, _, _, _, _, _ -> Error(ProcessError.Unsupported "uid")
+        | _, _, Some _, _, _, _, _, _ -> Error(ProcessError.Unsupported "gid")
+        | _, _, _, true, _, _, _, _ -> Error(ProcessError.Unsupported "setsid")
+        | _, _, _, _, Some _, _, _, _ -> Error(ProcessError.Unsupported "groups")
+        | _, _, _, _, _, Some _, _, _ -> Error(ProcessError.Unsupported "arg0")
+        | _, _, _, _, _, _, false, _ -> Error rlimitUnsupportedOnWindows
+        | _, _, _, _, _, _, _, Some _ -> Error ioPriorityUnsupportedOnWindows
+        | None, None, None, false, None, None, true, None ->
             // Decide the launch (PATHEXT / effective-child-`PATH` substitution / cmd.exe batch wrapper)
             // BEFORE any handle is allocated, exactly as `spawnWindowsCore` does — an unsafe batch
             // argument, or a program the command's own overridden child `PATH` does not hold, is refused

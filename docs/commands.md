@@ -1255,6 +1255,106 @@ transcribe it finds the same six spellings in the generated dictionary
   `exec`s the target by name and has no seam for a distinct `argv[0]` (the same
   refusal a `Uid`/`Gid` drop, `Pty`, or a cgroup-backend run gives).
 
+### Linux I/O scheduling priority (`IoPriority`)
+
+**`IoPriority(priority)`** sets the child's — and its whole spawned tree's — **Linux
+I/O-scheduling** priority, so bulk disk work yields to whoever is using the same
+device interactively. It is a **separate axis** from the CPU-scheduling
+[`Priority`](#spawn-flags) and not a substitute for it: `Priority` decides how much
+*processor* the child gets, this decides how its *block-device requests are ordered*.
+A background job usually wants both.
+
+Three classes are typed as `IoPriorityClass`, and values are built by the factories on
+`IoPriority`:
+
+| Value | Class | Level | Privilege |
+|---|---|---|---|
+| `IoPriority.Idle` | `Idle` | none — the kernel ignores the field | none |
+| `IoPriority.BestEffort level` | `BestEffort` | `0` (highest) … `7` (lowest) | none |
+| `IoPriority.RealTime level` | `RealTime` | `0` (highest) … `7` (lowest) | `CAP_SYS_ADMIN` (or `CAP_SYS_NICE` on Linux 5.14+) |
+
+**Lower levels mean higher priority** — the kernel's own convention, and the opposite
+of how `Priority` reads. `BestEffort 7` is the usual "yield, but keep making progress"
+setting; `Idle` is the politest of all, running only while the device is otherwise
+idle.
+
+**F#**
+
+```fsharp
+task {
+    // A bulk indexer that must not slow down whoever is using this disk.
+    let! _ =
+        (Command.create "indexer"
+         |> Command.arg "--rebuild"
+         |> Command.ioPriority (IoPriority.BestEffort 7))
+            .RunAsync()
+
+    ()
+}
+```
+
+**C#**
+
+```csharp
+// A bulk indexer that must not slow down whoever is using this disk.
+await new Command("indexer")
+    .Arg("--rebuild")
+    .IoPriority(IoPriority.BestEffort(7))
+    .RunAsync();
+```
+
+A `level` outside `0..IoPriority.MaxLevel` (`7`) is rejected with
+`ArgumentOutOfRangeException` where the value is built — never clamped into range, and
+never carried as far as the kernel. Repeating the builder replaces the request (last
+write wins), and the default leaves the inherited I/O priority untouched.
+
+**A config-driven caller** can name a class by its **stable identifier** — `"idle"`,
+`"best_effort"`, `"real_time"` — through `IoPriorityClass.TryFromName` (an option,
+`None` on a miss) or `IoPriorityClass.FromName` (the same lookup, raising
+`ArgumentException` and listing every accepted spelling), with `IoPriorityClass.All`
+enumerating the set. The identifiers are held stable across a major version and appear
+in the generated dictionary `spec/identifiers.json` under `ProcessKit.IoPriorityClass`
+— see [Stable identifiers](jsonl-reports.md#stable-identifiers). The *level* is a plain
+number the caller supplies, so it is not part of that vocabulary.
+
+**When it takes effect, and how far it reaches.** Linux copies the creating task's I/O
+priority into a new task and the value survives `exec`, so ProcessKit arms the
+**spawning thread** with the request across the spawn itself and restores it
+immediately after. The consequence worth knowing is that the priority is in force for
+the child's **first** block-device request — before its program runs — rather than from
+some moment after it started, and every descendant it later forks inherits it. It rides
+through every helper `exec` on the POSIX path untouched, so it composes with
+`Uid`/`Gid`, `Pty`, `Arg0`, [`Rlimit`](#per-process-resource-limits-rlimit) and a
+cgroup-contained group with no extra helper binary and no argv change (unlike `Rlimit`,
+it needs no util-linux on the host).
+
+**How it fails — never a silent downgrade:**
+
+- **On Windows, macOS, and the BSDs** — `ioprio_set(2)` is a Linux system call with no
+  equivalent there, so the spawn fails with `ProcessError.Unsupported` rather than
+  running the child at the inherited priority. Windows' nearest relatives are a
+  whole-tree disk *rate* cap (`ProcessGroupOptions.WithIoMax`) and the CPU-side
+  `Priority`; neither is an honest stand-in, so neither is substituted.
+- **On a detached launch** — `Command.LaunchDetached` refuses it with
+  `ProcessError.Unsupported` on **every** platform, Linux included. The setting is
+  applied by the owner across the spawn, and that verb deliberately gives ownership up.
+  (The CPU-axis `Priority` is honoured there, because it is not owner-applied.)
+- **Without the privilege** — a `RealTime` request the kernel refuses fails the spawn
+  with `ProcessError.Spawn`, never a quiet fall back to best-effort.
+- **On a kernel without the call** — a build (or a seccomp filter) answering `ENOSYS`,
+  or a Linux architecture whose `ioprio_set` system call number ProcessKit does not
+  know, is a typed `ProcessError.Unsupported`.
+
+**What it does not promise.** The class and level are recorded on the child
+unconditionally, but whether they change the order requests are actually *served* in is
+the block device's I/O scheduler's decision: Linux honours I/O priorities under **BFQ**
+(and the historical CFQ), while `mq-deadline`, `kyber`, and `none` — the common
+defaults for NVMe — largely ignore them. This builder asks the kernel for a priority;
+it cannot promise a scheduler that acts on it.
+
+`DryRunRunner` renders the request as `(io_priority: best_effort:7)`, so a preview never
+reports a weaker command than the one that would run.
+
 ### Windows privilege drop (restricted token & integrity level)
 
 Two **Windows-only** builders are the counterpart of the Unix drop above. They do
@@ -1506,6 +1606,7 @@ can never look applied when nothing will ever enforce it:
 |---|---|
 | `Pty` | a pseudo-terminal is a live parent-side device that must be owned and pumped |
 | `KillOnParentDeath` | it asks the OS to kill the child with us — the opposite of detaching |
+| `IoPriority` | the Linux I/O priority is applied by the **owner** across the spawn itself, and this verb gives ownership up (the CPU-axis `Priority` *is* honoured — it is not owner-applied) |
 | `Timeout` / `TimeoutGrace` / `IdleTimeout` | a deadline needs a parent watchdog that can still kill |
 | `CancelOn` / `CancelGrace` | cancelling means killing, the very control this verb gives up (and nothing is left to run the grace) |
 | `Stdin` (a feeder source) | feeding stdin needs a parent-side pump (`InheritStdin` *is* supported) |

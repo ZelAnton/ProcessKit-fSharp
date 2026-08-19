@@ -71,6 +71,10 @@
 		<Compile Include="Timeouts.fs" />
 		<Compile Include="Backoff.fs" />
 		<Compile Include="Priority.fs" />
+		<!-- The Linux I/O-scheduling axis, next to the CPU-scheduling one it is deliberately
+		     separate from. Needs nothing above it and is consumed by Command.fs (the builder
+		     knob) and Native.Posix.fs (the ioprio_set encoding). -->
+		<Compile Include="IoPriority.fs" />
 		<Compile Include="LineTerminator.fs" />
 		<Compile Include="RotatingFileSink.fs" />
 		<Compile Include="Command.fs" />

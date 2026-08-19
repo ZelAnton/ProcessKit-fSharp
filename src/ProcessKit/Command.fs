@@ -215,6 +215,16 @@ type internal CommandConfig =
       // The child's CPU-scheduling priority, applied at spawn (Windows priority class / Unix nice).
       // `None` (the default) leaves the OS default untouched.
       Priority: Priority option
+      // The child's LINUX I/O-scheduling priority (`ioprio_set(2)`) — a separate axis from the CPU
+      // `Priority` above. `None` (the default) leaves the inherited I/O priority untouched,
+      // byte-identical to before this knob existed. Linux-only: a set value fails a Windows, macOS, or
+      // BSD spawn with `ProcessError.Unsupported`, never a silent drop, and is refused outright on the
+      // detached launch (which has no owner to apply it for). On Linux it is applied by setting the
+      // spawning thread's own I/O priority across the `posix_spawnp` window: the kernel copies the
+      // calling task's I/O priority into the child at clone time and it survives every `execve`, so the
+      // child's first block-device request already runs at the requested priority — see
+      // `Native.Posix.withIoPriority`.
+      IoPriority: IoPriority option
       // The child's Unix file-mode creation mask (`umask(2)`), applied at spawn on the POSIX path.
       // `None` (the default) leaves the inherited umask untouched. Unix-only: a set value fails a
       // Windows spawn with `ProcessError.Unsupported` (there is no Windows equivalent), never a silent
@@ -365,6 +375,7 @@ module internal CommandConfig =
           CreateNoWindow = false
           WindowsCtrlSignals = false
           Priority = None
+          IoPriority = None
           Umask = None
           Rlimits = ImmutableList<Rlimit>.Empty
           Uid = None
@@ -1488,6 +1499,46 @@ type Command internal (config: CommandConfig) =
     member _.Priority(priority: Priority) =
         Command({ config with Priority = Some priority })
 
+    /// Set the **Linux I/O-scheduling priority** of the child — and of the tree it spawns — so that
+    /// background disk work yields to the interactive users of the same device. A separate axis from the
+    /// CPU-scheduling `Priority` above and not a substitute for it: that one decides how much *processor*
+    /// the child gets, this one how its *block-device* requests are ordered. Build the value with
+    /// `IoPriority.Idle` / `IoPriority.BestEffort level` / `IoPriority.RealTime level`, which validate the
+    /// level at construction; the default (unset) leaves the inherited I/O priority untouched. Last write
+    /// wins, like every other builder knob.
+    ///
+    /// **How far it reaches, and when it takes effect.** The kernel copies the spawning task's I/O
+    /// priority into the child when the child is created and it survives every `exec`, so the priority is
+    /// in force for the child's very FIRST block-device request — before its program runs — and is
+    /// inherited by every descendant the child later forks. There is no spawn-then-apply window here (the
+    /// one the CPU `Priority` axis documents for its post-spawn `setpriority`), and no helper binary is
+    /// involved, so it composes unchanged with a `Uid`/`Gid` drop, a `Pty`, a cgroup-contained group, a
+    /// `Command.Rlimit` set, and `Command.Arg0` alike.
+    ///
+    /// **Linux-only, and honestly so.** `ioprio_set(2)` is a Linux system call with no Win32 or POSIX
+    /// equivalent, so a spawn carrying an I/O priority fails with `ProcessError.Unsupported` on
+    /// **Windows, macOS, and the BSDs** rather than running the child at the inherited priority as if
+    /// the request had been honoured. `Command.LaunchDetached` refuses it on the same terms — that verb
+    /// deliberately gives up ownership of the child, and this is an owner-applied setting.
+    ///
+    /// **Privilege.** `Idle` and `BestEffort` need none. `RealTime` needs `CAP_SYS_ADMIN` (Linux ≥ 5.14
+    /// accepts `CAP_SYS_NICE` too); without it the kernel refuses the request and the spawn fails with
+    /// `ProcessError.Spawn` — never a silent downgrade to best-effort. A kernel or sandbox with no
+    /// `ioprio_set` at all (a seccomp filter returning `ENOSYS`) is a typed `ProcessError.Unsupported`.
+    ///
+    /// **What it does not promise.** The class and level are recorded on the child unconditionally, but
+    /// whether they change the *order requests are served in* is the block device's I/O scheduler's
+    /// decision: Linux honours I/O priorities under **BFQ** (and the historical CFQ), while `mq-deadline`,
+    /// `kyber`, and `none` — the common defaults for NVMe — largely ignore them. This knob asks the
+    /// kernel for a priority; it cannot promise a scheduler that acts on it. See `IoPriority`.
+    member _.IoPriority(priority: IoPriority) =
+        ArgumentNullException.ThrowIfNull(priority, nameof priority)
+
+        Command(
+            { config with
+                IoPriority = Some priority }
+        )
+
     /// Set the child's Unix file-mode creation mask (`umask(2)`), controlling the default permissions
     /// of files it creates — pass the value you would give the `umask` shell builtin (e.g. `0o022`).
     /// Only the low permission bits are meaningful, as with the syscall itself. **Unix-only:** on
@@ -2056,6 +2107,13 @@ module Command =
     /// Launch the child (and its spawned tree) at a lower/higher CPU-scheduling priority (Windows
     /// priority class / Unix nice). Supported on both platforms; the default leaves the OS default.
     let priority (level: Priority) (command: Command) = command.Priority level
+
+    /// Set the child's **Linux I/O-scheduling** priority (`ioprio_set(2)`) — the block-device axis, not
+    /// the CPU one `priority` sets. Build the value with `IoPriority.Idle`/`IoPriority.BestEffort`/
+    /// `IoPriority.RealTime`. In force from the child's first disk request and inherited by its
+    /// descendants. Linux-only: a set value fails a Windows/macOS/BSD spawn — and a detached launch —
+    /// with `ProcessError.Unsupported`. See `Command.IoPriority`.
+    let ioPriority (level: IoPriority) (command: Command) = command.IoPriority level
 
     /// Set the child's Unix file-mode creation mask (`umask(2)`). Unix-only: a set mask fails a Windows
     /// spawn with `ProcessError.Unsupported`. The default leaves the inherited umask untouched.

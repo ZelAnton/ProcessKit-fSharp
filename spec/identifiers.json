@@ -95,6 +95,15 @@
         { "variant": "NoFile", "identifier": "no_file" },
         { "variant": "Stack", "identifier": "stack" }
       ]
+    },
+    {
+      "path": "ProcessKit.IoPriorityClass",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Idle", "identifier": "idle" },
+        { "variant": "BestEffort", "identifier": "best_effort" },
+        { "variant": "RealTime", "identifier": "real_time" }
+      ]
     }
   ]
 }

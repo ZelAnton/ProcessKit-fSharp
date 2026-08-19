@@ -10,7 +10,14 @@ open NUnit.Framework
 open ProcessKit
 
 /// Rebuilds the committed `spec/identifiers.json` dictionary from the **live** cases of `Mechanism`,
-/// `Signal`, `Outcome`, `ProcessError`, `LimitVerdict`, `SupervisionEventKind`, and `RlimitResource`.
+/// `Signal`, `Outcome`, `ProcessError`, `LimitVerdict`, `SupervisionEventKind`, `RlimitResource`, and
+/// `IoPriorityClass`.
+///
+/// **Adding a public vocabulary is a deliberate step here.** The reflection guard below keeps each type
+/// already in the dictionary complete, but nothing detects a brand-new public type with a stable string
+/// identifier that was never added to it at all — no match goes non-exhaustive, no test turns red. When a
+/// task introduces one (as T-387 did with `IoPriorityClass`), it belongs in `dictionary`, in `published`,
+/// and in the class assertion, in the same change.
 ///
 /// Two independent guards keep the dictionary and the types in step, and neither can be satisfied by
 /// editing a list maintained by hand:
@@ -19,7 +26,8 @@ open ProcessKit
 ///     itself emits that name through: `StableIdentifiers` for the five unions (wildcard free matches, so
 ///     a case added without an identifier fails the library build, warnings being errors),
 ///     `SupervisionEventPayload.eventName` for the supervision event kinds, and the public
-///     `RlimitResource.Name` for the rlimit resources, which spell themselves next to their cases
+///     `RlimitResource.Name` / `IoPriorityClass.Name` for the rlimit resources and the I/O scheduling
+///     classes, which spell themselves next to their cases
 ///     because that same string is what `TryFromName` parses back. Nothing in this file spells
 ///     a wire name, so the dictionary and what ProcessKit emits are one vocabulary rather than two
 ///     copies of one: `ReportJson` writes an `Outcome`'s and a `LimitEvidence` axis's identifier from
@@ -176,7 +184,16 @@ module internal IdentifiersManifest =
           { Path = "ProcessKit.RlimitResource"
             Class = "configurable"
             Type = typeof<RlimitResource>
-            Identifier = fun value -> Some (unbox<RlimitResource> value).Name } ]
+            Identifier = fun value -> Some (unbox<RlimitResource> value).Name }
+          // `IoPriorityClass` names itself for exactly the same reason `RlimitResource` does: its `Name`
+          // is the spelling `TryFromName`/`FromName` parse back and the one an `IoPriority` renders, so
+          // it is declared next to the cases in `IoPriority.fs` rather than in `StableIdentifiers`. The
+          // levelled classes' LEVEL is not part of this vocabulary — it is a number the caller supplies,
+          // not a case that could be named — so the dictionary publishes the three classes only.
+          { Path = "ProcessKit.IoPriorityClass"
+            Class = "configurable"
+            Type = typeof<IoPriorityClass>
+            Identifier = fun value -> Some (unbox<IoPriorityClass> value).Name } ]
 
     /// The `(path, class, [| variant, identifier |])` rows the manifest publishes — the structure the
     /// text below renders, and what the structural assertions read.
@@ -316,7 +333,8 @@ type IdentifiersManifestTests() =
             "Data=data"
             "FileSize=file_size"
             "NoFile=no_file"
-            "Stack=stack" ] ]
+            "Stack=stack" ]
+          "ProcessKit.IoPriorityClass", [ "Idle=idle"; "BestEffort=best_effort"; "RealTime=real_time" ] ]
 
     /// A JSON string property, with the `string | null` the BCL declares narrowed to a plain string —
     /// every string this document carries is written by the generator and is never null.
@@ -432,6 +450,7 @@ type IdentifiersManifestTests() =
         Assert.That(classes["ProcessKit.LimitVerdict"], Is.EqualTo "report_only")
         Assert.That(classes["ProcessKit.SupervisionEventKind"], Is.EqualTo "report_only")
         Assert.That(classes["ProcessKit.RlimitResource"], Is.EqualTo "configurable")
+        Assert.That(classes["ProcessKit.IoPriorityClass"], Is.EqualTo "configurable")
 
     /// Paths are unique across the dictionary, and identifiers are unique and lower snake case within
     /// each type — a duplicate would make the dictionary ambiguous for the consumers that key on it.
@@ -565,6 +584,20 @@ type IdentifiersManifestTests() =
 
             Assert.That(resource.Name, Is.EqualTo identifier)
             Assert.That(RlimitResource.TryFromName identifier, Is.EqualTo(Some resource))
+
+    /// The same tie for `IoPriorityClass`, the second published vocabulary the library parses as well as
+    /// spells: a config layer that reads a class name out of the dictionary and hands it to
+    /// `IoPriorityClass.FromName` can never be given a string the parser rejects.
+    [<Test>]
+    member _.``Every IoPriorityClass identifier is a name TryFromName parses back``() =
+        let classIdentifiers = identifiersOf "ProcessKit.IoPriorityClass"
+
+        for name, value in IdentifiersManifest.caseValues typeof<IoPriorityClass> do
+            let ioClass = unbox<IoPriorityClass> value
+            let identifier = classIdentifiers[name]
+
+            Assert.That(ioClass.Name, Is.EqualTo identifier)
+            Assert.That(IoPriorityClass.TryFromName identifier, Is.EqualTo(Some ioClass))
 
     /// The rendered form the drift guard compares is the same one the structural assertions read, so a
     /// row that renders differently from what it publishes cannot pass both.

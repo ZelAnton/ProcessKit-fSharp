@@ -91,13 +91,14 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
   `*.approved.txt`. An unreviewed API change fails the build.
 - **The stable identifiers are locked too.** [`spec/identifiers.json`](spec/identifiers.json)
   is the machine readable dictionary of the wire names for `Mechanism`, `Signal`,
-  `Outcome`, `ProcessError`, `LimitVerdict`, `SupervisionEventKind`, and
-  `RlimitResource`. It is
+  `Outcome`, `ProcessError`, `LimitVerdict`, `SupervisionEventKind`,
+  `RlimitResource`, and `IoPriorityClass`. It is
   generated, never hand edited: `IdentifiersManifestTests` rebuilds it from the live
   cases and fails on any difference. Adding a case to one of the five unions is a
   compile error until it is named in `src/ProcessKit/StableIdentifiers.fs`; adding an
-  `RlimitResource` is a compile error until it is named in its own wildcard free
-  `Name` member in `src/ProcessKit/Limits.fs`, which is also the spelling
+  `RlimitResource` or an `IoPriorityClass` is a compile error until it is named in that
+  type's own wildcard free `Name` member (`src/ProcessKit/Limits.fs`,
+  `src/ProcessKit/IoPriority.fs`), which is also the spelling
   `TryFromName` parses back; adding a
   `SupervisionEventKind` compiles (F# enum matches carry a wildcard arm) but fails that
   test until it is named in `SupervisionEventPayload.eventName`, next to the events
@@ -108,8 +109,8 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
   pin these strings, so a rename breaks them even when the .NET API is untouched.
   **A new stable string vocabulary has to be registered by hand** in that generator's
   `dictionary` list: the compiler and the drift test between them guarantee that a type
-  already in the dictionary stays complete, but neither can notice a seventh or eighth
-  type that was never added, so adding one is part of introducing it.
+  already in the dictionary stays complete, but neither can notice a ninth type that was
+  never added, so adding one is part of introducing it.
 
 ## API reference site
 

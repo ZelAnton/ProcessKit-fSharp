@@ -296,6 +296,191 @@ module internal Posix =
     [<DllImport("libc", SetLastError = true)>]
     extern int private setpriority(int which, int who, int prio)
 
+    // ----------------------------------------------------------------------------------
+    // ioprio_set(2) / ioprio_get(2) — the Linux I/O-scheduling priority (`Command.IoPriority`)
+    // ----------------------------------------------------------------------------------
+    //
+    // Reached through the raw `syscall(2)` entry point rather than a libc wrapper on purpose: glibc grew
+    // `ioprio_set`/`ioprio_get` wrappers only in 2.39 (2024) and musl has none at all, so binding the
+    // named symbols would fail to resolve on Ubuntu 22.04 and on every Alpine image — hosts this library
+    // supports and tests on. `syscall` itself is ancient and present in both. It is variadic in C, but
+    // its integer arguments are passed in exactly the registers a fixed-arity call puts them in on the
+    // Linux ABIs this targets, and glibc/musl implement it in assembly that reads nothing else — so a
+    // fixed-arity P/Invoke of it is correct here. Every argument is declared `nativeint` (C `long`),
+    // which is what the wrapper forwards; the kernel truncates each to the `int` its own prototype takes.
+    //
+    // `IOPRIO_WHO_PROCESS` with `who = 0` means "the calling thread", which is the only form used here
+    // (see `withIoPriority` for why the priority is armed on the spawning thread rather than pushed onto
+    // the child afterwards).
+    let private IOPRIO_WHO_PROCESS = 1n
+
+    [<DllImport("libc", SetLastError = true, EntryPoint = "syscall")>]
+    extern nativeint private ioprioSetSyscall(nativeint number, nativeint which, nativeint who, nativeint ioprio)
+
+    [<DllImport("libc", SetLastError = true, EntryPoint = "syscall")>]
+    extern nativeint private ioprioGetSyscall(nativeint number, nativeint which, nativeint who)
+
+    // The `__NR_ioprio_set` / `__NR_ioprio_get` pair for this machine, or `None` when there is none to be
+    // sure of. Linux system call NUMBERS are per-architecture, and there is no runtime way to ask for
+    // one — so the table is spelled out, and an architecture that is NOT in it yields `None` rather than
+    // a guess. That matters more than usual here: a wrong number would not fail, it would invoke a
+    // COMPLETELY DIFFERENT system call, so the honest answer for an unknown machine is a typed
+    // `ProcessError.Unsupported` (`ioPriorityUnsupported`) and never a number that happens to be right
+    // elsewhere.
+    //
+    // The OS check is part of the same guard rather than only a caller's precondition, and for the same
+    // reason: `libc` resolves on macOS too, where these numbers name entirely different BSD system calls.
+    // The spawn entry points already refuse a non-Linux host up front (`ioPriorityPlatformUnsupported`);
+    // this makes it impossible for a future caller to reach the raw `syscall` there by mistake.
+    //
+    // Sources are each architecture's own `unistd.h`: x86-64 251/252, i386 289/290, arm (EABI) 314/315,
+    // s390x 282/283, powerpc 273/274, and 30/31 for every port on the generic ABI table
+    // (`asm-generic/unistd.h`) — arm64, riscv64, loongarch64. Read once at load: neither the OS nor the
+    // architecture can change under a running process.
+    //
+    // `Architecture.RiscV64` is matched by its numeric value because the enum member only exists from
+    // .NET 9 and this library also targets net8.0, where naming it would not compile. The enum's
+    // numbering is public BCL contract, so this is a spelling workaround, not a guess.
+    [<Literal>]
+    let private ArchitectureRiscV64 = 9
+
+    let private ioprioSyscallNumbers: (nativeint * nativeint) option =
+        if not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) then
+            None
+        else
+            match RuntimeInformation.ProcessArchitecture with
+            | Architecture.X64 -> Some(251n, 252n)
+            | Architecture.X86 -> Some(289n, 290n)
+            | Architecture.Arm
+            | Architecture.Armv6 -> Some(314n, 315n)
+            | Architecture.S390x -> Some(282n, 283n)
+            | Architecture.Ppc64le -> Some(273n, 274n)
+            | Architecture.Arm64
+            | Architecture.LoongArch64 -> Some(30n, 31n)
+            | other when int other = ArchitectureRiscV64 -> Some(30n, 31n)
+            | _ -> None
+
+    /// Test seam (internal, not public API): overrides the `ioprio_set` that arms the spawning thread,
+    /// so a test can force the kernel's privilege refusal (the `IoPriorityClass.RealTime` case) or its
+    /// `ENOSYS` deterministically — regardless of what capabilities the test host happens to hold — and
+    /// exercise the honest typed spawn refusal. Takes the encoded `ioprio` value and returns the syscall
+    /// return (`0` for success, `-1` for failure), exactly as the real call does. Production leaves it
+    /// `None`. Only the ARMING call is intercepted: the restore that puts the calling thread back always
+    /// goes to the kernel, so a seam can never leave a test host's thread at a priority it did not have.
+    let mutable ioprioSetForTests: (int -> nativeint) option = None
+
+    // errno `ENOSYS` — "function not implemented". The one `ioprio_set`/`ioprio_get` failure that is a
+    // CAPABILITY gap rather than a refusal of this particular request: a kernel built without the call,
+    // or a seccomp filter answering for it. Reported as `ProcessError.Unsupported` (this host cannot do
+    // it at all) where every other errno is a `ProcessError.Spawn` (this attempt was refused) — the same
+    // split the rest of the library draws between the two cases.
+    [<Literal>]
+    let private ENOSYS = 38
+
+    /// The honest typed refusal for a requested `Command.IoPriority` this host cannot apply at all: a
+    /// non-Linux POSIX platform (macOS, the BSDs — `ioprio_set(2)` is a Linux system call with no
+    /// equivalent there), or a Linux architecture whose system call numbers this library does not know.
+    /// Never a child running at the inherited I/O priority as if the request had been honoured.
+    let ioPriorityUnsupported (reason: string) : ProcessError =
+        ProcessError.Unsupported
+            $"Command.IoPriority is a Linux ioprio_set(2) primitive; {reason} (there is no portable equivalent to stand in for it)"
+
+    /// The refusal for a non-Linux POSIX host — the check every POSIX spawn entry point makes before any
+    /// launch work, mirroring the `KillOnParentDeath` gate right next to it. `None` = nothing requested,
+    /// or a Linux host that can honour it.
+    let ioPriorityPlatformUnsupported (config: CommandConfig) : ProcessError option =
+        if config.IoPriority.IsNone || RuntimeInformation.IsOSPlatform OSPlatform.Linux then
+            None
+        else
+            Some(ioPriorityUnsupported "this POSIX host is not Linux (macOS and the BSDs have no such system call)")
+
+    /// Arm the CALLING THREAD with `priority`'s I/O-scheduling class and level, returning the action that
+    /// restores the priority it had before. Linux only; the caller has already refused every other
+    /// platform (`ioPriorityPlatformUnsupported`).
+    ///
+    /// **Why the parent's own thread rather than the child.** The obvious port of the Rust source's
+    /// `pre_exec` hook — run `ioprio_set` in the forked child before it `exec`s — is not available on
+    /// .NET (no managed code may run post-`fork` on CoreCLR; see the `setpriv` section further down), and
+    /// `posix_spawn` has no I/O-priority attribute. But this axis needs neither: Linux COPIES the
+    /// creating task's I/O priority into a new task at clone time (`copy_io`), and the value survives
+    /// `execve`, so setting it on the thread that is about to `posix_spawnp` puts the child's very first
+    /// block-device request at the requested priority — the same guarantee the `pre_exec` hook gives, and
+    /// strictly better than the post-spawn `setpriority` the CPU `Priority` axis has to settle for (which
+    /// documents a spawn-to-apply window). It is inherited onward by every descendant the child forks,
+    /// and it rides through every helper `exec` this file builds (`setpriv`, `prlimit`, the
+    /// `setsid --ctty` pty shim, the `/bin/sh` cgroup launcher) untouched — so this composes with all of
+    /// them without a single argv change, and `Command.Arg0` needs no refusal here.
+    ///
+    /// This is the same shape as `Command.Umask`, whose mask is likewise set on the parent around the
+    /// spawn and restored after, for the same "no `pre_exec` hook on .NET" reason. It is the NARROWER of
+    /// the two: an I/O priority lives on the task (thread), not the process, so only the spawning thread
+    /// is affected for the length of one `posix_spawnp` — but the call site still holds `umaskSpawnLock`
+    /// across the window, since every spawn takes it anyway.
+    ///
+    /// A failure is reported before any child exists: `ENOSYS` (no such call on this kernel, or a seccomp
+    /// filter) as `ProcessError.Unsupported`, and anything else — in practice `EPERM` for an
+    /// `IoPriorityClass.RealTime` request without `CAP_SYS_ADMIN` — as `ProcessError.Spawn`. Never a
+    /// child silently running at the priority it inherited.
+    let withIoPriority (program: string) (priority: IoPriority) : Result<(unit -> unit), ProcessError> =
+        match ioprioSyscallNumbers with
+        | None ->
+            Error(
+                ioPriorityUnsupported
+                    $"ProcessKit does not know the ioprio_set system call number for this Linux architecture ({RuntimeInformation.ProcessArchitecture})"
+            )
+        | Some(setNumber, getNumber) ->
+            let failure (verb: string) =
+                let errno = Marshal.GetLastWin32Error()
+
+                if errno = ENOSYS then
+                    ioPriorityUnsupported
+                        "this kernel does not implement it (errno ENOSYS), or a seccomp filter refuses it"
+                else
+                    ProcessError.Spawn(
+                        program,
+                        $"could not {verb} the Linux I/O scheduling priority via ioprio_set (errno {errno}); the real-time I/O class requires CAP_SYS_ADMIN (CAP_SYS_NICE on Linux 5.14 and newer)"
+                    )
+
+            // Read the priority to put back BEFORE changing anything, so a spawn can never leave this
+            // thread carrying a priority the caller never asked for. `-1` is the only error return: `0`
+            // is a legitimate value (the "no class of its own" state a thread starts in).
+            let previous = ioprioGetSyscall (getNumber, IOPRIO_WHO_PROCESS, 0n)
+
+            if previous = -1n then
+                Error(failure "read")
+            else
+                let value = IoPriorityMapping.linuxValue priority
+
+                let applied =
+                    match ioprioSetForTests with
+                    | Some hook -> hook value
+                    | None -> ioprioSetSyscall (setNumber, IOPRIO_WHO_PROCESS, 0n, nativeint value)
+
+                if applied = -1n then
+                    Error(failure "apply")
+                else
+                    Ok(fun () ->
+                        // Restoring cannot legitimately fail: the value came from this very thread a
+                        // moment ago, so it needs no privilege this caller did not already hold. The
+                        // return is dropped rather than raised on because this runs on the way out of a
+                        // spawn that has already succeeded or already failed for its own reason, and a
+                        // restore fault must not replace that outcome.
+                        ioprioSetSyscall (setNumber, IOPRIO_WHO_PROCESS, 0n, previous) |> ignore)
+
+    /// Test seam (internal, not public API): read a task's own Linux I/O-scheduling priority as the
+    /// KERNEL reports it (`ioprio_get(2)`), encoded exactly as `IoPriorityMapping.linuxValue` produces
+    /// it. `pid` of `0` asks about the calling thread; any other value asks about that task, which is how
+    /// a test can verify what a spawned CHILD actually ended up with rather than what the parent believes
+    /// it asked for — the inheritance-at-clone property the whole mechanism rests on. `None` off Linux,
+    /// on an architecture whose syscall numbers are unknown, or when the kernel refuses the read (the
+    /// process is gone, or this caller may not inspect it).
+    let ioPriorityOfForTests (pid: int) : int option =
+        match ioprioSyscallNumbers with
+        | None -> None
+        | Some(_, getNumber) ->
+            let value = ioprioGetSyscall (getNumber, IOPRIO_WHO_PROCESS, nativeint pid)
+            if value = -1n then None else Some(int value)
+
     // umask(2) sets the calling PROCESS's file-mode creation mask and returns the previous one. It is a
     // whole-process attribute (not per-thread, not per-spawn), and `posix_spawn` has no umask attribute
     // of its own (unlike its file-action / flag attributes), so `Command.Umask` is applied by setting
@@ -4109,17 +4294,41 @@ module internal Posix =
                         // no-mask spawn can never observe another spawn's temporarily-set umask. See
                         // `umaskSpawnLock` for why this parent-side set/spawn/restore replaces the Rust
                         // source's child-side `pre_exec` hook.
+                        let spawnUnderUmask () =
+                            match config.Umask with
+                            | None -> spawnUnderLock ()
+                            | Some mask ->
+                                let previous = umask mask
+
+                                try
+                                    spawnUnderLock ()
+                                finally
+                                    umask previous |> ignore
+
+                        // A requested Linux I/O-scheduling priority is armed on THIS THREAD for the same
+                        // window, and for the same reason the umask is: `posix_spawn` has no attribute for
+                        // it and no managed code may run in a forked child. The kernel copies the creating
+                        // task's I/O priority into the child, so the child's first block-device request
+                        // already runs at it (see `withIoPriority`). A kernel refusal — the privileged
+                        // real-time class, most realistically — is reported HERE, before any child exists:
+                        // `ioPriorityRefusal` carries it out of the lock and past the child-side fd
+                        // cleanup below, and the sentinel `rc` steers the flow into the failure branch.
+                        let ioPriorityRefusal = ref (None: ProcessError option)
+
                         let rc, pid =
                             lock umaskSpawnLock (fun () ->
-                                match config.Umask with
-                                | None -> spawnUnderLock ()
-                                | Some mask ->
-                                    let previous = umask mask
-
-                                    try
-                                        spawnUnderLock ()
-                                    finally
-                                        umask previous |> ignore)
+                                match config.IoPriority with
+                                | None -> spawnUnderUmask ()
+                                | Some priority ->
+                                    match withIoPriority command.Program priority with
+                                    | Error error ->
+                                        ioPriorityRefusal.Value <- Some error
+                                        -1, 0
+                                    | Ok restore ->
+                                        try
+                                            spawnUnderUmask ()
+                                        finally
+                                            restore ())
 
                         // The parent never needs the child-side fds.
                         closeChildSideFds ()
@@ -4127,10 +4336,13 @@ module internal Posix =
                         if rc <> 0 then
                             closeParentEnds ()
 
-                            if rc = ENOENT then
-                                Error(notFoundFromSpawnFailure command)
-                            else
-                                Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
+                            // A refused I/O priority is reported as itself: nothing was spawned at all
+                            // (the arming happens before the `posix_spawnp`), so the sentinel `rc` that
+                            // brought us here is not a `posix_spawn` return to be interpreted as one.
+                            match ioPriorityRefusal.Value with
+                            | Some error -> Error error
+                            | None when rc = ENOENT -> Error(notFoundFromSpawnFailure command)
+                            | None -> Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
                         else
                             // posix_spawnp succeeded: the child is running with pid `pid` (== its own pgid).
                             // Target-number reservations protected the file-action construction only. The
@@ -4816,10 +5028,16 @@ module internal Posix =
         let config = command.Config
 
         // The Windows-only token knobs are refused first, before any other dispatch: a POSIX host has no
-        // restricted token and no integrity label to honour them with. `Arg0` combined with a
-        // helper-routing knob is refused right behind it, for the same "refuse before any child exists"
-        // reason.
-        match windowsOnlyOptionsUnsupported config with
+        // restricted token and no integrity label to honour them with. The Linux-only I/O priority is
+        // refused on the same terms in the other direction (macOS/BSD have no `ioprio_set(2)`), and
+        // `Arg0` combined with a helper-routing knob right behind them — all for the same "refuse before
+        // any child exists" reason.
+        let platformRefusal =
+            match windowsOnlyOptionsUnsupported config with
+            | Some error -> Some error
+            | None -> ioPriorityPlatformUnsupported config
+
+        match platformRefusal with
         | Some error -> Error error
         | None ->
 
@@ -5426,7 +5644,24 @@ module internal Posix =
         // no weaker honesty guarantee than a contained one just because nothing tracks it afterwards.
         // `Pty` never reaches here (the verb layer already refuses it for a detached launch), so
         // `arg0HelperConflict` only ever fires here for the `Uid`/`Gid`/`Groups` drop it also guards.
-        match windowsOnlyOptionsUnsupported config with
+        //
+        // `Command.IoPriority` is refused OUTRIGHT here, on every platform including Linux, rather than
+        // only off Linux as on the contained path: it is applied by the owner across the spawn window,
+        // and a detached launch is precisely the verb that gives ownership up. The verb layer
+        // (`DetachedLaunch.incompatibleKnob`) already refuses it with a message naming the verb; this is
+        // the second, native-side gate, so the knob can never be silently dropped by some other caller of
+        // this function.
+        let platformRefusal =
+            match windowsOnlyOptionsUnsupported config with
+            | Some error -> Some error
+            | None when config.IoPriority.IsSome ->
+                Some(
+                    ioPriorityUnsupported
+                        "a detached launch applies no owner-dependent setting to the child it lets go (use StartAsync/RunAsync instead)"
+                )
+            | None -> None
+
+        match platformRefusal with
         | Some error -> Error error
         | None ->
 

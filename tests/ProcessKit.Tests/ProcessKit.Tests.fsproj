@@ -39,6 +39,7 @@
 		<Compile Include="ReportJsonTests.fs" />
 		<Compile Include="IdentifiersManifestTests.fs" />
 		<Compile Include="LimitsTests.fs" />
+		<Compile Include="IoPriorityTests.fs" />
 		<Compile Include="CapabilityTests.fs" />
 		<Compile Include="CassetteTests.fs" />
 		<Compile Include="CassetteRobustnessTests.fs" />

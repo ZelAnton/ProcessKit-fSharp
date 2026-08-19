@@ -110,6 +110,7 @@ class ProcessKit.Command
   member Groups(System.Collections.Generic.IEnumerable<System.Int32>) : ProcessKit.Command
   member IdleTimeout(System.TimeSpan) : ProcessKit.Command
   member InheritStdin() : ProcessKit.Command
+  member IoPriority(ProcessKit.IoPriority) : ProcessKit.Command
   member KeepStdinOpen() : ProcessKit.Command
   member KillOnParentDeath() : ProcessKit.Command
   member KillOnParentDeathScope() : ProcessKit.KillOnParentDeathScope
@@ -183,6 +184,7 @@ module ProcessKit.CommandModule
   static member groups(System.Collections.Generic.IEnumerable<System.Int32>, ProcessKit.Command) : ProcessKit.Command
   static member idleTimeout(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member inheritStdin(ProcessKit.Command) : ProcessKit.Command
+  static member ioPriority(ProcessKit.IoPriority, ProcessKit.Command) : ProcessKit.Command
   static member keepStdinOpen(ProcessKit.Command) : ProcessKit.Command
   static member killOnParentDeath(ProcessKit.Command) : ProcessKit.Command
   static member killOnParentDeathScope(ProcessKit.Command) : ProcessKit.KillOnParentDeathScope
@@ -318,6 +320,51 @@ class ProcessKit.IoMax
   property Target : System.String { get }
   property WriteBytesPerSecond : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
   property WriteOperationsPerSecond : Microsoft.FSharp.Core.FSharpOption<System.Int64> { get }
+
+class ProcessKit.IoPriority
+  member Equals(System.Object) : System.Boolean
+  member GetHashCode() : System.Int32
+  member ToString() : System.String
+  property Class : ProcessKit.IoPriorityClass { get }
+  property Idle : ProcessKit.IoPriority { get }
+  property Level : System.Int32 { get }
+  property MaxLevel : System.Int32 { get }
+  static member BestEffort(System.Int32) : ProcessKit.IoPriority
+  static member RealTime(System.Int32) : ProcessKit.IoPriority
+
+class ProcessKit.IoPriorityClass
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.IoPriorityClass>
+  member Equals(ProcessKit.IoPriorityClass) : System.Boolean
+  member Equals(ProcessKit.IoPriorityClass, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsBestEffort() : System.Boolean
+  member get_IsIdle() : System.Boolean
+  member get_IsRealTime() : System.Boolean
+  member get_Tag() : System.Int32
+  property All : System.Collections.Generic.IReadOnlyList<ProcessKit.IoPriorityClass> { get }
+  property BestEffort : ProcessKit.IoPriorityClass { get }
+  property Idle : ProcessKit.IoPriorityClass { get }
+  property IsBestEffort : System.Boolean { get }
+  property IsIdle : System.Boolean { get }
+  property IsRealTime : System.Boolean { get }
+  property Name : System.String { get }
+  property RealTime : ProcessKit.IoPriorityClass { get }
+  property Tag : System.Int32 { get }
+  static member FromName(System.String) : ProcessKit.IoPriorityClass
+  static member TryFromName(System.String) : Microsoft.FSharp.Core.FSharpOption<ProcessKit.IoPriorityClass>
+  static member get_BestEffort() : ProcessKit.IoPriorityClass
+  static member get_Idle() : ProcessKit.IoPriorityClass
+  static member get_RealTime() : ProcessKit.IoPriorityClass
+
+module ProcessKit.IoPriorityClass+Tags
+  field literal BestEffort : System.Int32
+  field literal Idle : System.Int32
+  field literal RealTime : System.Int32
 
 class ProcessKit.JobRunner
   :> ProcessKit.IProcessRunner

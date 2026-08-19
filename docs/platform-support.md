@@ -578,6 +578,38 @@ succeeds or fails, so a cap that fired and was later lifted is still answered fr
 than a guessed `NotTripped`. See [Limit Evidence](process-groups.md#limit-evidence) for the API and
 examples.
 
+**Linux I/O scheduling priority (`Command.IoPriority`)**
+
+| Capability | Windows | Linux | macOS / BSD |
+|---|:---:|:---:|:---:|
+| `IoPriority(Idle \| BestEffort level \| RealTime level)` | ❌ `ProcessError.Unsupported` | ✅ `ioprio_set(2)` on the spawning thread, inherited by the child at clone | ❌ `ProcessError.Unsupported` (no such system call) |
+| The same on `Command.LaunchDetached` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` (owner-applied; the verb gives ownership up) | ❌ `ProcessError.Unsupported` |
+| `RealTime` without `CAP_SYS_ADMIN` (`CAP_SYS_NICE` on Linux 5.14+) | — | ❌ `ProcessError.Spawn` | — |
+
+This is a **separate axis** from the CPU-scheduling `Command.Priority`, which is supported on every
+platform and never returns `Unsupported`: `Priority` orders the child's claim on the *processor*,
+`IoPriority` its claim on a *block device*. Windows has no per-process I/O scheduling class at all —
+its nearest relatives are a whole-Job disk *rate* ceiling (`ResourceLimits.WithIoMax`, in the table
+above) and the CPU priority class — so the request is refused rather than approximated, exactly as
+`Command.Rlimit` is.
+
+It needs **no helper binary**: `posix_spawn` has no I/O-priority attribute and no managed code may run
+in a forked child on .NET, but Linux copies the creating task's I/O priority into the new task and the
+value survives `exec`, so ProcessKit arms the spawning thread across the spawn and restores it right
+after. The priority is therefore in force for the child's *first* block-device request, is inherited by
+every descendant, and rides through every helper `exec` on the POSIX path (`setpriv`, `prlimit`,
+`setsid --ctty`, the cgroup launcher) — so unlike `Command.Rlimit` it composes with `Command.Arg0` and
+needs nothing installed on the host. Two remaining honest gaps are typed `ProcessError.Unsupported`
+rather than a silent no-op: a kernel (or seccomp filter) answering `ENOSYS`, and a Linux architecture
+whose `ioprio_set` system call number ProcessKit does not know (x86-64, x86, arm, arm64, riscv64,
+loongarch64, s390x, and ppc64le are known).
+
+**What no platform promises** is that the class changes the order requests are *served* in: Linux
+honours I/O priorities under the **BFQ** scheduler (and the historical CFQ), while `mq-deadline`,
+`kyber`, and `none` — the common defaults for NVMe — largely ignore them. The recording of the class on
+the child is what this builder guarantees. See
+[Running commands](commands.md#linux-io-scheduling-priority-iopriority).
+
 **`argv[0]` override (`Command.Arg0`)**
 
 | Capability | Windows | Linux / macOS / BSD (POSIX) |
