@@ -1497,6 +1497,8 @@ class ProcessKit.RunningProcess
   member WaitForPathAsync(System.String, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForPortAsync(System.Net.IPEndPoint, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member WaitForSocketAsync(System.String, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member WaitForStderrLineAsync(System.Func<System.String, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
+  member WaitForStderrTailAsync(System.Func<System.String, System.Boolean>, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
   property CpuTime : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
   property DroppedStreamLineCount : System.Int32 { get }
   property Elapsed : System.TimeSpan { get }

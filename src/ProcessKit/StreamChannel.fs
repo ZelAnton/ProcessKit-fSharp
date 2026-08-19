@@ -182,6 +182,40 @@ module internal StreamChannel =
     // unbounded on that flood — same reasoning as `pumpToBuffer`'s buffered capture. `isTearingDown` is
     // threaded straight through to `Pump.readLinesUntilDone`'s genuine-vs-teardown-race classification
     // (T-087) — the caller reports whether ITS handle's own teardown has begun.
+    //
+    // `tailObserver` (optional) watches the in-flight, not-yet-framed tail — see `Pump.ITailObserver`.
+    // It changes nothing about the framing or about what `onLine` receives; it exists so a readiness
+    // wait can match a prompt that carries no line terminator, which by construction never reaches
+    // `onLine` until a terminator (or EOF) finally does.
+    let pumpLinesObservingTail
+        (stream: Stream option)
+        encoding
+        terminator
+        tee
+        (onLine: string -> ValueTask)
+        (tailObserver: Pump.ITailObserver option)
+        (maxLineBytes: int option)
+        (isTearingDown: unit -> bool)
+        =
+        task {
+            match stream with
+            | Some s ->
+                do!
+                    Pump.readLinesUntilDoneObservingTail
+                        s
+                        encoding
+                        terminator
+                        tee
+                        onLine
+                        tailObserver
+                        maxLineBytes
+                        isTearingDown
+                        CancellationToken.None
+            | None -> ()
+        }
+
+    // `pumpLinesObservingTail` without an in-flight tail observer — what every pump that only needs
+    // framed lines uses.
     let pumpLines
         (stream: Stream option)
         encoding
@@ -191,18 +225,4 @@ module internal StreamChannel =
         (maxLineBytes: int option)
         (isTearingDown: unit -> bool)
         =
-        task {
-            match stream with
-            | Some s ->
-                do!
-                    Pump.readLinesUntilDone
-                        s
-                        encoding
-                        terminator
-                        tee
-                        onLine
-                        maxLineBytes
-                        isTearingDown
-                        CancellationToken.None
-            | None -> ()
-        }
+        pumpLinesObservingTail stream encoding terminator tee onLine None maxLineBytes isTearingDown

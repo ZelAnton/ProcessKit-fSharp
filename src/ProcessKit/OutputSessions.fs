@@ -151,6 +151,23 @@ type internal OutputSessions
     // `ConsumptionGate` runs under its lock before any consumer can observe the claim.
     let mutable stderrStreamBuffer = Unchecked.defaultof<GuardedLineBuffer>
 
+    // The stderr readiness watch (`StderrReadinessWatch`) — created by the FIRST stderr readiness wait
+    // on this handle and `None` for every run that never asks for one, so the stderr line pump's hot
+    // path costs one volatile read and a handle nobody waits on retains nothing extra. The wait creates
+    // it BEFORE the claim starts the pumps (see `RunningProcess.StartStderrReadiness`), so a wait on a
+    // fresh handle cannot miss stderr the child writes immediately; a wait that joins an already-running
+    // session sees stderr from the moment it arms, which is exactly what the watch's retention then
+    // carries forward between successive waits.
+    let watchGate = obj ()
+    let mutable stderrWatch: StderrReadinessWatch option = None
+
+    // Whether the LINE session's stderr pump is over, and why. Kept next to the watch (and decided
+    // under the same lock) so a wait that arms after the stream already ended is answered with that
+    // ending — the pump's fault if it failed, else "no match" — instead of waiting out its whole
+    // deadline for a pump that can no longer produce anything.
+    let mutable stderrObservationEnded = false
+    let mutable stderrObservationFault: exn option = None
+
     let mutable streamOutcome = Unchecked.defaultof<Task<Outcome>>
     let mutable chunkOutcome = Unchecked.defaultof<Task<Outcome>>
 
@@ -336,6 +353,39 @@ type internal OutputSessions
         | Some cb -> cb.Invoke line
         | None -> ()
 
+    // Show one framed stderr line to the readiness watch, if this handle has one. A run that never
+    // waits on stderr pays one volatile read per line and nothing else.
+    let observeStderrLine (line: string) =
+        match Volatile.Read(&stderrWatch) with
+        | Some watch -> watch.ObserveLine line
+        | None -> ()
+
+    // Show the in-flight (not yet framed) stderr tail to the same watch — see `Pump.ITailObserver` for
+    // what the pump promises here. `Wanted` is the same volatile read, so with no watch the pump never
+    // even materializes a per-chunk string.
+    let stderrTailObserver =
+        { new Pump.ITailObserver with
+            member _.Wanted = (Volatile.Read(&stderrWatch)).IsSome
+
+            member _.Observe text =
+                match Volatile.Read(&stderrWatch) with
+                | Some watch -> watch.ObserveTail text
+                | None -> () }
+
+    // End stderr observation for this handle: the line session's stderr pump finished (cleanly or with
+    // `fault`), or its combined outcome concluded past a pump the post-exit drain bound had to abandon.
+    // The first call decides; a watch created afterwards is born ended, and one already armed is
+    // released at once with the same verdict.
+    let endStderrObservation (fault: exn option) =
+        lock watchGate (fun () ->
+            if not stderrObservationEnded then
+                stderrObservationEnded <- true
+                stderrObservationFault <- fault
+
+            match stderrWatch with
+            | Some watch -> watch.Complete stderrObservationFault
+            | None -> ())
+
     // Reclassify a fault escaping a stdout/stderr pump into a typed `ProcessError.Io` when it is one of
     // the two exception types a genuine OS read fault surfaces as. Only ever reached once the routine
     // teardown-race case has already been excluded: the streaming pumps route through
@@ -447,6 +497,29 @@ type internal OutputSessions
     /// A fresh line capture under this run's `OutputBuffer` policy, owned by the buffered verb that
     /// asks for it (see `GuardedLineBuffer`: the verb, not the pump, must outlive the bound).
     member _.NewCaptureBuffer() = GuardedLineBuffer config.OutputBuffer
+
+    /// This handle's stderr readiness watch, created on first use and shared by every later stderr
+    /// readiness wait (see `stderrWatch`). Called by `RunningProcess`'s stderr readiness verbs — from
+    /// inside the claim that STARTS the line session (so a wait on a fresh handle sees that session's
+    /// stderr from its very first line), and again right after, which is what joins an already-running
+    /// session's watch.
+    ///
+    /// A watch created once the stderr pump is already over is born ended, carrying that pump's fault
+    /// if it failed — so a wait armed too late reports the real ending rather than waiting out its
+    /// whole deadline.
+    member _.EnsureStderrWatch() : StderrReadinessWatch =
+        lock watchGate (fun () ->
+            match stderrWatch with
+            | Some watch -> watch
+            | None ->
+                let watch =
+                    StderrReadinessWatch(StderrReadiness.retentionBytesFor config.OutputBuffer)
+
+                if stderrObservationEnded then
+                    watch.Complete stderrObservationFault
+
+                Volatile.Write(&stderrWatch, Some watch)
+                watch)
 
     /// Line-pump stdout into a caller-owned capture (the buffered text verb).
     member _.PumpStdoutBuffer(buffer: GuardedLineBuffer) : Task =
@@ -620,11 +693,15 @@ type internal OutputSessions
                     ExceptionDispatchInfo.Throw reported
             }
 
+        // The one session whose stderr is watched for readiness (`StderrReadinessWatch`): the stderr
+        // readiness verbs claim exactly this session, and the tail observer below is what lets them see
+        // a prompt that carries no line terminator. The framing is untouched by it, so `OnStderrLine`,
+        // `StderrTee` and the capture receive precisely what they always did.
         let stderrPump =
             task {
                 try
                     do!
-                        StreamChannel.pumpLines
+                        StreamChannel.pumpLinesObservingTail
                             stderrStream
                             config.StderrEncoding
                             config.StderrLineTerminator
@@ -633,13 +710,24 @@ type internal OutputSessions
                                 invokeLine config.OnStderrLine line
                                 bumpStderrLine ()
                                 stderrBuffer.Add line
+                                observeStderrLine line
                                 ValueTask.CompletedTask)
+                            (Some stderrTailObserver)
                             config.OutputBuffer.MaxBytes
                             (fun () -> terminal.DisposalToken.IsCancellationRequested)
+
+                    // Clean EOF: nothing more can arrive on stderr, so a readiness wait must be
+                    // released now with "no match" rather than left waiting out its deadline.
+                    endStderrObservation None
                 with ex ->
                     // A genuine OS read fault is reclassified into `ProcessError.Io` (T-087) before
-                    // it faults the session outcome / `FinishAsync` below.
-                    ExceptionDispatchInfo.Throw(reportedPumpFault ex)
+                    // it faults the session outcome / `FinishAsync` below. A readiness wait is
+                    // released with that same fault, so a real read/decode/handler failure surfaces
+                    // as itself instead of as a spurious readiness timeout — the stderr twin of what
+                    // completing the stdout channel WITH its error does for `WaitForLineAsync`.
+                    let reported = reportedPumpFault ex
+                    endStderrObservation (Some reported)
+                    ExceptionDispatchInfo.Throw reported
             }
 
         // A fault in either pump kills the tree at once, so a still-producing child can't wedge the
@@ -661,6 +749,10 @@ type internal OutputSessions
                 // stream when this session concludes, not wait on a pump nobody owns any more.
                 // Idempotent with the pump's own completion.
                 stdoutChannel.TryComplete() |> ignore
+                // The same belt and braces for the stderr readiness watch: a stderr pump the bound
+                // had to abandon will never end its own observation, and no readiness wait may
+                // outlive this session's conclusion. Idempotent with the pump's own call above.
+                endStderrObservation None
                 return outcome
             }
 

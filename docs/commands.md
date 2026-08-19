@@ -647,7 +647,10 @@ throw `ArgumentException` alongside `MergeStderr`, in either chaining order.
 The remaining stderr knobs are **no-ops** under merge: the merged bytes follow
 stdout's settings, so `StderrEncoding` gives way to `StdoutEncoding`,
 `StderrLineTerminator` to `StdoutLineTerminator`, and the `Stderr` `StdioMode` to
-stdout's destination. Inside a [pipeline](pipelines.md) `MergeStderr` is allowed
+stdout's destination. The live handle's stderr-only verbs say the same thing out loud instead of
+answering about a stream that does not exist: `StderrChunksAsync` and the stderr readiness waits
+(`WaitForStderrLineAsync` / `WaitForStderrTailAsync`) fail with `ProcessError.Unsupported` naming the
+merge — reach for their stdout counterparts, where those bytes actually are. Inside a [pipeline](pipelines.md) `MergeStderr` is allowed
 only on the last stage.
 
 ### Encodings
@@ -928,6 +931,14 @@ Console.WriteLine(await cmd.OutputStringAsync() switch
     { IsOk: false, ErrorValue: var err }   => err.Message,
 });
 ```
+
+The same framing decides what a **readiness wait on stderr** sees. `StderrEncoding` and
+`StderrLineTerminator` are what turn the child's diagnostic bytes into the lines
+`RunningProcess.WaitForStderrLineAsync` matches — exactly the lines `OnStderrLine` receives — and
+`WaitForStderrTailAsync` matches the text between those terminators, for a prompt that never gets
+one (`Password: `). Neither wait takes stderr away from anything: the same lines still reach
+`OnStderrLine`, the `StderrTee` and the captured `Finished.Stderr`/`ProcessResult.Stderr` exactly
+once. See [Streaming → readiness on stderr](streaming.md#readiness-on-stderr-including-a-prompt-with-no-newline).
 
 For a ready-made copy to a `System.IO.Stream` sink — a file, a socket, anything —
 reach for `StdoutTee` / `StderrTee`. Each tee copies the stream's **raw bytes**

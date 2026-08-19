@@ -150,27 +150,33 @@ type RunningProcess
 
     let alreadyConsumedError () = ConsumptionRefusal.error ()
 
-    // Why a byte-exact stderr stream is impossible for THIS run, if it is — the one place that decides
-    // it, so `StderrChunksAsync` refuses honestly (a typed `ProcessError.Unsupported`) instead of
-    // handing back a stream that could only ever be empty. The condition is the ground truth (is there
-    // a parent-side stderr pipe to read at all: `host.Stderr`), never the config alone — a test double
-    // that models a merged run answers exactly as the spawn it stands in for. The config only explains
-    // WHICH configuration removed the stream, so the message names the real cause.
-    let stderrChunksUnsupported () : ProcessError option =
+    // Why THIS run has no parent-side stderr stream, if it has none — the one place that decides it, so
+    // every verb that needs its own view of stderr (`StderrChunksAsync`, the stderr readiness waits)
+    // refuses honestly (a typed `ProcessError.Unsupported`) instead of handing back something that
+    // could only ever be empty or a readiness verdict that could only ever be "not ready". The
+    // condition is the ground truth (is there a parent-side stderr pipe to read at all: `host.Stderr`),
+    // never the config alone — a test double that models a merged run answers exactly as the spawn it
+    // stands in for. The config only explains WHICH configuration removed the stream, so the message
+    // names the real cause, and `mergedAlternative` names the verb to reach for when those bytes are
+    // still there, just merged into stdout.
+    let stderrStreamUnsupported (verb: string) (mergedAlternative: string) : ProcessError option =
         match stderrStream with
         | Some _ -> None
         | None ->
             let reason =
                 if config.MergeStderr then
-                    "this run merges stderr into stdout (MergeStderr), so there is no separate stderr stream; stream the merged bytes with StdoutChunksAsync"
+                    $"this run merges stderr into stdout (MergeStderr), so there is no separate stderr stream; {mergedAlternative}"
                 elif hasPseudoTerminal then
-                    "a PTY run gives the child one terminal device, so there is no separate stderr stream; stream the merged bytes with StdoutChunksAsync"
+                    $"a PTY run gives the child one terminal device, so there is no separate stderr stream; {mergedAlternative}"
                 elif config.StderrFile.IsSome then
                     "this run redirects stderr straight to a file, so there is no parent-side stderr stream to read"
                 else
                     "this run does not pipe stderr, so there is no parent-side stderr stream to read"
 
-            Some(ProcessError.Unsupported $"StderrChunksAsync: {reason}")
+            Some(ProcessError.Unsupported $"{verb}: {reason}")
+
+    let stderrChunksUnsupported () : ProcessError option =
+        stderrStreamUnsupported "StderrChunksAsync" "stream the merged bytes with StdoutChunksAsync"
 
     // Hand `stdoutStream`/`stderrStream` to a readiness probe (`WaitForPortAsync`/`WaitForAsync`) for
     // its background drain — but only a still-`Fresh` handle's pipes: if a buffered verb or a
@@ -1227,6 +1233,31 @@ type RunningProcess
     member private _.StartStdoutStreaming(terminalOnly: bool) : bool =
         gate.TryClaimStdoutStreaming(terminalOnly, (fun () -> sessions.StartLineSession()))
 
+    // Claim (or rejoin) that same stdout LINE-streaming session for a STDERR readiness wait, and hand
+    // back the watch that session's stderr pump feeds (`StderrReadinessWatch`). The stderr readiness
+    // waits are consumers of the very session `WaitForLineAsync`/`StdoutLinesAsync`/`FinishAsync`
+    // share — one claim, one pump per pipe — so they compose with those verbs exactly as those verbs
+    // compose with each other, and can never become a second reader of stderr (the byte-chunk stderr
+    // session, the event session and the buffered verbs all own the pipes outright, so a wait after any
+    // of them is refused by this same gate, as is one after a terminal `FinishAsync` latched the
+    // discard).
+    //
+    // The watch is created INSIDE the claim's session setup, under the gate's lock and before the pumps
+    // exist, so a wait on a fresh handle cannot miss stderr the child writes immediately; the second
+    // call is what joins an already-running session's watch (and creates one for a session another verb
+    // started). `None` means the pipes belong to an incompatible consumer — the ordinary
+    // already-consumed refusal, and no watch is created for a wait that never runs.
+    member private _.StartStderrReadiness() : StderrReadinessWatch option =
+        let claimed =
+            gate.TryClaimStdoutStreaming(
+                false,
+                fun () ->
+                    sessions.EnsureStderrWatch() |> ignore
+                    sessions.StartLineSession()
+            )
+
+        if claimed then Some(sessions.EnsureStderrWatch()) else None
+
     // The byte-chunk counterpart to `StartStdoutStreaming`. It owns the same stdout pipe and stderr
     // capture, but its pump deliberately does no decoding or line framing: one channel item is one
     // non-empty OS read. The claim is reentrant for `FinishAsync`/`ExitTask`, while the public
@@ -1590,6 +1621,152 @@ type RunningProcess
                         ExceptionDispatchInfo.Throw inner
                         return Unchecked.defaultof<_>
             }
+
+    // The shared body of the two stderr readiness waits: the claim, then `WaitForLineAsync`'s exact
+    // deadline/cancellation contract over the stderr watch instead of the stdout channel — one clamped
+    // timeout armed on this run's `TimeProvider`, linked with the caller's token, the caller's token
+    // winning over the deadline, and a genuine pump fault surfacing as itself rather than as a
+    // spurious `NotReady`.
+    member private this.WaitForStderrAsync
+        (
+            verb: string,
+            mode: StderrReadinessMode,
+            predicate: Func<string, bool>,
+            timeout: TimeSpan,
+            cancellationToken: CancellationToken
+        ) : Task<Result<string, ProcessError>> =
+        ArgumentNullException.ThrowIfNull predicate
+
+        match stderrStreamUnsupported verb "wait on the merged stream with WaitForLineAsync" with
+        | Some error ->
+            // No parent-side stderr pipe exists on this run, so this wait could only ever report
+            // "not ready yet" about a stream that does not exist. Refuse before claiming anything, so
+            // the handle is left untouched and every other verb remains available — the same honest
+            // refusal `StderrChunksAsync` gives for the same runs.
+            Task.FromResult(Error error)
+        | None ->
+            match this.StartStderrReadiness() with
+            | None -> Task.FromResult(Error(alreadyConsumedError ()))
+            | Some watch ->
+                task {
+                    // Clamp so an out-of-range timeout can't throw out of the CTS constructor, and
+                    // report the clamped value in `NotReady` — identical to `WaitForLineAsync` above
+                    // and to `ReadinessProbe.waitForCoreUsing`: an over-long requested timeout is
+                    // silently capped at ~24.8 days, so reporting the raw value would claim a budget
+                    // longer than the one actually enforced.
+                    let armedTimeout = Timeouts.clampArmable timeout
+                    use timeoutCts = new CancellationTokenSource(armedTimeout, config.TimeProvider)
+
+                    use linked =
+                        CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)
+
+                    try
+                        match! watch.WaitAsync(mode, predicate, linked.Token) with
+                        | ValueSome text -> return Ok text
+                        | ValueNone ->
+                            // stderr ended (the child exited, or the pipe reached EOF) without the
+                            // predicate ever being satisfied: the readiness condition was never met,
+                            // which is `NotReady` — not an indefinite wait, and not a fault.
+                            return Error(ProcessError.NotReady(config.Program, armedTimeout))
+                    with :? OperationCanceledException ->
+                        // The caller's token wins over the deadline: a cancelled wait is an error, a
+                        // timed-out one is "not ready yet".
+                        if cancellationToken.IsCancellationRequested then
+                            return Error(ProcessError.Cancelled config.Program)
+                        else
+                            return Error(ProcessError.NotReady(config.Program, armedTimeout))
+                }
+
+    /// Wait until a **stderr** line satisfies `predicate`, or fail with `NotReady` after `timeout` (or
+    /// `Cancelled` if `cancellationToken` fires first) — `WaitForLineAsync`'s exact contract, pointed at
+    /// the diagnostic stream, for the many tools that publish their readiness marker there rather than
+    /// on stdout. Returns the line that matched.
+    ///
+    /// Lines are framed with `Command.StderrLineTerminator` and decoded with `Command.StderrEncoding`,
+    /// so this sees precisely what `Command.OnStderrLine`, `StderrTee` and `Finished.Stderr` see —
+    /// never stdout's framing applied to the wrong stream.
+    ///
+    /// **It observes stderr; it does not take it.** The line it matched still reaches the captured
+    /// stderr `FinishAsync` returns, exactly once, together with every line before and after it: this
+    /// wait consumes from its own readiness view of the stream, not from the capture. What it does
+    /// consume is that readiness view — the line it matched, and the lines it skipped past on the way,
+    /// are not offered to a LATER stderr readiness wait, the same way `WaitForLineAsync` consumes the
+    /// stdout lines it reads.
+    ///
+    /// **Composes with the stdout verbs**, because it joins the very same streaming session they use:
+    /// `WaitForLineAsync`, `StdoutLinesAsync`/`StdoutJsonLinesAsync` and a closing `FinishAsync` all
+    /// remain available before and after it, and stdout keeps being drained (and queued for a stream a
+    /// caller may still take) throughout the wait. A verb that owns the pipes outright — the buffered
+    /// captures, `OutputEventsAsync`, either byte-chunk stream, an interactive session — makes this
+    /// return `ProcessError.Unsupported` (already consumed), as does a terminal `FinishAsync` that has
+    /// already discarded the session's stdout. Stderr lines framed BEFORE the first wait on a handle
+    /// whose session another verb had already started are not retained for it (nothing was watching
+    /// yet); between successive waits they are, bounded as described below.
+    ///
+    /// If the child exits (or stderr simply reaches EOF) before the predicate is satisfied, this
+    /// returns `NotReady` promptly rather than waiting out the full `timeout` — and a genuine stderr
+    /// pump failure (a throwing `OnStderrLine`/`StderrTee` handler, a decode or I/O error) surfaces as
+    /// that failure instead of a misleading readiness timeout, exactly as it does through
+    /// `FinishAsync`.
+    ///
+    /// A run with no parent-side stderr stream — `Command.MergeStderr`, a `Command.Pty` run,
+    /// `StderrToFile`, `StdioMode.Inherit`/`Null` — returns `ProcessError.Unsupported` naming which one
+    /// it was, rather than a `NotReady` that would read as "the marker never came" for a stream that
+    /// never existed. Under a merge the marker is in stdout: wait for it with `WaitForLineAsync`.
+    ///
+    /// `predicate` runs on the pump's own thread as each line is framed, so keep it cheap and
+    /// non-blocking (the same rule `Command.OnStderrLine` follows); if it throws, this wait fails with
+    /// that exception and the run itself is unaffected.
+    member this.WaitForStderrLineAsync
+        (predicate: Func<string, bool>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<string, ProcessError>> =
+        this.WaitForStderrAsync(
+            "WaitForStderrLineAsync",
+            StderrReadinessMode.Line,
+            predicate,
+            timeout,
+            cancellationToken
+        )
+
+    /// Wait until the **unterminated tail** of stderr satisfies `predicate` — everything the child has
+    /// written since the last line terminator, matched as it grows, without waiting for a terminator
+    /// that may never come. This is the readiness signal for a newline-free prompt (`Password: `,
+    /// `Continue? [y/N] `, a progress marker) that `WaitForStderrLineAsync` by construction cannot see:
+    /// a line pump holds such text in its assembly buffer until a terminator (or EOF) arrives.
+    /// Returns the tail text that matched.
+    ///
+    /// Everything `WaitForStderrLineAsync` documents about framing/encoding, composition with the
+    /// stdout verbs, the already-consumed refusals, child-exit `NotReady`, pump-fault propagation, the
+    /// `Unsupported` refusal on a run with no separate stderr, and the predicate running on the pump's
+    /// thread applies here identically. The one difference is WHAT the predicate is shown: the
+    /// accumulated tail after each read (`"Pass"`, then `"Password: "` when the rest arrives), plus —
+    /// for content that had already been framed before this wait armed — those whole lines. A tail that
+    /// does end up terminated is offered complete, immediately before the pump frames it, so a marker
+    /// that turns out to have a newline after all still matches here.
+    ///
+    /// **A matched tail is not a line, and is delivered nowhere twice.** The text this returns is still
+    /// in flight in the pump: it reaches `Command.OnStderrLine`, `StderrTee` and the captured
+    /// `Finished.Stderr` exactly once, later, as part of the line it is eventually framed into (or as
+    /// the final unterminated line at EOF). No other verb sees it as an extra line, and none loses it.
+    /// Consuming it here only means the next partial wait starts from what arrives after it.
+    ///
+    /// **Bounded retention.** What this wait needs — the accumulated tail, plus the lines framed
+    /// between one wait and the next — is capped at `OutputBufferPolicy.MaxBytes` when this run set one
+    /// (`Command.OutputBuffer`), else at 64 KiB. At the cap the tail is force-flushed after being
+    /// offered one last time, exactly as `MaxBytes` force-flushes an unterminated line in the capture
+    /// paths, and the retained lines drop oldest-first — so a child that floods stderr with no line
+    /// terminator at all cannot grow this without bound. A marker larger than that cap is the one thing
+    /// this cannot match; raise `MaxBytes` if you have one.
+    member this.WaitForStderrTailAsync
+        (predicate: Func<string, bool>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
+        : Task<Result<string, ProcessError>> =
+        this.WaitForStderrAsync(
+            "WaitForStderrTailAsync",
+            StderrReadinessMode.Tail,
+            predicate,
+            timeout,
+            cancellationToken
+        )
 
     /// Wait until `path` exists on disk — as a file, a directory, or anything else
     /// `File.Exists`/`Directory.Exists` can observe — or fail with `NotReady` once the shared `timeout`

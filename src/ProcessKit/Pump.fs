@@ -30,6 +30,42 @@ module internal Pump =
     let lineWithLf (encoding: Encoding) (text: string) : byte[] =
         lineWithTerminator encoding (defaultInputLineTerminator false) text
 
+    /// Watches a line pump's IN-FLIGHT tail — the decoded text that has arrived since the last line
+    /// terminator and has therefore not been framed into a line yet. It is what a readiness wait on a
+    /// newline-free prompt (`Password: `, `> `) needs and what `onLine` by construction cannot give it:
+    /// a line pump holds such a prompt in its assembly buffer until a terminator (or EOF) finally
+    /// arrives.
+    ///
+    /// **Observation, never consumption.** The observer only looks at the text; the pump's own framing
+    /// is untouched, so the same bytes still reach `onLine` exactly once, as one complete line, and a
+    /// capture/channel fed from `onLine` can never see a tail twice or lose it.
+    ///
+    /// The contract the pump honours:
+    ///
+    /// - `Observe` receives only the text appended SINCE THE PREVIOUS CALL, never the whole tail again,
+    ///   so an observer accumulates (bounded, its own business) rather than re-scanning a growing
+    ///   string per read.
+    /// - It is called at the end of every decoded chunk that added content, and once more immediately
+    ///   BEFORE each `onLine` — so the observer always sees the complete text of a line before the pump
+    ///   frames it away, whether that line ended with a terminator, was force-flushed at the
+    ///   `maxLineBytes` cap, or was the final unterminated one at EOF.
+    /// - A trailing `\r` is held back until the next character resolves it, so an observer never sees a
+    ///   carriage return the framed line will not contain.
+    /// - `onLine` itself is the frame signal: everything reported since the previous `onLine` belongs
+    ///   to the line it is now delivering, and the tail restarts empty afterwards.
+    /// - Calls come from the pump's own read loop, one at a time, in arrival order — an observer's work
+    ///   must therefore be cheap and non-blocking, exactly like a `Command.OnStderrLine` handler's.
+    ///
+    /// `Wanted` is read on the pump's hot path before any per-chunk string is materialized, so a pump
+    /// wired for observation costs nothing at all while nothing is actually watching.
+    type ITailObserver =
+
+        /// Whether anything currently wants the in-flight tail.
+        abstract Wanted: bool
+
+        /// The text appended to the in-flight line since the previous call.
+        abstract Observe: text: string -> unit
+
     /// Accumulates retained output lines under an `OutputBufferPolicy`, tracking cumulative
     /// totals and whether the fail-loud ceiling tripped. Not thread-safe; one per stream.
     ///
@@ -360,6 +396,10 @@ module internal Pump =
     /// draining more of the pipe until the consumer catches up. A buffered sink (a `LineBuffer`) is
     /// synchronous work wrapped in `ValueTask.CompletedTask`, so it costs nothing extra on that path.
     ///
+    /// `tailObserver` (optional) watches the in-flight, not-yet-framed tail as it grows — see
+    /// `ITailObserver` for the exact contract. It observes only; the framing below, and therefore what
+    /// `onLine` receives, is identical with and without one.
+    ///
     /// The line-splitting body itself lives in `readLinesBody`; this function only adds the
     /// `finally`-flush of `tee` (see `flushTeeQuietly`), which must run on every exit path of the read
     /// loop — clean EOF as well as a read failure — not just the happy path.
@@ -368,7 +408,8 @@ module internal Pump =
         (encoding: Encoding)
         (terminator: LineTerminator)
         (tee: Stream option)
-        (onLine: string -> ValueTask)
+        (deliverLine: string -> ValueTask)
+        (tailObserver: ITailObserver option)
         (maxLineBytes: int option)
         (cancellationToken: CancellationToken)
         : Task =
@@ -379,6 +420,55 @@ module internal Pump =
             let line = StringBuilder()
             let lineBytes = ref 0L
             let mutable reading = true
+
+            // How many characters of the current in-flight line the tail observer has already been told
+            // about (see `ITailObserver`: it is told each APPENDED run, never the whole tail again).
+            // Reset to 0 whenever the line is framed away, so the next line's tail starts empty.
+            let mutable tailNotified = 0
+
+            // The part of the in-flight line that is safe to report right now. A trailing '\r' is held
+            // back: under `Lf` framing it disappears when the '\n' that follows lands in the next
+            // decoded chunk, so reporting it would show an observer a carriage return the framed line
+            // does not contain. It is never lost — it is reported as soon as the next character (or the
+            // emit below) resolves it.
+            let observableLength () =
+                if line.Length > 0 && line[line.Length - 1] = '\r' then
+                    line.Length - 1
+                else
+                    line.Length
+
+            // Report the in-flight tail's unreported part. Called at the end of every decoded chunk, so
+            // a prompt that carries no line terminator reaches the observer as soon as it is read
+            // instead of waiting for a terminator that may never come.
+            let observeInFlightTail () =
+                match tailObserver with
+                | Some observer when observer.Wanted ->
+                    let notified = min tailNotified line.Length
+                    let observable = observableLength ()
+
+                    if observable > notified then
+                        observer.Observe(line.ToString(notified, observable - notified))
+                        tailNotified <- observable
+                | _ -> ()
+
+            // The ONE emit path of this body. Every framing site below (a terminator, the
+            // `maxLineBytes` force-flush inside `appendCapped`, the final unterminated line at EOF)
+            // passes the WHOLE current in-flight line here, so the observer's view of that line is
+            // completed — with whatever the chunk-end reports above have not covered yet — before the
+            // line is delivered and the tail restarts. That is what lets a partial-tail observer match
+            // content that turns out to be terminated after all, while the line itself still reaches
+            // `deliverLine` exactly once. `deliverLine` is deliberately not used anywhere else below.
+            let onLine (text: string) : ValueTask =
+                match tailObserver with
+                | Some observer ->
+                    if observer.Wanted && tailNotified < text.Length then
+                        observer.Observe(text.Substring tailNotified)
+
+                    tailNotified <- 0
+                | None -> ()
+
+                deliverLine text
+
             // A leading byte-order mark of the chosen encoding is stripped from the decoded text
             // (GetDecoder, unlike StreamReader, leaves it in). The raw `tee` and OutputBytes stay
             // byte-exact — only decoded text drops the BOM.
@@ -444,6 +534,11 @@ module internal Pump =
                             line.Clear() |> ignore
                             lineBytes.Value <- 0L
                             pos <- newlineIndex + 1
+
+                    // This chunk is scanned; whatever it left unterminated is the tail as it now
+                    // stands, so report it before blocking on the next read (which may never return
+                    // for a child that has published a prompt and is waiting for input).
+                    observeInFlightTail ()
 
                 if line.Length > 0 then
                     if line[line.Length - 1] = '\r' then
@@ -572,6 +667,10 @@ module internal Pump =
                                 pendingCr <- true
                                 pos <- sigIndex + 1
 
+                    // As on the `Lf` path: report what this chunk left unterminated before blocking on
+                    // the next read.
+                    observeInFlightTail ()
+
                 // A trailing CR produced by the decoder flush is resolved after its shared scan.
                 if pendingCr then
                     if crSplits then do! emitLine () else do! appendChar '\r'
@@ -581,15 +680,21 @@ module internal Pump =
         }
         :> Task
 
-    /// Read `stream` to EOF via `readLinesBody`, then flush `tee` (if set) so a buffered tee sink sees
-    /// its last bytes without waiting for the caller to dispose it — on both the clean-EOF path and a
-    /// read-loop failure (the `finally` runs either way). See `flushTeeQuietly`.
-    let readLines
+    /// `readLines` with an in-flight tail observer attached (see `ITailObserver`) — the shape a
+    /// readiness wait on a newline-free prompt needs. The framing, and therefore everything `onLine`
+    /// receives, is identical to `readLines`; the observer only watches what the pump is still
+    /// assembling.
+    ///
+    /// Reads `stream` to EOF via `readLinesBody`, then flushes `tee` (if set) so a buffered tee sink
+    /// sees its last bytes without waiting for the caller to dispose it — on both the clean-EOF path and
+    /// a read-loop failure (the `finally` runs either way). See `flushTeeQuietly`.
+    let readLinesObservingTail
         (stream: Stream)
         (encoding: Encoding)
         (terminator: LineTerminator)
         (tee: Stream option)
         (onLine: string -> ValueTask)
+        (tailObserver: ITailObserver option)
         (maxLineBytes: int option)
         (cancellationToken: CancellationToken)
         : Task =
@@ -601,7 +706,7 @@ module internal Pump =
             let mutable fault: exn option = None
 
             try
-                do! readLinesBody stream encoding terminator tee onLine maxLineBytes cancellationToken
+                do! readLinesBody stream encoding terminator tee onLine tailObserver maxLineBytes cancellationToken
             with ex ->
                 fault <- Some ex
 
@@ -612,6 +717,19 @@ module internal Pump =
             | None -> ()
         }
         :> Task
+
+    /// Read `stream` to EOF, framing lines under `terminator` and handing each to `onLine`, with no
+    /// tail observation — the shape every capture/streaming pump uses.
+    let readLines
+        (stream: Stream)
+        (encoding: Encoding)
+        (terminator: LineTerminator)
+        (tee: Stream option)
+        (onLine: string -> ValueTask)
+        (maxLineBytes: int option)
+        (cancellationToken: CancellationToken)
+        : Task =
+        readLinesObservingTail stream encoding terminator tee onLine None maxLineBytes cancellationToken
 
     /// Classify an `ObjectDisposedException`/`IOException` caught by a background pump
     /// (`readLinesUntilDone`) reading a live child's stdout/stderr pipe. `isTearingDown` is polled
@@ -639,19 +757,29 @@ module internal Pump =
     /// `isTearingDown` still reports `false` — is a real OS-level read failure and is re-raised
     /// (preserving its original stack via `ExceptionDispatchInfo`) so the caller can surface it as
     /// `ProcessError.Io` instead of silently reporting a truncated capture as a success.
-    let readLinesUntilDone
+    let readLinesUntilDoneObservingTail
         (stream: Stream)
         (encoding: Encoding)
         (terminator: LineTerminator)
         (tee: Stream option)
         (onLine: string -> ValueTask)
+        (tailObserver: ITailObserver option)
         (maxLineBytes: int option)
         (isTearingDown: unit -> bool)
         (cancellationToken: CancellationToken)
         : Task =
         task {
             try
-                do! readLines stream encoding terminator tee onLine maxLineBytes cancellationToken
+                do!
+                    readLinesObservingTail
+                        stream
+                        encoding
+                        terminator
+                        tee
+                        onLine
+                        tailObserver
+                        maxLineBytes
+                        cancellationToken
             with
             | :? ObjectDisposedException as ex ->
                 match genuineReadFault isTearingDown ex with
@@ -667,6 +795,29 @@ module internal Pump =
                     ()
         }
         :> Task
+
+    /// `readLinesUntilDoneObservingTail` without an in-flight tail observer — what every background
+    /// pump that only needs framed lines uses.
+    let readLinesUntilDone
+        (stream: Stream)
+        (encoding: Encoding)
+        (terminator: LineTerminator)
+        (tee: Stream option)
+        (onLine: string -> ValueTask)
+        (maxLineBytes: int option)
+        (isTearingDown: unit -> bool)
+        (cancellationToken: CancellationToken)
+        : Task =
+        readLinesUntilDoneObservingTail
+            stream
+            encoding
+            terminator
+            tee
+            onLine
+            None
+            maxLineBytes
+            isTearingDown
+            cancellationToken
 
     /// Read `stream` to EOF as raw decoded TEXT — no line splitting at all — handing each decoded chunk
     /// to `onText` the instant it arrives, and teeing the raw bytes first if a sink is set. The

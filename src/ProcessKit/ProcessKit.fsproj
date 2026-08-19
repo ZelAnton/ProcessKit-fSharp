@@ -106,6 +106,10 @@
 		<Compile Include="ConsumptionGate.fs" />
 		<Compile Include="RunTerminal.fs" />
 		<Compile Include="ExpectWindow.fs" />
+		<!-- The stderr readiness watch the line session feeds (it implements no type from
+		     OutputSessions.fs and only needs Pump's tail-observer contract + OutputPolicy), so it sits
+		     between the expect window and the sessions that fill both. -->
+		<Compile Include="StderrReadiness.fs" />
 		<Compile Include="OutputSessions.fs" />
 		<Compile Include="ReadinessRace.fs" />
 		<Compile Include="RunningProcess.fs" />

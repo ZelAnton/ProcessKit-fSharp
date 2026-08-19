@@ -591,9 +591,10 @@ is launched, and normal supervision teardown still runs.
 
 ## Waiting for a child to be ready
 
-"Start a server, then use it" needs the server to be *ready*, not merely started. Seven probes —
-a stdout line, a TCP port, a Unix socket, a Windows named pipe, an HTTP endpoint, a filesystem
-path, or any async predicate of your own — replace the arbitrary sleep:
+"Start a server, then use it" needs the server to be *ready*, not merely started. Nine probes —
+a stdout line, a stderr line, a newline-free stderr prompt, a TCP port, a Unix socket, a Windows
+named pipe, an HTTP endpoint, a filesystem path, or any async predicate of your own — replace the
+arbitrary sleep:
 
 **F#**
 
@@ -634,7 +635,8 @@ Console.WriteLine(await proc.WaitForLineAsync(l => l.Contains("listening on"), T
 ```
 
 A probe that doesn't pass within its deadline — or that can no longer pass (the child exits; for
-`WaitForLineAsync`, its stdout closes) — fails with `ProcessError.NotReady` (distinct from a timeout)
+`WaitForLineAsync`, its stdout closes; for `WaitForStderrLineAsync`/`WaitForStderrTailAsync`, its
+stderr does) — fails with `ProcessError.NotReady` (distinct from a timeout)
 and **does not kill the child**: the caller decides what happens next.
 
 HTTP readiness and supervisor liveness accept a caller-owned `HttpClient` for authentication headers,

@@ -718,7 +718,9 @@ nothing left to drop and `Truncated` reports the stderr capture (plus a bounded 
 one fired — see below). That finish is also the point
 of no return for stdout, and it says so out loud: asking for the discarded stream afterwards is
 refused as already-consumed — `StdoutLinesAsync()`/`StdoutJsonLinesAsync()` throw
-`InvalidOperationException` and `WaitForLineAsync()` returns `ProcessError.Unsupported`, just as they
+`InvalidOperationException`, and `WaitForLineAsync()` (as well as `WaitForStderrLineAsync()` /
+`WaitForStderrTailAsync()`, which share that same streaming session) returns
+`ProcessError.Unsupported`, just as they
 do after `WaitAsync()`/`ProfileAsync()` — instead of handing back an empty stream you could mistake
 for a silent child. So take the stream first (`StdoutLinesAsync()`/`StdoutChunksAsync()`) if you want
 to read stdout after finishing: its backlog is retained for its enumerator as before.
@@ -1238,7 +1240,7 @@ peer's stdin for the usual `shutdown`/`exit` handshake. Dispose the `RunningProc
 ## Readiness probes
 
 "Start a server, then use it" needs the server to be *ready*, not merely started.
-Seven probes replace the arbitrary sleep, each bounded by its own deadline and each
+Nine probes replace the arbitrary sleep, each bounded by its own deadline and each
 returning a `Result`:
 
 **F#**
@@ -1301,6 +1303,18 @@ task {
         //    written" check, …):
         match! proc.WaitForAsync((fun () -> healthCheck ()), TimeSpan.FromSeconds 10.0) with
         | Ok() -> printfn "healthy"
+        | Error err -> eprintfn $"{err.Message}"
+
+        // 8. A line on STDERR — plenty of tools publish their readiness banner there
+        //    (returns the matching line):
+        match! proc.WaitForStderrLineAsync((fun line -> line.Contains "listening on"), TimeSpan.FromSeconds 10.0) with
+        | Ok banner -> printfn $"server says: {banner}"
+        | Error err -> eprintfn $"{err.Message}"
+
+        // 9. A newline-free prompt on stderr — matched as the tail grows, without waiting
+        //    for a line terminator that may never come (returns the tail that matched):
+        match! proc.WaitForStderrTailAsync((fun tail -> tail.EndsWith "Password: "), TimeSpan.FromSeconds 10.0) with
+        | Ok prompt -> printfn $"prompt: {prompt}"
         | Error err -> eprintfn $"{err.Message}"
 }
 ```
@@ -1375,14 +1389,31 @@ Console.WriteLine(await proc.WaitForAsync(() => healthCheck(), TimeSpan.FromSeco
     { IsOk: true }        => "healthy",
     { IsOk: false, ErrorValue: var err } => err.Message,
 });
+
+// 8. A line on STDERR — plenty of tools publish their readiness banner there
+//    (returns the matching line):
+Console.WriteLine(await proc.WaitForStderrLineAsync(line => line.Contains("listening on"), TimeSpan.FromSeconds(10)) switch
+{
+    { IsOk: true, ResultValue: var banner } => $"server says: {banner}",
+    { IsOk: false, ErrorValue: var err }    => err.Message,
+});
+
+// 9. A newline-free prompt on stderr — matched as the tail grows, without waiting for a line
+//    terminator that may never come (returns the tail that matched):
+Console.WriteLine(await proc.WaitForStderrTailAsync(tail => tail.EndsWith("Password: "), TimeSpan.FromSeconds(10)) switch
+{
+    { IsOk: true, ResultValue: var prompt } => $"prompt: {prompt}",
+    { IsOk: false, ErrorValue: var err }    => err.Message,
+});
 ```
 
 Probe semantics are deliberately uniform:
 
 - A probe that can't pass within its deadline fails with **`ProcessError.NotReady`** —
   distinct from `ProcessError.Timeout`, which is the run's own deadline.
-- A probe also fails *fast* once readiness can no longer happen: the child exits, or
-  (for `WaitForLineAsync`) its stdout closes — no waiting out a 10s deadline on a dead
+- A probe also fails *fast* once readiness can no longer happen: the child exits, or the stream it
+  watches closes — its stdout for `WaitForLineAsync`, its stderr for `WaitForStderrLineAsync` /
+  `WaitForStderrTailAsync` — no waiting out a 10s deadline on a dead
   server. Observing the exit does not by itself discard readiness, though: the six
   external-condition probes (`WaitForPortAsync` / `WaitForSocketAsync` / `WaitForHttpAsync` /
   `WaitForPathAsync` / `WaitForNamedPipeAsync` / `WaitForAsync`) check the condition exactly one more
@@ -1392,14 +1423,17 @@ Probe semantics are deliberately uniform:
   predicate; an already-cancelled token or a spent deadline skips it.
 - A failed probe **never kills the child.** You decide what happens next: retry, log
   and continue, or tear down.
-- All seven probes background-drain the child's piped stdout/stderr while polling, so a chatty
+- All nine probes drain the child's piped stdout/stderr while they wait, so a chatty
   child that writes more than one OS pipe buffer of startup output (~64 KiB on Linux) before
   becoming ready can't block in `write()` and spuriously fail the probe with `NotReady`.
-  `WaitForLineAsync` hands the drained stdout back to you (consumed up to and including the
-  matching line — continue with `FinishAsync()` or further streaming afterwards); `WaitForPortAsync` /
+  The three output-watching probes keep what they drain: `WaitForLineAsync` hands the drained stdout
+  back to you (consumed up to and including the matching line — continue with `FinishAsync()` or
+  further streaming afterwards), and `WaitForStderrLineAsync` / `WaitForStderrTailAsync` leave both
+  streams where the streaming session puts them (stdout queued for a stream you may still take,
+  stderr captured for `FinishAsync`). `WaitForPortAsync` /
   `WaitForSocketAsync` / `WaitForHttpAsync` / `WaitForPathAsync` / `WaitForNamedPipeAsync` /
-  `WaitForAsync` discard what they drain and stop draining once the probe concludes. Either way, a
-  capture verb called afterward (`OutputStringAsync`/`OutputBytesAsync`/a fresh
+  `WaitForAsync` discard what they drain and stop draining once the probe concludes. After one of
+  those six, a capture verb called afterward (`OutputStringAsync`/`OutputBytesAsync`/a fresh
   `StdoutLinesAsync`/`OutputEventsAsync`) only sees output the child wrote *after* the probe
   concluded — run probes before a capturing verb if you need the complete output.
 - `WaitForSocketAsync` requires the host to support `AF_UNIX` sockets (Windows 10 1809+, any current
@@ -1422,6 +1456,54 @@ Probe semantics are deliberately uniform:
   resolves against the run's own `CurrentDir` (the child's working directory) when one was configured
   on the `Command`, otherwise against the calling process's own current directory — pass an absolute
   `path` for a child sentinel when no `CurrentDir` is set.
+
+### Readiness on stderr, including a prompt with no newline
+
+`WaitForStderrLineAsync` is `WaitForLineAsync` pointed at the **diagnostic** stream, for the many
+tools that publish their readiness marker there rather than on stdout. Same contract throughout:
+the matching line is returned, an unmet condition within the deadline is `ProcessError.NotReady`
+(reporting the clamped deadline actually armed), a cancelled token is `ProcessError.Cancelled`, and
+stderr reaching EOF — because the child exited, or simply closed it — ends the wait promptly rather
+than burning the rest of the deadline. Lines are framed with `Command.StderrLineTerminator` and
+decoded with `Command.StderrEncoding`, so a wait sees exactly what `Command.OnStderrLine`, a
+`StderrTee` and `Finished.Stderr` see.
+
+`WaitForStderrTailAsync` matches the **unterminated tail** instead: everything written since the
+last line terminator, offered to your predicate as it grows. That is the only way to see a prompt
+that carries no newline at all (`Password: `, `Continue? [y/N] `), which a line-framing wait cannot
+deliver by construction — the pump holds such text in its assembly buffer until a terminator (or
+EOF) finally arrives. Content that *does* end up terminated is offered complete, right before it is
+framed, so a marker that turns out to have a newline after all still matches here.
+
+Three things worth knowing before reaching for them:
+
+- **They observe stderr; they do not take it.** Whatever a wait matched still reaches
+  `Command.OnStderrLine`, the `StderrTee` and the captured `Finished.Stderr` exactly once — a
+  matched *tail* arrives there once, later, inside the line it is eventually framed into, never as
+  an extra line of its own. What a wait does consume is its own readiness view: the line it matched
+  and the lines it read past on the way are not offered to a *later* stderr wait, exactly as
+  `WaitForLineAsync` consumes the stdout lines it reads.
+- **They join the stdout streaming session** rather than opening a second reader, so they compose
+  with `WaitForLineAsync`, `StdoutLinesAsync`/`StdoutJsonLinesAsync` and a closing `FinishAsync`
+  before or after — and a verb that owns the pipes outright (`OutputStringAsync`/`OutputBytesAsync`/
+  `WaitAsync`/`ProfileAsync`, `OutputEventsAsync`, either byte-chunk stream, an interactive session)
+  makes a later stderr wait return the usual already-consumed `ProcessError.Unsupported`, as does a
+  terminal `FinishAsync` that already discarded the session's stdout.
+- **What they retain is bounded.** Between one wait and the next, the framed stderr lines and the
+  current unterminated tail are kept so a marker arriving in that gap is not lost — capped at
+  `OutputBufferPolicy.MaxBytes` when the run set one (`Command.OutputBuffer`), else at 64 KiB. At the
+  cap the tail is force-flushed after one last offer (the same rule that force-flushes an
+  unterminated line into a capture) and the retained lines drop oldest-first, so a child that floods
+  stderr with no line terminator cannot grow this. A marker larger than that cap is the one thing a
+  tail wait cannot match — raise `MaxBytes` if you have one.
+
+A run with no separate stderr stream — `Command.MergeStderr`, a `Command.Pty` run, `StderrToFile`,
+`StdioMode.Inherit`/`Null` — fails both waits immediately with `ProcessError.Unsupported` naming
+which of those it was, rather than a `NotReady` that would read as "the marker never came" for a
+stream that never existed. Under a merge those bytes are in stdout: wait for them with
+`WaitForLineAsync`. Your predicate runs on the pump's thread as each line/tail is framed, so keep it
+cheap and non-blocking (the rule `Command.OnStderrLine` already follows); a predicate that throws
+fails only its own wait, leaving the run and every other verb untouched.
 
 `WaitForAsync` takes a function returning `Task<bool>` (`Func<Task<bool>>` from C#), so any
 async health check fits — re-evaluated until it returns `true` or the deadline elapses.

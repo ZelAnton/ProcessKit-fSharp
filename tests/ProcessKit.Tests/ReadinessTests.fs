@@ -2371,3 +2371,594 @@ type ReadinessTests() =
                     Assert.That(outcomes.Length, Is.EqualTo 2)
         }
         :> Task
+
+/// The STDERR readiness surface (T-379): `WaitForStderrLineAsync` (complete framed lines) and
+/// `WaitForStderrTailAsync` (the unterminated tail, for a prompt that carries no line terminator).
+///
+/// A fixture of its own rather than more members on `ReadinessTests` above: these waits are driven by
+/// the stderr line pump rather than by the polling core the probes above share, so they need their own
+/// synthetic child (one that writes stderr on the test's cue, byte for byte, with no line terminator
+/// when that is the point) instead of a listener/endpoint to dial.
+[<TestFixture>]
+type StderrReadinessTests() =
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    let runner: IProcessRunner = JobRunner()
+
+    let shell (script: string) =
+        if isWindows then
+            Command.create "cmd.exe" |> Command.args [ "/c"; script ]
+        else
+            Command.create "/bin/sh" |> Command.args [ "-c"; script ]
+
+    // A synthetic `RunningProcess` over two in-memory pipes (not a real OS pipe or subprocess) plus a
+    // caller-driven exit — the deterministic way to play "the child writes exactly this to stderr, now"
+    // on every OS in the matrix, including output that deliberately carries no line terminator (which
+    // `cmd.exe`'s `echo` cannot produce). Returns the handle and the two writer-side streams the test
+    // uses as the child.
+    let syntheticChild (config: CommandConfig) (exitTask: Task<Outcome>) : RunningProcess * Stream * Stream =
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        let host: RunningHost =
+            { Config = config
+              Pid = None
+              Stdout = Some(stdoutPipe.Reader.AsStream())
+              Stderr = Some(stderrPipe.Reader.AsStream())
+              Stdin = None
+              StartTime = DateTime.UtcNow
+              StartedTimestamp = Stopwatch.GetTimestamp()
+              StartTimeIdentity = None
+              Wait = fun () -> exitTask
+              StdinError = RunningHost.NoStdinError
+              StdinFeedComplete = ignore
+              StartKill = ignore
+              Signal = fun _ -> Ok()
+              GracefulKill = fun _ -> Task.CompletedTask
+              ResizePty = None
+              TreeStats = None
+              Teardown = fun () -> ValueTask() }
+
+        new RunningProcess(host), stdoutPipe.Writer.AsStream(), stderrPipe.Writer.AsStream()
+
+    // A child that never exits on its own, so a wait ends on what the test writes (or on its own
+    // deadline) rather than on a synthetic exit racing it (KB K-044).
+    let liveChild (config: CommandConfig) =
+        syntheticChild config (TaskCompletionSource<Outcome>().Task)
+
+    // Write `text` as the child would: encoded with the given encoding, flushed so the pump's next read
+    // sees it, and with NO line terminator added — the caller writes one if it wants one.
+    let write (stream: Stream) (encoding: Encoding) (text: string) : Task =
+        task {
+            let bytes = encoding.GetBytes text
+            do! stream.WriteAsync(ReadOnlyMemory bytes)
+            do! stream.FlushAsync()
+        }
+        :> Task
+
+    let writeUtf8 (stream: Stream) (text: string) = write stream Encoding.UTF8 text
+
+    [<Test>]
+    member _.``WaitForStderrLine matches a stderr line from a real child``() : Task =
+        task {
+            let command =
+                if isWindows then
+                    shell "echo ready 1>&2&ping 127.0.0.1 -n 5 >NUL"
+                else
+                    shell "echo ready >&2; sleep 4"
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+
+                match!
+                    running.WaitForStderrLineAsync((fun line -> line.Contains "ready"), TimeSpan.FromSeconds 10.0)
+                with
+                | Ok line -> Assert.That(line, Does.Contain "ready")
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForStderrLine times out with NotReady when the line never appears``() : Task =
+        task {
+            let running, _stdout, stderr = liveChild (Command.create "test").Config
+            use running = running
+            do! writeUtf8 stderr "starting up\n"
+
+            match!
+                running.WaitForStderrLineAsync((fun line -> line.Contains "never"), TimeSpan.FromMilliseconds 300.0)
+            with
+            | Error(ProcessError.NotReady _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForStderrLine reports the clamped (armable) timeout in NotReady, not an over-long raw one``
+        ()
+        : Task =
+        task {
+            // Same clamp contract as `WaitForLineAsync`: an over-long timeout cannot be armed on a BCL
+            // timer as-is, so `Timeouts.clampArmable` is what gets armed AND what `NotReady` must
+            // report. Closing stderr with nothing written is a clean EOF, so this resolves at once
+            // instead of waiting out an unarmably long deadline.
+            let running, _stdout, stderr = liveChild (Command.create "test").Config
+            use running = running
+            stderr.Close()
+
+            match! running.WaitForStderrLineAsync((fun _ -> true), TimeSpan.MaxValue) with
+            | Error(ProcessError.NotReady(_, reportedTimeout)) ->
+                Assert.That(reportedTimeout, Is.EqualTo Timeouts.maxArmable)
+            | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForStderrLine reports Cancelled when the caller's token fires first``() : Task =
+        task {
+            let running, _stdout, _stderr = liveChild (Command.create "test").Config
+            use running = running
+            use cts = new CancellationTokenSource()
+
+            let waiting =
+                running.WaitForStderrLineAsync((fun _ -> true), TimeSpan.FromSeconds 30.0, cts.Token)
+
+            cts.Cancel()
+
+            match! waiting with
+            | Error(ProcessError.Cancelled _) -> Assert.Pass()
+            | other -> Assert.Fail $"expected Cancelled, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForStderrLine reports NotReady when the child exits before the line arrives``() : Task =
+        task {
+            // A child that writes something else to stderr and exits. The wait must end on that EOF,
+            // not sit out its (much longer) deadline.
+            let command =
+                if isWindows then
+                    shell "echo other 1>&2"
+                else
+                    shell "echo other >&2"
+
+            match! runner.StartAsync(command, CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+                let clock = Stopwatch.StartNew()
+
+                match!
+                    running.WaitForStderrLineAsync((fun line -> line.Contains "ready"), TimeSpan.FromSeconds 30.0)
+                with
+                | Error(ProcessError.NotReady _) ->
+                    Assert.That(
+                        clock.Elapsed,
+                        Is.LessThan(TimeSpan.FromSeconds 20.0),
+                        "the child's stderr reached EOF, so this must not wait out the deadline"
+                    )
+                | other -> Assert.Fail $"expected NotReady, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForStderrTail matches a newline-free stderr prompt``() : Task =
+        task {
+            let running, _stdout, stderr = liveChild (Command.create "test").Config
+            use running = running
+
+            // No line terminator anywhere: a line wait could never see this, which is the whole point
+            // of the partial-tail verb. Written in two pieces so the match also proves the tail is
+            // ACCUMULATED across reads rather than matched per chunk.
+            do! writeUtf8 stderr "Enter "
+            do! writeUtf8 stderr "password: "
+
+            match!
+                running.WaitForStderrTailAsync((fun tail -> tail.EndsWith "password: "), TimeSpan.FromSeconds 10.0)
+            with
+            | Ok tail -> Assert.That(tail, Is.EqualTo "Enter password: ")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForStderrTail matches a newline-free stderr prompt from a real child``() : Task =
+        task {
+            if isWindows then
+                // `cmd.exe`'s `echo` always terminates its line, and the `set /p` trick that does not
+                // needs an interactive-console shape this suite deliberately avoids. The synthetic and
+                // test-double regressions around this one cover the same path on every OS, here
+                // included.
+                Assert.Ignore "no portable newline-free writer in cmd.exe; covered by the synthetic child"
+
+            match! runner.StartAsync(shell "printf 'Password: ' >&2; sleep 4", CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+
+                match!
+                    running.WaitForStderrTailAsync((fun tail -> tail.EndsWith "Password: "), TimeSpan.FromSeconds 10.0)
+                with
+                | Ok tail -> Assert.That(tail, Is.EqualTo "Password: ")
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForStderrTail matches a newline-free prompt scripted on a FakeProcess``() : Task =
+        task {
+            // Test-double parity: the same newline-free stderr prompt a real child publishes is
+            // scriptable on the double, and the same verb finds it there.
+            use running = FakeProcess.Create("fake").WithStderr("Password: ").Build()
+
+            match!
+                running.WaitForStderrTailAsync((fun tail -> tail.EndsWith "Password: "), TimeSpan.FromSeconds 10.0)
+            with
+            | Ok tail -> Assert.That(tail, Is.EqualTo "Password: ")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``WaitForStderrTail matches a newline-free prompt scripted through ScriptedRunner``() : Task =
+        task {
+            // The same parity one layer up: a `Reply`'s stderr is replayed verbatim through the
+            // `IProcessRunner` seam, so code that waits on a newline-free stderr prompt is testable
+            // against the double exactly as it runs against a real spawn.
+            let scripted =
+                ScriptedRunner().Fallback(Reply.Ok("").WithStderr "Password: ") :> IProcessRunner
+
+            match! scripted.SpawnAsync(Command.create "installer", CancellationToken.None) with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok running ->
+                use running = running
+
+                match!
+                    running.WaitForStderrTailAsync((fun tail -> tail.EndsWith "Password: "), TimeSpan.FromSeconds 10.0)
+                with
+                | Ok tail -> Assert.That(tail, Is.EqualTo "Password: ")
+                | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a partial tail matched by a wait still reaches the capture exactly once, as one line``() : Task =
+        task {
+            // The invariant the partial-tail verb must not break: the tail it matched is NOT a line and
+            // is delivered nowhere twice — it arrives once, later, inside the line the pump frames it
+            // into. `OnStderrLine` counts what the framing produced; `Finished.Stderr` is what the
+            // capture kept.
+            let framed = ResizeArray<string>()
+            let exit = TaskCompletionSource<Outcome>()
+
+            let config =
+                (Command.create "test"
+                 |> Command.onStderrLine (fun line -> lock framed (fun () -> framed.Add line)))
+                    .Config
+
+            let running, stdout, stderr = syntheticChild config exit.Task
+            use running = running
+            do! writeUtf8 stderr "Password: "
+
+            match!
+                running.WaitForStderrTailAsync((fun tail -> tail.EndsWith "Password: "), TimeSpan.FromSeconds 10.0)
+            with
+            | Ok tail -> Assert.That(tail, Is.EqualTo "Password: ")
+            | Error error -> Assert.Fail $"{error}"
+
+            // The child finishes the very line whose tail was matched, then exits.
+            do! writeUtf8 stderr "\ndone\n"
+            stdout.Close()
+            stderr.Close()
+            exit.SetResult(Outcome.Exited 0)
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished ->
+                Assert.That(finished.Stderr, Is.EqualTo "Password: \ndone")
+                Assert.That(running.StderrLineCount, Is.EqualTo 2)
+
+            // Joined rather than compared as a sequence: `Assert.That(list, Is.EqualTo [ ... ])` cannot
+            // resolve its overload from F# (see the note in `FreeBsdReaperTests`), and the joined form
+            // shows the exact framing this assertion is about.
+            Assert.That(String.Join("|", framed), Is.EqualTo "Password: |done")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a stderr line a wait consumed is not re-delivered to the next wait``() : Task =
+        task {
+            // The stderr form of "consumed lines are not re-delivered": a wait consumes what it read,
+            // matching or not, exactly as a `WaitForLineAsync` consumer consumes the stdout lines it
+            // takes off the channel.
+            let running, _stdout, stderr = liveChild (Command.create "test").Config
+            use running = running
+            do! writeUtf8 stderr "alpha\nbravo\ncharlie\n"
+
+            match! running.WaitForStderrLineAsync((fun line -> line = "bravo"), TimeSpan.FromSeconds 10.0) with
+            | Ok line -> Assert.That(line, Is.EqualTo "bravo")
+            | Error error -> Assert.Fail $"{error}"
+
+            // `alpha` was read (and skipped) on the way to `bravo`, so it is gone: this wait can only
+            // time out. It reads (and so consumes) `charlie` on its way to that timeout, exactly as a
+            // timed-out `WaitForLineAsync` consumes the stdout lines it took off the channel.
+            match! running.WaitForStderrLineAsync((fun line -> line = "alpha"), TimeSpan.FromMilliseconds 300.0) with
+            | Error(ProcessError.NotReady _) -> ()
+            | other -> Assert.Fail $"expected a consumed line NOT to be re-delivered, got {other}"
+
+            // The watch is still live for what the child writes NEXT — consuming is not closing.
+            do! writeUtf8 stderr "delta\n"
+
+            match! running.WaitForStderrLineAsync((fun line -> line = "delta"), TimeSpan.FromSeconds 10.0) with
+            | Ok line -> Assert.That(line, Is.EqualTo "delta")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``stderr readiness honours StderrEncoding and StderrLineTerminator, like every other stderr path``
+        ()
+        : Task =
+        task {
+            // Parity with the stdout path and with `PumpStderrBuffer`: the same two config knobs decide
+            // what a stderr line IS. Latin-1 bytes decoded as UTF-8 would be replacement characters, and
+            // a bare '\r' is content — not a terminator — unless `Cr` framing says otherwise.
+            let config =
+                (Command.create "test"
+                 |> Command.stderrEncoding Encoding.Latin1
+                 |> Command.stderrLineTerminator LineTerminator.Cr)
+                    .Config
+
+            let running, _stdout, stderr = liveChild config
+            use running = running
+
+            // The trailing content after the '\r' is what RESOLVES it: this pump defers a carriage
+            // return until the next character (or EOF) decides whether it was a lone `\r` or half of a
+            // `\r\n` — the same deferral every other stderr consumer on this handle sees, since they
+            // all read through the one pump.
+            do! write stderr Encoding.Latin1 "café ready\rnext"
+
+            match! running.WaitForStderrLineAsync((fun line -> line = "café ready"), TimeSpan.FromSeconds 10.0) with
+            | Ok line -> Assert.That(line, Is.EqualTo "café ready")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``stderr readiness composes with the stdout streaming session it shares``() : Task =
+        task {
+            let running, stdout, stderr = liveChild (Command.create "test").Config
+            use running = running
+            do! writeUtf8 stdout "out-1\n"
+            do! writeUtf8 stderr "ready\n"
+
+            match! running.WaitForStderrLineAsync((fun line -> line = "ready"), TimeSpan.FromSeconds 10.0) with
+            | Ok line -> Assert.That(line, Is.EqualTo "ready")
+            | Error error -> Assert.Fail $"{error}"
+
+            // stdout was drained and QUEUED throughout the stderr wait (one session, one pump per
+            // pipe), so the stream is still there to take afterwards — nothing was lost or discarded.
+            let lines = running.StdoutLinesAsync().GetAsyncEnumerator()
+
+            try
+                let! moved = lines.MoveNextAsync()
+                Assert.That(moved, Is.True)
+                Assert.That(lines.Current, Is.EqualTo "out-1")
+            finally
+                lines.DisposeAsync().AsTask().GetAwaiter().GetResult()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``stderr readiness joins a streaming session another verb already started``() : Task =
+        task {
+            // The other arming order: `StdoutLinesAsync` claimed the session (and started its pumps)
+            // first, so this wait joins that session rather than starting one. It watches stderr from
+            // the moment it arms — which is what the child writes next.
+            let running, stdout, stderr = liveChild (Command.create "test").Config
+            use running = running
+            let lines = running.StdoutLinesAsync().GetAsyncEnumerator()
+
+            try
+                do! writeUtf8 stdout "out-1\n"
+                let! moved = lines.MoveNextAsync()
+                Assert.That(moved, Is.True)
+                Assert.That(lines.Current, Is.EqualTo "out-1")
+
+                // Armed BEFORE the child writes it: a wait that joins a session already in flight
+                // watches stderr from the moment it arms, so the ordering is the test's to control,
+                // not a race to hope for.
+                let waiting =
+                    running.WaitForStderrLineAsync((fun line -> line = "ready"), TimeSpan.FromSeconds 10.0)
+
+                do! writeUtf8 stderr "ready\n"
+
+                match! waiting with
+                | Ok line -> Assert.That(line, Is.EqualTo "ready")
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                lines.DisposeAsync().AsTask().GetAwaiter().GetResult()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``stderr readiness is refused after another verb has consumed the pipes``() : Task =
+        task {
+            // The buffered verbs own the pipes outright, so a later stderr wait must be refused rather
+            // than left waiting on a stream it can never be given — the same already-consumed contract
+            // `WaitForLineAsync` follows.
+            use buffered = FakeProcess.Create("fake").WithStderr("ready\n").Build()
+
+            match! buffered.OutputStringAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok _ -> ()
+
+            let clock = Stopwatch.StartNew()
+
+            match! buffered.WaitForStderrLineAsync((fun _ -> true), TimeSpan.FromSeconds 30.0) with
+            | Error(ProcessError.Unsupported message) ->
+                Assert.That(message, Does.Contain "already been consumed")
+
+                Assert.That(
+                    clock.Elapsed,
+                    Is.LessThan(TimeSpan.FromSeconds 30.0),
+                    "the refusal must come from the claim gate, not from waiting out the timeout"
+                )
+            | other -> Assert.Fail $"expected an already-consumed refusal, got {other}"
+
+            // The stderr BYTE-chunk session is the other stderr reader on this handle; it owns the pipe
+            // and its consumer already has those bytes, so a readiness wait over it is refused too.
+            use chunked = FakeProcess.Create("fake").WithStderr("ready\n").Build()
+            chunked.StderrChunksAsync() |> ignore
+
+            match! chunked.WaitForStderrTailAsync((fun _ -> true), TimeSpan.FromSeconds 30.0) with
+            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "already been consumed")
+            | other -> Assert.Fail $"expected an already-consumed refusal, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``stderr readiness after a terminal fresh FinishAsync refuses instead of reporting NotReady``() : Task =
+        task {
+            use running = FakeProcess.Create("fake").WithStderr("ready\n").Build()
+
+            match! running.FinishAsync() with
+            | Error error -> Assert.Fail $"{error}"
+            | Ok finished -> Assert.That(finished.Outcome, Is.EqualTo(Outcome.Exited 0))
+
+            match! running.WaitForStderrLineAsync((fun _ -> true), TimeSpan.FromSeconds 30.0) with
+            | Error(ProcessError.Unsupported message) -> Assert.That(message, Does.Contain "already been consumed")
+            | other -> Assert.Fail $"expected an already-consumed refusal, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``stderr readiness reports Unsupported on a run with no separate stderr stream``() : Task =
+        task {
+            // `MergeStderr` folds stderr into stdout at the OS level: there is no stderr stream to wait
+            // on, and a `NotReady` here would read as "the marker never came" for a stream that never
+            // existed. The refusal must name the cause and point at the verb that can see those bytes.
+            use merged =
+                FakeProcess.OfCommand(Command.create "tool" |> Command.mergeStderr).WithStderr("ready\n").Build()
+
+            match! merged.WaitForStderrLineAsync((fun _ -> true), TimeSpan.FromSeconds 30.0) with
+            | Error(ProcessError.Unsupported message) ->
+                Assert.That(message, Does.Contain "WaitForStderrLineAsync")
+                Assert.That(message, Does.Contain "MergeStderr")
+                Assert.That(message, Does.Contain "WaitForLineAsync")
+            | other -> Assert.Fail $"expected Unsupported, got {other}"
+
+            // The refusal happens BEFORE anything is claimed, so every other verb is still available.
+            match! merged.OutputStringAsync() with
+            | Ok result -> Assert.That(result.Stdout, Does.Contain "ready")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing OnStderrLine handler surfaces on a stderr wait, not a spurious NotReady``() : Task =
+        task {
+            // The stderr twin of the stdout regression: a genuine pump failure must surface as itself
+            // rather than as a readiness timeout that would read as "the marker never came".
+            let config =
+                (Command.create "test"
+                 |> Command.onStderrLine (fun _ -> raise (InvalidOperationException "handler boom")))
+                    .Config
+
+            let running, _stdout, stderr = liveChild config
+            use running = running
+
+            let waiting =
+                running.WaitForStderrLineAsync((fun line -> line.Contains "no-such-line"), TimeSpan.FromSeconds 10.0)
+
+            do! writeUtf8 stderr "anything\n"
+
+            let thrown =
+                Assert.ThrowsAsync<InvalidOperationException>(Func<Task>(fun () -> waiting :> Task))
+
+            match thrown with
+            | null -> Assert.Fail "expected the handler's own exception to surface on the wait"
+            | thrown -> Assert.That(thrown.Message, Does.Contain "handler boom")
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a throwing predicate fails only its own wait``() : Task =
+        task {
+            let running, _stdout, stderr = liveChild (Command.create "test").Config
+            use running = running
+
+            let waiting =
+                running.WaitForStderrLineAsync(
+                    (fun _ -> raise (InvalidOperationException "predicate boom")),
+                    TimeSpan.FromSeconds 10.0
+                )
+
+            do! writeUtf8 stderr "first\n"
+
+            let thrown =
+                Assert.ThrowsAsync<InvalidOperationException>(Func<Task>(fun () -> waiting :> Task))
+
+            match thrown with
+            | null -> Assert.Fail "expected the predicate's own exception to fail its wait"
+            | thrown -> Assert.That(thrown.Message, Does.Contain "predicate boom")
+
+            // The pump, the session and every other verb carried on: a later wait still works.
+            do! writeUtf8 stderr "second\n"
+
+            match! running.WaitForStderrLineAsync((fun line -> line = "second"), TimeSpan.FromSeconds 10.0) with
+            | Ok line -> Assert.That(line, Is.EqualTo "second")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``the partial tail retention is capped, and force-flushes at the cap``() : Task =
+        task {
+            // Bounded output retention: a child that floods stderr with no line terminator at all must
+            // not grow the readiness retention without bound. The cap follows this run's own
+            // `OutputBufferPolicy.MaxBytes`, and at the cap the tail is force-flushed after being
+            // offered one last time — the same rule that force-flushes an unterminated line into a
+            // capture.
+            let config =
+                (Command.create "test"
+                 |> Command.outputBuffer (OutputBufferPolicy.Unbounded.WithMaxBytes 16))
+                    .Config
+
+            let running, _stdout, stderr = liveChild config
+            use running = running
+            let seen = ResizeArray<string>()
+
+            let waiting =
+                running.WaitForStderrTailAsync(
+                    (fun tail ->
+                        lock seen (fun () -> seen.Add tail)
+                        tail.Contains "MARKER"),
+                    TimeSpan.FromSeconds 10.0
+                )
+
+            // Three 16-byte chunks with no terminator anywhere, then the marker. Every offered tail
+            // must stay within a cap's worth of accumulation, so the flood cannot pile up — and the
+            // marker still matches once it arrives.
+            for _ in 1..3 do
+                do! writeUtf8 stderr (String('x', 16))
+
+            do! writeUtf8 stderr "MARKER"
+
+            match! waiting with
+            | Ok tail -> Assert.That(tail, Does.Contain "MARKER")
+            | Error error -> Assert.Fail $"{error}"
+
+            let offered = lock seen (fun () -> List.ofSeq seen)
+            Assert.That(offered, Is.Not.Empty)
+
+            for tail in offered do
+                Assert.That(
+                    Encoding.UTF8.GetByteCount tail,
+                    Is.LessThanOrEqualTo 32,
+                    "an offered tail must stay within one cap's worth of accumulation"
+                )
+        }
+        :> Task
