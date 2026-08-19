@@ -585,9 +585,7 @@ not a delivery guarantee: a live console-CTRL leader can still see
 `GenerateConsoleCtrlEvent` fail for reasons this read does not probe (such as the
 caller having no console to share), in which case the later `Signal(Int/Term)`
 call returns `ProcessError.Unsupported` even though `SoftStopScope` reported
-`OptInMembers`. The cgroup and POSIX `WholeTree` cases have no such gap — the
-signal write/`killpg` call itself is the delivery mechanism, not a separate step
-that can independently fail.
+`OptInMembers`.
 
 ## Signals and suspend/resume
 
