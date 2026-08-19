@@ -657,9 +657,9 @@ blocks the child) or `Error` (fails loud instead of stalling) over `Backpressure
 
 ## Live counters
 
-A `RunningProcess` publishes four live counters. All are cheap to read at any time — mid-stream, and
-afterwards: each keeps its final value once the pumps end, including after `FinishAsync()` and after
-the handle is disposed.
+A `RunningProcess` publishes the live counters below. All are cheap to read at any time — mid-stream,
+and afterwards: each keeps its final value once the pumps end, including after `FinishAsync()` and
+after the handle is disposed.
 
 | Counter | Counts |
 |---|---|

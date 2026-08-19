@@ -562,11 +562,13 @@ type RunningProcess
     /// child, not what was kept. Monotonic, cheap to read at any time — mid-stream, and afterwards: it
     /// keeps its final total once the pumps end, including after `FinishAsync`/`DisposeAsync`.
     ///
-    /// **`0` means "the parent never reads this stream"**, honestly and without blocking: a `StdioMode`
+    /// **A stream the parent never reads answers `0`** — honestly, without blocking: a `StdioMode`
     /// `Null`/`Inherit` stdout, one redirected straight to a file (`Command.StdoutToFile`), or a stream
-    /// this command did not configure. It is the byte-level counterpart of `StdoutLineCount`, and a
-    /// different quantity from the byte totals a capture reports (`ProcessResult`'s truncation totals
-    /// count what was RETAINED, post-decode, in the currency of the cap that bounds it).
+    /// this command did not configure. Not the converse: a piped stream reads `0` too until bytes
+    /// actually come off it, so `0` alone does not mean the stream is unread. It is the byte-level
+    /// counterpart of `StdoutLineCount`, and a different quantity from the byte totals a capture reports
+    /// (`ProcessResult`'s truncation totals count what was RETAINED, post-decode, in the currency of the
+    /// cap that bounds it).
     member _.StdoutBytesSeen: int64 = sessions.StdoutBytesSeen
 
     /// The stderr twin of `StdoutBytesSeen`. A run with **one merged stream** — `Command.MergeStderr()`
