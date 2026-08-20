@@ -123,6 +123,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// at all (e.g. the cgroup was torn down underneath the spawn), it is killed and reaped and the
     /// spawn fails with `ProcessError.ResourceLimit` — never left running unconstrained.
     static member Create(options: ProcessGroupOptions) : Result<ProcessGroup, ProcessError> =
+        ArgumentNullException.ThrowIfNull options
         let limits = options.Limits
 
         let withBackend (backend: IContainmentBackend) = Ok(new ProcessGroup(backend, options))
