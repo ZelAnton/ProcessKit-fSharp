@@ -2255,3 +2255,215 @@ type PosixChildPathLaunchTests() =
                     deleteDirQuietly dir
         }
         :> Task
+
+    member private _.ExpectedNotFound(command: Command) =
+        match command.ResolveProgram() with
+        | Error(ProcessError.NotFound(program, searched)) -> program, searched
+        | Error other -> failwith $"expected NotFound from preflight, got {other}"
+        | Ok resolved -> failwith $"expected preflight refusal, got '{resolved}'"
+
+    member private _.AssertMatchingNotFound
+        (label: string, (expectedProgram: string, expectedSearched: string option), error: ProcessError)
+        =
+        match error with
+        | ProcessError.NotFound(program, searched) ->
+            Assert.That(program, Is.EqualTo expectedProgram, label)
+            Assert.That(searched, Is.EqualTo expectedSearched, label)
+        | other -> Assert.Fail $"{label}: expected NotFound, got {other}"
+
+    member private this.AssertCgroupSeamRefused(label: string, marker: string, command: Command) : Task =
+        task {
+            let procs =
+                Path.Combine(Path.GetTempPath(), $"processkit-cgroup-path-{Guid.NewGuid():N}.procs")
+
+            let expected = this.ExpectedNotFound command
+
+            try
+                match Native.Posix.spawnPosixIntoCgroup command procs with
+                | Error error -> this.AssertMatchingNotFound(label, expected, error)
+                | Ok spawned ->
+                    let! outcome = Native.Posix.waitPosix spawned.Handle
+                    spawned.Stdout |> Option.iter _.Dispose()
+                    spawned.Stderr |> Option.iter _.Dispose()
+                    spawned.Stdin |> Option.iter _.Dispose()
+                    Assert.Fail $"{label}: the cgroup launcher ran despite the preflight miss ({outcome})"
+
+                Assert.That(File.Exists procs, Is.False, $"{label}: the cgroup launcher must not start")
+                Assert.That(File.Exists marker, Is.False, $"{label}: the refused image must not run")
+            finally
+                deleteFileQuietly procs
+                deleteFileQuietly marker
+        }
+
+    member private this.AssertGroupRefused
+        (group: ProcessGroup, label: string, marker: string, command: Command)
+        : Task =
+        task {
+            let expected = this.ExpectedNotFound command
+
+            match! group.StartAsync command with
+            | Error error -> this.AssertMatchingNotFound(label, expected, error)
+            | Ok running ->
+                use running = running
+                let! outcome = running.WaitAsync()
+                Assert.Fail $"{label}: the real cgroup backend ran despite the preflight miss ({outcome})"
+
+            Assert.That(File.Exists marker, Is.False, $"{label}: the refused image must not run")
+        }
+
+    [<Test>]
+    member this.``Linux cgroup launcher preflights absent and empty PATH before its shell can search``() : Task =
+        task {
+            if not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) then
+                Assert.Ignore "Linux-only: the cgroup migration launcher is a Linux backend."
+            else
+                let currentDir = freshDir "cgroup-empty-current"
+                let currentTool = "processkit-cgroup-current-namesake"
+                let currentMarker = Path.Combine(currentDir, "current.marker")
+                let defaultClearMarker = Path.Combine(currentDir, "default-clear.marker")
+                let defaultRemoveMarker = Path.Combine(currentDir, "default-remove.marker")
+
+                try
+                    File.WriteAllText(
+                        Path.Combine(currentDir, currentTool),
+                        $"#!/bin/sh\nprintf current > '{currentMarker}'\n"
+                    )
+
+                    File.SetUnixFileMode(
+                        Path.Combine(currentDir, currentTool),
+                        UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
+                    )
+
+                    do!
+                        Command.create "sh"
+                        |> Command.args [ "-c"; $"printf default > '{defaultClearMarker}'" ]
+                        |> Command.envClear
+                        |> Command.stdout StdioMode.Null
+                        |> Command.stderr StdioMode.Null
+                        |> fun command ->
+                            this.AssertCgroupSeamRefused("EnvClear/default-path", defaultClearMarker, command)
+
+                    do!
+                        Command.create "sh"
+                        |> Command.args [ "-c"; $"printf default > '{defaultRemoveMarker}'" ]
+                        |> Command.envRemove "PATH"
+                        |> Command.stdout StdioMode.Null
+                        |> Command.stderr StdioMode.Null
+                        |> fun command ->
+                            this.AssertCgroupSeamRefused("EnvRemove/default-path", defaultRemoveMarker, command)
+
+                    do!
+                        Command.create currentTool
+                        |> Command.currentDir currentDir
+                        |> Command.env "PATH" ""
+                        |> Command.stdout StdioMode.Null
+                        |> Command.stderr StdioMode.Null
+                        |> fun command ->
+                            this.AssertCgroupSeamRefused("empty-PATH/current-directory", currentMarker, command)
+                finally
+                    deleteDirQuietly currentDir
+        }
+        :> Task
+
+    [<Test>]
+    member this.``Linux cgroup backend uses the same effective child PATH boundary as preflight``() : Task =
+        task {
+            if not (RuntimeInformation.IsOSPlatform OSPlatform.Linux) then
+                Assert.Ignore "Linux-only: this requires the cgroup-v2 backend."
+            else
+                let options =
+                    ProcessGroupOptions().WithMemoryMax(256L * 1024L * 1024L).WithMaxProcesses(64)
+
+                match ProcessGroup.Create options with
+                | Error(ProcessError.ResourceLimit _) ->
+                    Assert.Ignore "cgroup v2 limits not enforceable here (no delegated writable hierarchy)"
+                | Error other -> Assert.Fail $"creating the cgroup-v2 group failed: {other}"
+                | Ok group ->
+                    use group = group
+                    Assert.That(group.Mechanism, Is.EqualTo Mechanism.CgroupV2)
+
+                    let root = freshDir "real-cgroup"
+                    let parentDir = Path.Combine(root, "parent")
+                    let childDir = Path.Combine(root, "child")
+                    let currentDir = Path.Combine(root, "current")
+                    Directory.CreateDirectory parentDir |> ignore
+                    Directory.CreateDirectory childDir |> ignore
+                    Directory.CreateDirectory currentDir |> ignore
+
+                    let originalPath = currentPath ()
+                    let pairedName = "processkit-real-cgroup-pair"
+                    let currentName = "processkit-real-cgroup-current"
+                    let currentMarker = Path.Combine(root, "current.marker")
+                    let clearMarker = Path.Combine(root, "clear.marker")
+                    let removeMarker = Path.Combine(root, "remove.marker")
+
+                    try
+                        writeTool parentDir pairedName "PARENT-CGROUP" |> ignore
+                        let childTool = writeTool childDir pairedName "CHILD-CGROUP"
+                        writeTool currentDir currentName "CURRENT-CGROUP" |> ignore
+                        setPath (parentDir + string Path.PathSeparator + originalPath)
+
+                        let selected =
+                            Command.create pairedName
+                            |> Command.env "PATH" childDir
+                            |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                        match selected.ResolveProgram() with
+                        | Error error -> Assert.Fail $"the child-PATH image must preflight, got {error}"
+                        | Ok resolved -> Assert.That(resolved, Is.EqualTo childTool)
+
+                        match! group.StartAsync selected with
+                        | Error error -> Assert.Fail $"the child-PATH image failed through cgroup-v2: {error}"
+                        | Ok running ->
+                            use running = running
+
+                            match! running.OutputStringAsync() with
+                            | Error error -> Assert.Fail $"the cgroup-v2 child failed: {error}"
+                            | Ok result -> Assert.That(result.Stdout, Is.EqualTo "CHILD-CGROUP")
+
+                        do!
+                            Command.create "sh"
+                            |> Command.args [ "-c"; $"printf default > '{clearMarker}'" ]
+                            |> Command.envClear
+                            |> Command.stdout StdioMode.Null
+                            |> Command.stderr StdioMode.Null
+                            |> fun command ->
+                                this.AssertGroupRefused(
+                                    group,
+                                    "real cgroup EnvClear/default-path",
+                                    clearMarker,
+                                    command
+                                )
+
+                        do!
+                            Command.create "sh"
+                            |> Command.args [ "-c"; $"printf default > '{removeMarker}'" ]
+                            |> Command.envRemove "PATH"
+                            |> Command.stdout StdioMode.Null
+                            |> Command.stderr StdioMode.Null
+                            |> fun command ->
+                                this.AssertGroupRefused(
+                                    group,
+                                    "real cgroup EnvRemove/default-path",
+                                    removeMarker,
+                                    command
+                                )
+
+                        do!
+                            Command.create currentName
+                            |> Command.currentDir currentDir
+                            |> Command.env "PATH" ""
+                            |> Command.stdout StdioMode.Null
+                            |> Command.stderr StdioMode.Null
+                            |> fun command ->
+                                this.AssertGroupRefused(
+                                    group,
+                                    "real cgroup empty-PATH/current-directory",
+                                    currentMarker,
+                                    command
+                                )
+                    finally
+                        setPath originalPath
+                        deleteDirQuietly root
+        }
+        :> Task

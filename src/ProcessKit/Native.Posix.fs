@@ -5195,16 +5195,9 @@ module internal Posix =
     let private cgroupLauncherScript =
         "echo $$ > \"$1\" || exit 127; shift; exec \"$@\""
 
-    /// Spawn `command` so that its pid is placed into the cgroup whose `cgroup.procs` path is
-    /// `cgroupProcs` BEFORE the program executes a single instruction, closing the spawn-to-migrate
-    /// window (see the section comment above). Linux cgroup-backend only. A requested `Uid`/`Gid` drop is
-    /// honoured (nested inside the launcher, after the privileged migration) with the same up-front
-    /// non-root rejection as `spawnPosix`. `/bin/sh` missing (pathological on Linux) surfaces as an honest
-    /// `ProcessError.ResourceLimit`, never a silent unconstrained run.
-    let spawnPosixIntoCgroup (command: Command) (cgroupProcs: string) : Result<Spawned, ProcessError> =
-        // Resolve any prefer-local program to its absolute path first, so the cgroup launcher's inner argv
-        // (and any nested setpriv/setsid drop) `exec`s the substituted path (T-182).
-        let command = applyPreferLocal command
+    /// Build the cgroup migration launcher around a command that has already crossed
+    /// `preparePosixLaunch`'s executable-selection boundary.
+    let private spawnPreparedPosixIntoCgroup (command: Command) (cgroupProcs: string) : Result<Spawned, ProcessError> =
         let config = command.Config
 
         // Build and spawn the `/bin/sh` migration launcher around an already-resolved inner argv (the
@@ -5318,6 +5311,20 @@ module internal Posix =
                     | None -> launch ()
                 else
                     launch ()
+
+    /// Spawn `command` so that its pid is placed into the cgroup whose `cgroup.procs` path is
+    /// `cgroupProcs` BEFORE the program executes a single instruction, closing the spawn-to-migrate
+    /// window (see the section comment above). The target first crosses the same effective-child-PATH
+    /// acceptance boundary as ordinary and detached POSIX launches, so the inner launcher argv always
+    /// contains an absolute selected target or the call returns the matching pre-spawn `NotFound`.
+    /// Linux cgroup-backend only. A requested `Uid`/`Gid` drop is honoured (nested inside the launcher,
+    /// after the privileged migration) with the same up-front non-root rejection as `spawnPosix`.
+    /// `/bin/sh` missing (pathological on Linux) surfaces as an honest `ProcessError.ResourceLimit`, never
+    /// a silent unconstrained run.
+    let spawnPosixIntoCgroup (command: Command) (cgroupProcs: string) : Result<Spawned, ProcessError> =
+        match preparePosixLaunch command with
+        | Error error -> Error error
+        | Ok prepared -> spawnPreparedPosixIntoCgroup prepared cgroupProcs
 
     // ----------------------------------------------------------------------------------
     // POSIX: the detached launch (Command.LaunchDetached) — deliberately NOT contained
