@@ -196,14 +196,16 @@ type private DropCounter() =
 /// timed out — is discarded, since the caller has already been told the request failed.
 ///
 /// **Two backlogs, two knobs.** `messageBacklog` (the third constructor argument, 1024 by default)
-/// bounds the DECODED incoming messages waiting for `MessagesAsync`, dropping the oldest and counting
-/// them in `DroppedMessages`. `Command.StreamBuffer` bounds the raw frame backlog underneath it, through
-/// the `ContentLengthSession` this session owns, and only its two LOSSLESS full modes apply there:
-/// `Backpressure` paces the peer against the router, and `Error` ends the conversation with
-/// `ProcessError.OutputTooLarge` at the cap. The two DROP modes are refused when this session is
-/// constructed — the constructor raises `ProcessException` carrying `ProcessError.Unsupported`, because
-/// silently deleting a queued frame would delete a message the peer is correlating with a request, and
-/// no consumer could tell. Leaving `StreamBuffer` unset keeps the default unbounded frame backlog.
+/// bounds the DECODED incoming messages waiting for `MessagesAsync`. Old notifications may be dropped
+/// and are counted in `DroppedMessages`; a peer request is never silently dropped — if it would be
+/// evicted, the conversation ends with `ProcessError.OutputTooLarge`. `Command.StreamBuffer` bounds the
+/// raw frame backlog underneath it, through the `ContentLengthSession` this session owns, and only its
+/// two LOSSLESS full modes apply there: `Backpressure` paces the peer against the router, and `Error`
+/// ends the conversation with `ProcessError.OutputTooLarge` at the cap. The two DROP modes are refused
+/// when this session is constructed — the constructor raises `ProcessException` carrying
+/// `ProcessError.Unsupported`, because silently deleting a queued frame would delete a message the peer
+/// is correlating with a request, and no consumer could tell. Leaving `StreamBuffer` unset keeps the
+/// default unbounded frame backlog.
 [<Sealed>]
 type JsonRpcSession
     internal
@@ -237,12 +239,13 @@ type JsonRpcSession
     let mutable nextId = 0L
     let mutable ended: ProcessError option = None
     let mutable messagesClaimed = 0
+    let mutable peerRequestDropped = false
 
-    // Bounded, dropping the OLDEST message when full, so a caller that never enumerates `MessagesAsync`
-    // (or reads it slowly) cannot grow this queue without limit — a chatty LSP server emits `$/progress`
-    // and `window/logMessage` continuously. Blocking the router instead would be worse: it would also
-    // stall the answers `RequestAsync` is waiting for, deadlocking the conversation. Drops are counted in
-    // `DroppedMessages` rather than hidden.
+    // Bounded and non-blocking, so a caller that never enumerates `MessagesAsync` (or reads it slowly)
+    // cannot grow this queue without limit or stall answers `RequestAsync` is waiting for. Dropped
+    // notifications are counted. A dropped peer request is detected synchronously by this single writer
+    // and promoted to the router's terminal failure immediately after the write, because the peer cannot
+    // otherwise learn that nobody will answer its id.
     let messages =
         Channel.CreateBounded<JsonRpcMessage>(
             BoundedChannelOptions(
@@ -251,8 +254,21 @@ type JsonRpcSession
                 SingleWriter = true,
                 FullMode = BoundedChannelFullMode.DropOldest
             ),
-            (fun _ -> dropped.Increment())
+            (fun message ->
+                if message.IsRequest then
+                    peerRequestDropped <- true
+                else
+                    dropped.Increment())
         )
+
+    let messageBacklogOverflow () =
+        let totalMessages =
+            if messageBacklog = Int32.MaxValue then
+                Int32.MaxValue
+            else
+                messageBacklog + 1
+
+        ProcessError.OutputTooLarge(program, None, None, totalMessages, 0)
 
     let parseFailure (detail: string) = ProcessError.Parse(program, detail)
 
@@ -457,8 +473,14 @@ type JsonRpcSession
                 )
 
             // Never blocks (see the channel's drop policy), so a consumer that is not reading its
-            // messages can never stall the answers other calls are waiting for.
+            // messages can never stall the answers other calls are waiting for. The drop callback runs
+            // synchronously on this sole writer; promote an evicted peer request before routing another
+            // frame, so its peer observes a terminal typed failure rather than waiting forever.
             messages.Writer.TryWrite message |> ignore
+
+            if peerRequestDropped then
+                peerRequestDropped <- false
+                raise (ProcessException(messageBacklogOverflow ()))
         | None ->
             match id with
             | None ->
@@ -823,9 +845,10 @@ type JsonRpcSession
 
     member internal _.Identity = identity
 
-    /// How many incoming notifications/peer requests were dropped because the inbound backlog was full
-    /// — a consumer that is not enumerating `MessagesAsync`, or is falling behind the peer. Always `0`
-    /// while the consumer keeps up. Answers to this session's own requests are never dropped.
+    /// How many incoming notifications were dropped because the inbound backlog was full — a consumer
+    /// that is not enumerating `MessagesAsync`, or is falling behind the peer. Always `0` while the
+    /// consumer keeps up. Peer requests and answers to this session's own requests are never silently
+    /// dropped; evicting a peer request ends the conversation with `ProcessError.OutputTooLarge`.
     member _.DroppedMessages = dropped.Value
 
     /// Enumerate the peer's notifications and its own requests, in arrival order. Answers to this
@@ -833,8 +856,8 @@ type JsonRpcSession
     /// this enumeration and the request verbs never compete for the same message.
     ///
     /// The enumeration ends when the peer's framed output ends, and faults with `ProcessException` when
-    /// the peer sends something that is not a JSON-RPC message. This single-consumer method may be
-    /// called only once.
+    /// the peer sends something that is not a JSON-RPC message or an unread peer request would overflow
+    /// the bounded decoded-message backlog. This single-consumer method may be called only once.
     member _.MessagesAsync() : IAsyncEnumerable<JsonRpcMessage> =
         if Interlocked.Exchange(&messagesClaimed, 1) <> 0 then
             raise (InvalidOperationException "this JsonRpcSession's incoming messages have already been consumed")

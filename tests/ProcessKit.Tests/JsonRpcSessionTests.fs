@@ -1265,7 +1265,7 @@ type JsonRpcSessionTests() =
         :> Task
 
     [<Test>]
-    member _.``a full inbound backlog drops the oldest messages and counts them``() : Task =
+    member _.``a full inbound backlog drops the oldest notifications and counts them``() : Task =
         task {
             let peer = peerHandle ()
             use running = peer.Running
@@ -1291,6 +1291,101 @@ type JsonRpcSessionTests() =
             let! received = messages.MoveNextAsync()
             Assert.That(received, Is.True)
             Assert.That(messages.Current.Method, Is.EqualTo "note/3")
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a full inbound backlog drops a notification to retain a peer request``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running, 16 * 1024 * 1024, 1)
+
+            let call = session.RequestRawAsync("initialize", null)
+            use! localRequest = nextFrame peer.Stdin
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/1\"}")
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":\"peer-1\",\"method\":\"workspace/configuration\"}")
+
+            // This answer is a deterministic routing fence: the router handles it only after both
+            // decoded messages above, and responses never enter or wait on the message backlog.
+            peer.Stdout.Emit(framed (responseJson (rawId localRequest) "null"))
+            let! answer = call
+            assertRaw "null" answer
+
+            Assert.That(session.DroppedMessages, Is.EqualTo 1L)
+
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+            let! received = messages.MoveNextAsync()
+            Assert.That(received, Is.True)
+
+            let peerRequest = messages.Current
+            Assert.That(peerRequest.Method, Is.EqualTo "workspace/configuration")
+            Assert.That(peerRequest.Id, Is.EqualTo(Some "\"peer-1\""))
+            Assert.That(peerRequest.IsRequest, Is.True)
+
+            match! session.RespondRawAsync(peerRequest, "null") with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"expected the retained peer request to remain answerable, got {error}"
+
+            use! peerResponse = nextFrame peer.Stdin
+            Assert.That(rawId peerResponse, Is.EqualTo "\"peer-1\"")
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``evicting a peer request faults a mixed inbound backlog instead of losing it silently``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running, 16 * 1024 * 1024, 2)
+
+            let call = session.RequestRawAsync("initialize", null)
+            use! _localRequest = nextFrame peer.Stdin
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/1\"}")
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"workspace/configuration\"}")
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/2\"}")
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/3\"}")
+
+            // The pending local request is completed by endSession, so this is a deterministic fence
+            // for the overflow without a delay or a response frame the faulted router could not read.
+            match! call with
+            | Error(ProcessError.OutputTooLarge(program, None, None, totalMessages, totalBytes)) ->
+                Assert.That(program, Is.EqualTo "language-server")
+                Assert.That(totalMessages, Is.EqualTo 3)
+                Assert.That(totalBytes, Is.EqualTo 0)
+            | other -> Assert.Fail $"expected a typed decoded-backlog overflow, got {other}"
+
+            let droppedMessage = "only the admissibly lossy notification is counted as dropped"
+            Assert.That(session.DroppedMessages, Is.EqualTo 1L, droppedMessage)
+
+            match! session.RequestRawAsync("shutdown", null) with
+            | Error(ProcessError.OutputTooLarge _) -> ()
+            | other -> Assert.Fail $"expected the overflow to remain the session's terminal error, got {other}"
+
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+            for expected in [ "note/2"; "note/3" ] do
+                let! received = messages.MoveNextAsync()
+                Assert.That(received, Is.True)
+                Assert.That(messages.Current.Method, Is.EqualTo expected)
+
+            let faulted =
+                Assert.ThrowsAsync<ProcessException>(Func<Task>(fun () -> messages.MoveNextAsync().AsTask()))
+
+            match faulted with
+            | null -> Assert.Fail "expected the decoded-message stream to fault after draining retained notifications"
+            | error ->
+                match error.Error with
+                | ProcessError.OutputTooLarge(_, None, None, 3, 0) -> ()
+                | other -> Assert.Fail $"expected the same OutputTooLarge terminal error, got {other}"
+
             do! messages.DisposeAsync()
         }
         :> Task
