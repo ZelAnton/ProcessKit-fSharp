@@ -1236,6 +1236,7 @@ Every failure is a typed `ProcessError`, never a raw exception and never a silen
 | A timeout or token interrupted a send mid-frame | The same `ProcessError.Timeout`/`Cancelled` — and it ends the session, because the peer may have received a truncated frame |
 | A timeout or token ended a send before it wrote anything | The same `ProcessError.Timeout`/`Cancelled`, failing only that call — nothing reached the peer, so the session stays usable |
 | A `StreamBuffer` cap with `StreamFullMode.Error` filled up | `ProcessError.OutputTooLarge`, ending the session like a protocol failure (see the backlog note below) |
+| An unread peer request would be evicted from the decoded-message backlog | `ProcessError.OutputTooLarge`, ending the session instead of silently losing a request the peer is waiting on |
 | The peer's framed output ended before answering | `ProcessError.Io` — and every later verb fails the same way instead of waiting forever |
 | The `result` does not fit the requested type | `ProcessError.Parse` (a JSON `null` result included — read it with `RequestRawAsync`) |
 | The peer sent something that is not a JSON-RPC 2.0 message, including a missing, non-string, or non-`"2.0"` `jsonrpc` member | `ProcessError.Parse`, ending the session before routing: pending requests all fail with it and `MessagesAsync` faults with `ProcessException` |
@@ -1260,11 +1261,16 @@ per-request timeout bounds its own call rather than the session. The framing lay
 which of the two happened, so "the session is over" always means a frame really was being written.
 
 Two backlogs sit behind a session, with separate knobs. The third constructor argument
-(`messageBacklog`, 1024 by default) bounds the *decoded* messages waiting for `MessagesAsync`, dropping
-the oldest and counting them in `DroppedMessages`. `Command.StreamBuffer` bounds the *raw frame*
-backlog underneath, through the `ContentLengthSession` this session owns, and only its lossless full
-modes apply there: `Backpressure` paces the peer against the router, and `Error` ends the conversation
-with `ProcessError.OutputTooLarge` at the cap. `DropOldest`/`DropNewest` are refused when the session is
+(`messageBacklog`, 1024 by default) bounds the *decoded* messages waiting for `MessagesAsync`.
+Notifications remain lossy: the oldest unread notification may be dropped and is counted in
+`DroppedMessages`. Peer requests are fail-loud: if making room would evict one, the session ends with
+`ProcessError.OutputTooLarge`, pending and later local requests fail with that same terminal error, and
+`MessagesAsync` faults after yielding anything still retained. The router never waits for this backlog,
+and responses to local requests bypass it, so a slow or absent message consumer cannot stall response
+correlation. `Command.StreamBuffer` bounds the *raw frame* backlog underneath, through the
+`ContentLengthSession` this session owns, and only its lossless full modes apply there: `Backpressure`
+paces the peer against the router, and `Error` ends the conversation with
+`ProcessError.OutputTooLarge` at the cap. `DropOldest`/`DropNewest` are refused when the session is
 constructed — the constructor throws `ProcessException` carrying `ProcessError.Unsupported`, since
 dropping a queued frame would delete a message the peer is correlating with a request. Leaving
 `StreamBuffer` unset keeps the default unbounded frame backlog.
@@ -1274,9 +1280,10 @@ requests: notifications (`IsRequest` false) and the peer's own requests (`IsRequ
 them with `RespondAsync` / `RespondRawAsync` / `RespondErrorAsync`, which echo its `id` verbatim).
 Read `ParamsJson` or call `ParamsAs<T>`; answering a notification is a typed
 `ProcessError.Unsupported`, since the peer is not waiting for one. The backlog is bounded (1024
-messages by default, the third constructor argument): when a consumer falls behind, the oldest
-messages are dropped and counted in `DroppedMessages` rather than growing without limit or stalling
-the answers other calls are waiting for.
+messages by default, the third constructor argument): when a consumer falls behind, old notifications
+may be dropped and counted in `DroppedMessages` rather than growing without limit. An unread peer
+request is never silently discarded — overflow at that point faults the conversation as described
+above.
 
 This session owns the handle exactly as `ContentLengthSession` does — it creates that session
 itself, so the frames are never exposed for a second reader — and `FinishInputAsync` closes the
