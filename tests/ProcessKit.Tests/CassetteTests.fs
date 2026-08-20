@@ -455,6 +455,60 @@ type CassetteTests() =
     let redirectPath () =
         Path.Combine(Path.GetTempPath(), $"pk-wiring-{Guid.NewGuid():N}.log")
 
+    let cancellationDuringLookupOptions
+        (source: CancellationTokenSource)
+        (cancelNextLookup: bool ref)
+        : RecordReplayOptions =
+        RecordReplayOptions()
+            .WithArgNormalizer(fun _ ->
+                if cancelNextLookup.Value then
+                    cancelNextLookup.Value <- false
+                    source.Cancel()
+
+                [||])
+
+    let recordDuplicateEntries path options capture : Task =
+        task {
+            let inner =
+                ScriptedRunner()
+                    .On([ "tool"; "record-first" ], Reply.Ok "first")
+                    .On([ "tool"; "record-second" ], Reply.Ok "second")
+                :> IProcessRunner
+
+            use recorder = RecordReplayRunner.Record(path, inner, options)
+
+            for argument in [ "record-first"; "record-second" ] do
+                let command = Command.create "tool" |> Command.arg argument
+
+                match! capture (runner recorder) command with
+                | Ok _ -> ()
+                | Error error -> Assert.Fail $"record duplicate '{argument}': {error}"
+
+            match recorder.Save() with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"save duplicates: {error}"
+        }
+
+    let assertTextReplayOrder (replay: IProcessRunner) : Task =
+        task {
+            let command = Command.create "tool" |> Command.arg "live"
+
+            for expected in [ "first"; "second"; "second" ] do
+                match! replay.CaptureStringAsync(command, CancellationToken.None) with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo expected)
+                | Error error -> Assert.Fail $"expected '{expected}' in replay order: {error}"
+        }
+
+    let assertBytesReplayOrder (replay: IProcessRunner) : Task =
+        task {
+            let command = Command.create "tool" |> Command.arg "live"
+
+            for expected in [ "first"; "second"; "second" ] do
+                match! replay.CaptureBytesAsync(command, CancellationToken.None) with
+                | Ok result -> Assert.That(Encoding.UTF8.GetString result.Stdout, Is.EqualTo expected)
+                | Error error -> Assert.Fail $"expected '{expected}' in bytes replay order: {error}"
+        }
+
     [<Test>]
     member _.``replay completion honours an already-cancelled Command.CancelOn``() : Task =
         withCassette (fun path ->
@@ -512,6 +566,122 @@ type CassetteTests() =
                         match! running.OutputStringAsync() with
                         | Ok result -> Assert.That(result.Stdout, Is.EqualTo "recorded")
                         | Error error -> Assert.Fail $"replayed fake failed: {error}"
+            })
+
+    [<Test>]
+    member _.``text replay cancellation during live key lookup does not consume the next entry``() : Task =
+        withCassette (fun path ->
+            task {
+                use source = new CancellationTokenSource()
+                let cancelNextLookup = ref false
+                let options = cancellationDuringLookupOptions source cancelNextLookup
+
+                do!
+                    recordDuplicateEntries path options (fun replay command ->
+                        replay.CaptureStringAsync(command, CancellationToken.None))
+
+                match RecordReplayRunner.Replay(path, options) with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    cancelNextLookup.Value <- true
+                    let command = Command.create "tool" |> Command.arg "live"
+
+                    match! (runner replayer).CaptureStringAsync(command, source.Token) with
+                    | Error(ProcessError.Cancelled "tool") -> ()
+                    | other -> Assert.Fail $"lookup cancellation must win before text acceptance, got {other}"
+
+                    do! assertTextReplayOrder (runner replayer)
+            })
+
+    [<Test>]
+    member _.``bytes replay cancellation during live key lookup does not consume the next entry``() : Task =
+        withCassette (fun path ->
+            task {
+                use source = new CancellationTokenSource()
+                let cancelNextLookup = ref false
+                let options = cancellationDuringLookupOptions source cancelNextLookup
+
+                do!
+                    recordDuplicateEntries path options (fun replay command ->
+                        replay.CaptureBytesAsync(command, CancellationToken.None))
+
+                match RecordReplayRunner.Replay(path, options) with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    cancelNextLookup.Value <- true
+                    let command = Command.create "tool" |> Command.arg "live"
+
+                    match! (runner replayer).CaptureBytesAsync(command, source.Token) with
+                    | Error(ProcessError.Cancelled "tool") -> ()
+                    | other -> Assert.Fail $"lookup cancellation must win before bytes acceptance, got {other}"
+
+                    do! assertBytesReplayOrder (runner replayer)
+            })
+
+    [<Test>]
+    member _.``Spawn replay cancellation during live key lookup does not consume the next entry``() : Task =
+        withCassette (fun path ->
+            task {
+                use source = new CancellationTokenSource()
+                let cancelNextLookup = ref false
+                let options = cancellationDuringLookupOptions source cancelNextLookup
+
+                do!
+                    recordDuplicateEntries path options (fun replay command ->
+                        replay.CaptureStringAsync(command, CancellationToken.None))
+
+                match RecordReplayRunner.Replay(path, options) with
+                | Error error -> Assert.Fail $"replay load: {error}"
+                | Ok replayer ->
+                    use replayer = replayer
+                    cancelNextLookup.Value <- true
+                    let command = Command.create "tool" |> Command.arg "live"
+
+                    match! (runner replayer).SpawnAsync(command, source.Token) with
+                    | Error(ProcessError.Cancelled "tool") -> ()
+                    | other -> Assert.Fail $"lookup cancellation must win before Spawn acceptance, got {other}"
+
+                    for expected in [ "first"; "second"; "second" ] do
+                        match! (runner replayer).SpawnAsync(command, CancellationToken.None) with
+                        | Error error -> Assert.Fail $"spawn replay for '{expected}': {error}"
+                        | Ok running ->
+                            use running = running
+
+                            match! running.OutputStringAsync() with
+                            | Ok result -> Assert.That(result.Stdout, Is.EqualTo expected)
+                            | Error error -> Assert.Fail $"consume spawned replay for '{expected}': {error}"
+            })
+
+    [<Test>]
+    member _.``Auto hit cancellation during live key lookup does not consume or delegate``() : Task =
+        withCassette (fun path ->
+            task {
+                use source = new CancellationTokenSource()
+                let cancelNextLookup = ref false
+                let options = cancellationDuringLookupOptions source cancelNextLookup
+
+                do!
+                    recordDuplicateEntries path options (fun replay command ->
+                        replay.CaptureStringAsync(command, CancellationToken.None))
+
+                let inner =
+                    ErrorRunner [ ProcessError.Unsupported "Auto hit delegated unexpectedly" ]
+
+                match RecordReplayRunner.Auto(path, inner, options) with
+                | Error error -> Assert.Fail $"Auto load: {error}"
+                | Ok auto ->
+                    use auto = auto
+                    cancelNextLookup.Value <- true
+                    let command = Command.create "tool" |> Command.arg "live"
+
+                    match! (runner auto).CaptureStringAsync(command, source.Token) with
+                    | Error(ProcessError.Cancelled "tool") -> ()
+                    | other -> Assert.Fail $"lookup cancellation must win before Auto-hit acceptance, got {other}"
+
+                    do! assertTextReplayOrder (runner auto)
+                    Assert.That(inner.Calls, Is.Zero, "an Auto hit must never reach the inner runner")
             })
 
     [<Test>]
