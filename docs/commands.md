@@ -1025,9 +1025,10 @@ Console.WriteLine(await cmd.RunAsync() switch
   retries, and `0`/`1` both mean a single run), waiting `delay` between attempts,
   while your classifier returns `true` for the error (`ProcessError.isTransient`
   covers spawn races and I/O blips). The classifier sees the typed `ProcessError`; a
-  cancelled token stops the loop. The delay must be zero or positive; negative
-  values are rejected when the command is built, while values beyond the runtime
-  timer maximum (about 24.8 days) are clamped when armed. If the classifier throws,
+  cancelled token stops the loop. `maxAttempts` must not be negative; `0` and `1`
+  remain the valid single-run boundary values. The delay must be zero or positive;
+  negative values are rejected when the command is built, while values beyond the
+  runtime timer maximum (about 24.8 days) are clamped when armed. If the classifier throws,
   the current attempt is terminal: the verb returns `ProcessError.RetryPredicate`,
   whose `Original` field is the failed attempt's original `ProcessError` and whose
   `Detail` contains the callback exception message. The callback exception never
@@ -1051,8 +1052,9 @@ Console.WriteLine(await cmd.RunAsync() switch
   nothing at all, such as a [`DryRunRunner`](testing.md) preview.
 - **`RetryBackoff`** uses the same attempt/classifier contract with a growing
   `baseDelay × factor^n` pause, capped by `maxDelay` before optional `[0.5, 1.5)`
-  jitter. Base/cap delays must be non-negative and `factor` must be finite and at
-  least `1.0`; the pipe-friendly mirror is `Command.retryBackoff`.
+  jitter. It applies the same non-negative `maxAttempts` rule; base/cap delays must
+  be non-negative and `factor` must be finite and at least `1.0`; the pipe-friendly
+  mirror is `Command.retryBackoff`.
 - **`RetryNever`** explicitly disables retrying for this command — it always runs
   exactly once. This differs from simply never calling `Retry`: a `CliClient` built
   with `WithDefaults(fun c -> c.Retry(...))` applies that default `Retry` to every

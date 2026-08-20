@@ -396,6 +396,9 @@ module internal CommandConfig =
           Logger = None
           RunId = None }
 
+    let validateRetryMaxAttempts (maxAttempts: int) =
+        ArgumentOutOfRangeException.ThrowIfNegative(maxAttempts, nameof maxAttempts)
+
     /// The soft signal a graceful CANCELLATION teardown opens with: `Command.CancelSignal` when set,
     /// otherwise `Signal.Term` — the same default `StopSignal` carries. One resolver, so every path that
     /// drives the cancellation ladder (the completion verbs, a pipeline chain, a supervised incarnation)
@@ -1407,12 +1410,14 @@ type Command internal (config: CommandConfig) =
     /// Run the command up to `maxAttempts` times **in total** (the initial run plus up to
     /// `maxAttempts - 1` retries), waiting `delay` between attempts, while `shouldRetry` returns true
     /// for the error. `maxAttempts` of `0` or `1` both mean a single run — a command always runs at
-    /// least once. A negative `delay` is rejected; delays beyond the maximum armable timer interval
-    /// are clamped when the retry runs. If `shouldRetry` throws, the current attempt is terminal and
-    /// the consuming verb returns `ProcessError.RetryPredicate` with the original `ProcessError` in
-    /// `Original`; the callback exception never escapes as a raw task fault and no further attempt runs.
+    /// least once — while a negative value is rejected with `ArgumentOutOfRangeException`. A negative
+    /// `delay` is rejected; delays beyond the maximum armable timer interval are clamped when the retry
+    /// runs. If `shouldRetry` throws, the current attempt is terminal and the consuming verb returns
+    /// `ProcessError.RetryPredicate` with the original `ProcessError` in `Original`; the callback
+    /// exception never escapes as a raw task fault and no further attempt runs.
     member _.Retry(maxAttempts: int, delay: TimeSpan, shouldRetry: Func<ProcessError, bool>) =
         ArgumentNullException.ThrowIfNull shouldRetry
+        CommandConfig.validateRetryMaxAttempts maxAttempts
         ArgumentOutOfRangeException.ThrowIfLessThan(delay, TimeSpan.Zero)
 
         Command(
@@ -1424,10 +1429,11 @@ type Command internal (config: CommandConfig) =
 
     /// Run the command up to `maxAttempts` times in total, using exponential backoff before each
     /// retry: `baseDelay × factor^n` (starting at `n = 0`), capped at `maxDelay` before optional
-    /// jitter multiplies it by a random factor in `[0.5, 1.5)`. All delays must be non-negative;
-    /// `factor` must be finite and at least `1.0`. Retry timers use the command's `TimeProvider`.
-    /// If `shouldRetry` throws, the current attempt is terminal and the consuming verb returns
-    /// `ProcessError.RetryPredicate` with the original `ProcessError` in `Original`; the callback
+    /// jitter multiplies it by a random factor in `[0.5, 1.5)`. A negative `maxAttempts` is rejected
+    /// with `ArgumentOutOfRangeException`; `0` and `1` both mean a single run. All delays must be
+    /// non-negative; `factor` must be finite and at least `1.0`. Retry timers use the command's
+    /// `TimeProvider`. If `shouldRetry` throws, the current attempt is terminal and the consuming verb
+    /// returns `ProcessError.RetryPredicate` with the original `ProcessError` in `Original`; the callback
     /// exception never escapes as a raw task fault and no further attempt runs.
     member _.RetryBackoff
         (
@@ -1439,6 +1445,7 @@ type Command internal (config: CommandConfig) =
             shouldRetry: Func<ProcessError, bool>
         ) =
         ArgumentNullException.ThrowIfNull shouldRetry
+        CommandConfig.validateRetryMaxAttempts maxAttempts
         ArgumentOutOfRangeException.ThrowIfLessThan(baseDelay, TimeSpan.Zero)
         ArgumentOutOfRangeException.ThrowIfLessThan(maxDelay, TimeSpan.Zero)
 
@@ -2099,17 +2106,19 @@ module Command =
     let cancelSignal (signal: Signal) (command: Command) = command.CancelSignal signal
 
     /// Run the command up to `maxAttempts` times in total (initial run plus retries), waiting `delay`
-    /// between attempts (`0`/`1` both mean a single run). A negative `delay` is rejected; delays
-    /// beyond the maximum armable timer interval are clamped when the retry runs. If the predicate
-    /// throws, the consuming verb returns `ProcessError.RetryPredicate` with the original attempt
-    /// error in `Original`, and no further attempt runs.
+    /// between attempts (`0`/`1` both mean a single run). A negative `maxAttempts` or `delay` is
+    /// rejected with `ArgumentOutOfRangeException`; delays beyond the maximum armable timer interval
+    /// are clamped when the retry runs. If the predicate throws, the consuming verb returns
+    /// `ProcessError.RetryPredicate` with the original attempt error in `Original`, and no further
+    /// attempt runs.
     let retry (maxAttempts: int) (delay: TimeSpan) (shouldRetry: ProcessError -> bool) (command: Command) =
         command.Retry(maxAttempts, delay, Func<ProcessError, bool> shouldRetry)
 
     /// Run the command with exponential retry backoff: `baseDelay × factor^n`, capped at `maxDelay`
-    /// before optional jitter. Retry timers use the command's `TimeProvider`. If the predicate throws,
-    /// the consuming verb returns `ProcessError.RetryPredicate` with the original attempt error in
-    /// `Original`, and no further attempt runs.
+    /// before optional jitter. A negative `maxAttempts` is rejected with `ArgumentOutOfRangeException`;
+    /// `0` and `1` both mean a single run. Retry timers use the command's `TimeProvider`. If the
+    /// predicate throws, the consuming verb returns `ProcessError.RetryPredicate` with the original
+    /// attempt error in `Original`, and no further attempt runs.
     let retryBackoff
         (maxAttempts: int)
         (baseDelay: TimeSpan)

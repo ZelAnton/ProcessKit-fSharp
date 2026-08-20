@@ -559,6 +559,64 @@ type RunnerTests() =
         :> Task
 
     [<Test>]
+    member _.``Retry builders reject negative maxAttempts consistently``() =
+        let shouldRetry = Func<ProcessError, bool>(fun _ -> true)
+        let zero = TimeSpan.Zero
+
+        let assertRejected (build: int -> unit) =
+            for maxAttempts in [ -1; Int32.MinValue ] do
+                match Assert.Throws<ArgumentOutOfRangeException>(Action(fun () -> build maxAttempts)) with
+                | null -> Assert.Fail("Assert.Throws did not return an exception.")
+                | error -> Assert.That(error.ParamName, Is.EqualTo "maxAttempts")
+
+        assertRejected (fun maxAttempts -> Command("svc").Retry(maxAttempts, zero, shouldRetry) |> ignore)
+
+        assertRejected (fun maxAttempts ->
+            Command.create "svc" |> Command.retry maxAttempts zero (fun _ -> true) |> ignore)
+
+        assertRejected (fun maxAttempts ->
+            CliClient("svc").WithDefaults(fun command -> command.Retry(maxAttempts, zero, shouldRetry))
+            |> ignore)
+
+        assertRejected (fun maxAttempts ->
+            Command("svc").RetryBackoff(maxAttempts, zero, 1.0, zero, false, shouldRetry)
+            |> ignore)
+
+        assertRejected (fun maxAttempts ->
+            Command.create "svc"
+            |> Command.retryBackoff maxAttempts zero 1.0 zero false (fun _ -> true)
+            |> ignore)
+
+        assertRejected (fun maxAttempts ->
+            CliClient("svc")
+                .WithDefaults(fun command -> command.RetryBackoff(maxAttempts, zero, 1.0, zero, false, shouldRetry))
+            |> ignore)
+
+    [<Test>]
+    member _.``Retry builders accept zero and one maxAttempts consistently``() =
+        let shouldRetry = Func<ProcessError, bool>(fun _ -> true)
+        let zero = TimeSpan.Zero
+
+        for maxAttempts in [ 0; 1 ] do
+            Command("svc").Retry(maxAttempts, zero, shouldRetry) |> ignore
+
+            Command.create "svc" |> Command.retry maxAttempts zero (fun _ -> true) |> ignore
+
+            CliClient("svc").WithDefaults(fun command -> command.Retry(maxAttempts, zero, shouldRetry))
+            |> ignore
+
+            Command("svc").RetryBackoff(maxAttempts, zero, 1.0, zero, false, shouldRetry)
+            |> ignore
+
+            Command.create "svc"
+            |> Command.retryBackoff maxAttempts zero 1.0 zero false (fun _ -> true)
+            |> ignore
+
+            CliClient("svc")
+                .WithDefaults(fun command -> command.RetryBackoff(maxAttempts, zero, 1.0, zero, false, shouldRetry))
+            |> ignore
+
+    [<Test>]
     member _.``Retry rejects negative delays at every builder entry point``() =
         let shouldRetry = Func<ProcessError, bool>(fun _ -> true)
 
@@ -579,9 +637,6 @@ type RunnerTests() =
                     |> ignore)
             )
             |> ignore
-
-        Command("svc").Retry(0, TimeSpan.Zero, shouldRetry) |> ignore
-        Command("svc").Retry(1, TimeSpan.Zero, shouldRetry) |> ignore
 
     [<Test>]
     member _.``RetryBackoff validates every delay and factor at the builder boundary``() =
@@ -610,8 +665,6 @@ type RunnerTests() =
                     |> ignore)
             )
             |> ignore
-
-        Command("svc").RetryBackoff(1, zero, 1.0, zero, false, shouldRetry) |> ignore
 
     [<Test>]
     member _.``RetryBackoff inherits through CliClient and uses TimeProvider with deterministic jitter``() : Task =

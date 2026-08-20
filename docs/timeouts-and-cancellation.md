@@ -327,7 +327,9 @@ backoff vocabulary as `Supervisor`, applied to a finite one-operation retry loop
 
 `maxAttempts` is the **total** number of runs (the first run plus up to
 `maxAttempts - 1` retries), so `Retry 3` runs the command at most three times, and
-`0`/`1` both mean a single run — a command always runs at least once.
+`0`/`1` both mean a single run — a command always runs at least once. A negative
+value is rejected at the `Retry`/`RetryBackoff` builder boundary with
+`ArgumentOutOfRangeException`.
 
 A command whose stdin is a **one-shot** source (`Stdin.FromStream` / `FromLines` /
 `FromAsyncLines`) still runs its first attempt, but retries only after a failure
