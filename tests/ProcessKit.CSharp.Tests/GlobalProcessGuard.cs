@@ -38,7 +38,9 @@ internal enum ProcessGuardStatus
 ///
 /// Off Windows this is a no-op: the stranded-window problem is a Windows one, and the POSIX primitives
 /// that could contain the host's descendants (process group, cgroup) are the library's own mechanisms,
-/// which the suite asserts on. The Linux runs are hermetic through their container instead.
+/// which the suite asserts on. Nothing at the harness level reaps a stranded child there — per-fixture
+/// cleanup is the only net a POSIX run has, an accepted gap because the survivor is an idle process
+/// rather than a window on someone's desktop, not one some outer mechanism is known to close.
 ///
 /// A `Guarded` status says the host joined a Job, which is not by itself proof that the run's children
 /// join it too — an ancestor Job carrying `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` would have the kernel
@@ -140,7 +142,8 @@ internal static class GlobalProcessGuard
             if (!OperatingSystem.IsWindows())
             {
                 Status = ProcessGuardStatus.NotApplicable;
-                Reason = "a stranded child window is a Windows problem; the POSIX runs are hermetic through their container";
+                Reason =
+                    "a stranded child window is a Windows problem, and POSIX has no containment primitive that would not collide with the process-group/cgroup mechanisms under test; off Windows a stranded child is left to per-fixture cleanup";
                 return;
             }
 

@@ -85,8 +85,12 @@ type internal ProcessGuardState =
 /// a console window or a modal dialog on the operator's desktop), and POSIX offers no equivalent
 /// primitive that could contain the host's own descendants without disturbing the containment the suite
 /// is testing: the process group and the cgroup ARE the library's POSIX mechanisms, and tests assert on
-/// both. The Linux runs that matter are already hermetic by construction — `scripts/test-linux.ps1` and
-/// CI run the suite in a container whose teardown takes the whole PID namespace with it.
+/// both. The gap that leaves is real and unhedged: off Windows nothing at the harness level reaps a child
+/// a test stranded, so the per-fixture discipline (`use group = …`, `killQuietly` in a `finally`) is the
+/// only net a POSIX run has. It is accepted because the survivor there is an idle process rather than a
+/// window on someone's desktop — NOT because some outer mechanism is known to collect it. Whether any
+/// given run happens to dispose of survivors anyway is a property of how that run is launched, not of
+/// this harness; if you need the guarantee off Windows, this is the gap to close.
 module internal GlobalProcessGuard =
 
     // JOBOBJECTINFOCLASS values used below.
@@ -359,7 +363,7 @@ module internal GlobalProcessGuard =
                 if not (OperatingSystem.IsWindows()) then
                     guardState <-
                         ProcessGuardState.NotApplicable
-                            "a stranded child window is a Windows problem, and POSIX has no containment primitive that would not collide with the process-group/cgroup mechanisms under test; the Linux runs are hermetic through their container instead"
+                            "a stranded child window is a Windows problem, and POSIX has no containment primitive that would not collide with the process-group/cgroup mechanisms under test; off Windows a stranded child is left to per-fixture cleanup"
                 else
                     try
                         match createKillOnCloseJob () with
