@@ -574,7 +574,7 @@ type TimeoutTests() =
         :> Task
 
     [<Test>]
-    member _.``Retry 0 (or any non-positive maxAttempts) runs the command exactly once``() : Task =
+    member _.``Retry 0 runs the command exactly once``() : Task =
         let id = Guid.NewGuid().ToString("N")
         let marker = Path.Combine(Path.GetTempPath(), $"pk-retry0-{id}.txt")
 
@@ -586,8 +586,8 @@ type TimeoutTests() =
                     else
                         $"echo x >> {marker}; exit 1"
 
-                // `maxAttempts` counts total runs, so 0 (a non-positive value) is still a single run — a
-                // command always runs at least once, and the `- 1` guard can't underflow into a storm.
+                // `maxAttempts` counts total runs, so the valid boundary value 0 is still a single run —
+                // a command always runs at least once.
                 let command =
                     shell script |> Command.retry 0 (TimeSpan.FromMilliseconds 50.0) (fun _ -> true)
 

@@ -302,9 +302,9 @@ module Runner =
                 let retryToken = retryCts.Token
 
                 // `maxAttempts` is the TOTAL number of runs (the initial run plus retries), so the
-                // command always runs at least once: `0`/`1` (and any non-positive value) mean a single
-                // run, `3` means one run and up to two retries. (Matches the vocabulary of the source
-                // crate's `retry`.) Guard the `- 1` so `Int32.MinValue` can't wrap to a huge retry count.
+                // command always runs at least once: `0`/`1` mean a single run, `3` means one run and up
+                // to two retries. Public builders reject negative values before they reach this loop;
+                // retaining the `<= 1` branch here also keeps the internal subtraction defensive.
                 let maxRetries = if maxAttempts <= 1 then 0 else maxAttempts - 1
 
                 // A one-shot stdin source (`FromStream`/`FromLines`/`FromAsyncLines`) feeds exactly one
@@ -314,7 +314,7 @@ module Runner =
                 // empty or truncated input. This hold is a LOAN for the duration of the run, whoever the
                 // runner turns out to be: the `finally` below hands it straight back unless some attempt
                 // actually launched a child over it, so a run through a runner that spawns nothing leaves
-                // the payload exactly as it found it. A single-run policy (`maxAttempts <= 1`) reserves
+                // the payload exactly as it found it. A single-run policy (`maxRetries = 0`) reserves
                 // nothing (each launch takes the payload for itself) and behaves exactly as it did
                 // before, and so does every repeatable source.
                 let reservationResult =
