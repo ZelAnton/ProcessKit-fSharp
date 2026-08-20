@@ -946,8 +946,8 @@ type RunningProcess
                 // The captures are owned HERE, not by the pumps: a pump the bounded post-exit output
                 // drain could not end (an inherited pipe a descendant still holds open) is abandoned
                 // rather than awaited, and this verb must still report what it captured.
-                let outBuf = sessions.NewCaptureBuffer()
-                let errBuf = sessions.NewCaptureBuffer()
+                let outBuf = sessions.NewCaptureBuffer CaptureStream.Stdout
+                let errBuf = sessions.NewCaptureBuffer CaptureStream.Stderr
                 let stdoutTask = sessions.PumpStdoutBuffer outBuf
                 let stderrTask = sessions.PumpStderrBuffer errBuf
                 // This verb runs the child to completion, so no caller can write its stdin past here: end
@@ -1030,6 +1030,10 @@ type RunningProcess
     /// This is a deliberate, documented divergence from the Rust `ProcessKit-rs` reference, whose
     /// `output_bytes` bounds raw bytes only by `Timeout`, not by the buffer policy: a caller who set
     /// `MaxBytes`/`FailLoud` to bound memory would still get an unbounded stdout buffer otherwise.
+    ///
+    /// A configured `Command.CapturePolicy` shapes the line-pumped **stderr** capture here and leaves
+    /// the raw stdout bytes untouched: that seam transforms decoded lines, and this stdout capture has
+    /// no line structure to hand it. Use the text verb when a policy must shape stdout.
     member _.OutputBytesAsync() : Task<Result<ProcessResult<byte[]>, ProcessError>> =
         if not (gate.TryClaimBuffered()) then
             Task.FromResult(Error(alreadyConsumedError ()))
@@ -1045,7 +1049,7 @@ type RunningProcess
                 // teardown race, and a pump the post-exit drain bound had to abandon, both leave this verb
                 // holding the bytes that did arrive rather than nothing — T-087.
                 let stdoutSink = Pump.RawSink config.OutputBuffer
-                let errBuf = sessions.NewCaptureBuffer()
+                let errBuf = sessions.NewCaptureBuffer CaptureStream.Stderr
                 let stdoutTask = sessions.CaptureRawStdout stdoutSink
                 let stderrTask = sessions.PumpStderrBuffer errBuf
                 // As on the text verb above: nobody can write this child's stdin past a completion verb, so

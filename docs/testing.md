@@ -756,6 +756,28 @@ since they change how invocations are keyed):
   rewrites none of the rows already in it, so a fixture that already carries a secret needs
   re-recording, not just reopening.
 
+**How a `CapturePolicy` interacts with a cassette.** `Command.CapturePolicy` (see
+[Hardening → Redacting output at capture](hardening.md#redacting-output-at-capture)) is a *command*
+knob, not a cassette one, so it applies on both halves of a round trip and the two doubles stay in
+step with a live run:
+
+- **Recording** goes through the real capture path, so the entry written to disk holds the
+  **already-shaped** text — the raw secret never reaches the file at all, without any
+  `RecordReplayOptions` configured. `WithRedaction` remains the hook for what a policy cannot
+  reach: a recorded typed **failure**'s own fields, and a fixture recorded by a command that had
+  no policy.
+- **Replaying** shapes the recorded text with the *replaying* command's policy, exactly as the live
+  pump would have shaped the same lines. That is what keeps a cassette hit agreeing with the
+  `SpawnAsync` replay of the same entry, which re-pumps the recording through the ordinary capture
+  path — and it means adding a policy to an existing test scrubs a fixture recorded before the
+  policy existed. A bytes entry's `byte[]` stdout stays byte-exact (a raw capture has no decoded
+  line to shape); its stderr is shaped, the same split a live bytes run makes.
+- Because the policy therefore runs on both halves, **write an idempotent policy** — redaction, the
+  case this seam exists for, is. A non-idempotent transform would be applied once at record time
+  and once again on replay.
+- The policy is **not** part of the match key, so it never changes which recording a call replays:
+  swapping or adding one re-shapes what comes back, it does not turn a hit into a miss.
+
 ```csharp
 var options = new RecordReplayOptions()
     .WithArgNormalizer(args => args.Where(a => !a.StartsWith("/tmp/")).ToArray())

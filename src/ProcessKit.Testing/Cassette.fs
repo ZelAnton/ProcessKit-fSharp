@@ -1774,6 +1774,19 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                         ProcessError.Io $"corrupt base64 stdout in cassette entry for '{command.Program}': {ex.Message}"
                     )
 
+    // Shape a recorded capture with the REPLAYING command's `CapturePolicy`, exactly as the live pump
+    // would have shaped the same lines on their way into the backlog (`CapturePolicy.shapeText`). A
+    // replay is still a run of that command, so its retained result has to honour the command's capture
+    // seam — and it must agree with the `SpawnAsync` replay below, which re-pumps the recorded output
+    // through the real capture path and is shaped by construction. Without this, the same cassette hit
+    // would come back scrubbed through one verb and raw through the other.
+    //
+    // A round trip therefore applies the policy twice — once when the live inner run recorded the entry
+    // (so the raw secret never reached the file at all), once here — which is why a policy should be
+    // idempotent. Redaction, the case this seam exists for, is.
+    let shapeCapture (command: Command) (stream: CaptureStream) (text: string) : string =
+        CapturePolicy.shapeText command.Config.CapturePolicy stream text
+
     let resultText (command: Command) (entry: CassetteEntry) : Result<ProcessResult<string>, ProcessError> =
         match stdoutText command entry with
         | Error error -> Error error
@@ -1781,8 +1794,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             Ok(
                 ProcessResult<string>(
                     command.Program,
-                    stdout,
-                    entry.Stderr,
+                    shapeCapture command CaptureStream.Stdout stdout,
+                    shapeCapture command CaptureStream.Stderr entry.Stderr,
                     outcomeOf entry,
                     TimeSpan.FromMilliseconds entry.DurationMs,
                     entry.Truncated,
@@ -1792,6 +1805,9 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
     // Replay a bytes result: only a bytes recording (base64 present) can promise exact bytes; a text /
     // pre-v2 entry is rejected rather than handing back a lossy re-encode (the honest-results contract).
+    // Its recorded stdout stays byte-exact through any configured `CapturePolicy` — a live bytes capture
+    // hands that seam no decoded line either (see `RunningProcess.OutputBytesAsync`) — while the
+    // line-pumped stderr is shaped, which is the same split a live run makes.
     let resultBytes (command: Command) (entry: CassetteEntry) : Result<ProcessResult<byte[]>, ProcessError> =
         match entry.StdoutBase64 with
         | null ->
@@ -1807,7 +1823,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                     ProcessResult<byte[]>(
                         command.Program,
                         bytes,
-                        entry.Stderr,
+                        shapeCapture command CaptureStream.Stderr entry.Stderr,
                         outcomeOf entry,
                         TimeSpan.FromMilliseconds entry.DurationMs,
                         entry.Truncated,

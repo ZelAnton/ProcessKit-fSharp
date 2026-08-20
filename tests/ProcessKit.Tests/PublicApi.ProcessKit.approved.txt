@@ -68,6 +68,31 @@ class ProcessKit.Capability+Unsupported : ProcessKit.Capability
   member get_Requires() : System.String
   property Requires : System.String { get }
 
+class ProcessKit.CaptureStream
+  :> System.Collections.IStructuralEquatable
+  :> System.IEquatable<ProcessKit.CaptureStream>
+  member Equals(ProcessKit.CaptureStream) : System.Boolean
+  member Equals(ProcessKit.CaptureStream, System.Collections.IEqualityComparer) : System.Boolean
+  member Equals(System.Object) : System.Boolean
+  member Equals(System.Object, System.Collections.IEqualityComparer) : System.Boolean
+  member GetHashCode() : System.Int32
+  member GetHashCode(System.Collections.IEqualityComparer) : System.Int32
+  member ToString() : System.String
+  member get_IsStderr() : System.Boolean
+  member get_IsStdout() : System.Boolean
+  member get_Tag() : System.Int32
+  property IsStderr : System.Boolean { get }
+  property IsStdout : System.Boolean { get }
+  property Stderr : ProcessKit.CaptureStream { get }
+  property Stdout : ProcessKit.CaptureStream { get }
+  property Tag : System.Int32 { get }
+  static member get_Stderr() : ProcessKit.CaptureStream
+  static member get_Stdout() : ProcessKit.CaptureStream
+
+module ProcessKit.CaptureStream+Tags
+  field literal Stderr : System.Int32
+  field literal Stdout : System.Int32
+
 class ProcessKit.CliClient
   member Command(System.Collections.Generic.IEnumerable<System.String>) : ProcessKit.Command
   member EnsureAvailableAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<System.String, ProcessKit.ProcessError>>
@@ -99,6 +124,7 @@ class ProcessKit.Command
   member CancelGrace(System.TimeSpan) : ProcessKit.Command
   member CancelOn(System.Threading.CancellationToken) : ProcessKit.Command
   member CancelSignal(ProcessKit.Signal) : ProcessKit.Command
+  member CapturePolicy(ProcessKit.ICapturePolicy) : ProcessKit.Command
   member CreateNoWindow() : ProcessKit.Command
   member CurrentDir(System.String) : ProcessKit.Command
   member Encoding(System.Text.Encoding) : ProcessKit.Command
@@ -160,6 +186,7 @@ class ProcessKit.Command
   member WindowsRestrictedToken() : ProcessKit.Command
   new(System.String)
   property Arguments : System.Collections.Generic.IReadOnlyList<System.String> { get }
+  property ConfiguredCapturePolicyName : Microsoft.FSharp.Core.FSharpOption<System.String> { get }
   property ConfiguredTimeout : Microsoft.FSharp.Core.FSharpOption<System.TimeSpan> { get }
   property Program : System.String { get }
   property Rlimits : System.Collections.Generic.IReadOnlyList<ProcessKit.Rlimit> { get }
@@ -172,6 +199,7 @@ module ProcessKit.CommandModule
   static member cancelGrace(System.TimeSpan, ProcessKit.Command) : ProcessKit.Command
   static member cancelOn(System.Threading.CancellationToken, ProcessKit.Command) : ProcessKit.Command
   static member cancelSignal(ProcessKit.Signal, ProcessKit.Command) : ProcessKit.Command
+  static member capturePolicy(ProcessKit.ICapturePolicy, ProcessKit.Command) : ProcessKit.Command
   static member create(System.String) : ProcessKit.Command
   static member createNoWindow(ProcessKit.Command) : ProcessKit.Command
   static member currentDir(System.String, ProcessKit.Command) : ProcessKit.Command
@@ -308,6 +336,10 @@ class ProcessKit.Finished
   property Outcome : ProcessKit.Outcome { get }
   property Stderr : System.String { get }
   property Truncated : System.Boolean { get }
+
+interface ProcessKit.ICapturePolicy
+  member OnCapture(ProcessKit.CaptureStream, System.String) : System.String
+  property Name : System.String { get }
 
 interface ProcessKit.IProcessRunner
   member CaptureBytesAsync(ProcessKit.Command, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ProcessResult<System.Byte[]>, ProcessKit.ProcessError>>

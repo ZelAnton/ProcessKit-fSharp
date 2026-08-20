@@ -165,6 +165,11 @@ type internal CommandConfig =
       // encoding/framing/destination). See `Command.MergeStderr`.
       MergeStderr: bool
       OutputBuffer: OutputBufferPolicy
+      // Opt-in consumer-supplied transform applied to each decoded line on its way INTO the in-memory
+      // capture backlog, and nowhere else — the redaction-at-capture seam (see `ICapturePolicy` for the
+      // full boundary: handlers, tees, the streaming verbs and the raw byte captures all keep seeing
+      // the unshaped line). `None` (the default) retains exactly what was framed, as before.
+      CapturePolicy: ICapturePolicy option
       // Opt-in bounded/backpressure policy for the streaming verbs (`StdoutLinesAsync`/
       // `OutputEventsAsync`/`WaitForLineAsync`). `None` (the default) keeps the unbounded streaming
       // channels ProcessKit has always used.
@@ -358,6 +363,7 @@ module internal CommandConfig =
           StderrTee = None
           MergeStderr = false
           OutputBuffer = OutputBufferPolicy.Default
+          CapturePolicy = None
           StreamBuffer = None
           Timeout = None
           TimeoutGrace = None
@@ -1222,6 +1228,33 @@ type Command internal (config: CommandConfig) =
         ArgumentNullException.ThrowIfNull policy
         Command({ config with OutputBuffer = policy })
 
+    /// Shape every decoded line on its way into the in-memory capture backlog — the
+    /// redaction-at-capture seam. `policy.OnCapture` runs before a line is retained, so what it returns
+    /// is what `ProcessResult.Stdout`/`Stderr` and `Finished.Stderr` carry; a policy that throws or
+    /// returns `null` fails **closed** (that line is retained empty, never raw).
+    ///
+    /// It shapes the retained backlog **only**. The per-line handlers (`OnStdoutLine`/`OnStderrLine`),
+    /// the tees (`StdoutTee`/`StderrTee`), the streaming verbs and a raw byte capture
+    /// (`OutputBytesAsync`'s stdout, a pipeline's captured stdout) all keep seeing the unshaped line —
+    /// see `ICapturePolicy` for the whole boundary and why it is drawn there. Unset (the default)
+    /// retains exactly what the child wrote. Composes with `OutputBuffer`, which decides how much of
+    /// the shaped output survives; the last `CapturePolicy` call in a chain wins.
+    member _.CapturePolicy(policy: ICapturePolicy) =
+        ArgumentNullException.ThrowIfNull policy
+
+        Command(
+            { config with
+                CapturePolicy = Some policy }
+        )
+
+    /// The `ICapturePolicy.Name` of the policy configured with `CapturePolicy`, or `None` when none is
+    /// set — the introspection point that keeps a configured policy visible (in a test assertion, a
+    /// diagnostic dump) instead of an anonymous callback. Deliberately the *name* rather than the
+    /// policy itself: a name is safe to print, a policy object is not something a diagnostic should
+    /// hand out.
+    member _.ConfiguredCapturePolicyName: string option =
+        config.CapturePolicy |> Option.map (fun policy -> policy.Name)
+
     /// Opt in to a bounded/backpressure channel for the streaming verbs (`StdoutLinesAsync`/
     /// `OutputEventsAsync`/`WaitForLineAsync`) and `ContentLengthSession.FramesAsync` — which honours only
     /// the two lossless full modes and refuses `DropOldest`/`DropNewest`, since a dropped protocol frame is
@@ -2030,6 +2063,11 @@ module Command =
 
     /// Bound the in-memory backlog of captured lines.
     let outputBuffer (policy: OutputBufferPolicy) (command: Command) = command.OutputBuffer policy
+
+    /// Shape each decoded line as it enters the capture backlog (redaction at capture); handlers, tees,
+    /// the streaming verbs and raw byte captures still see the unshaped line. See
+    /// `Command.CapturePolicy`.
+    let capturePolicy (policy: ICapturePolicy) (command: Command) = command.CapturePolicy policy
 
     /// Opt in to a bounded/backpressure channel for the streaming verbs (default stays unbounded).
     let streamBuffer (policy: StreamBufferPolicy) (command: Command) = command.StreamBuffer policy

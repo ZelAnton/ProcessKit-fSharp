@@ -17,11 +17,27 @@ open System.Threading.Tasks
 /// One uncontended `Monitor` per framed line, on a path that has just decoded and allocated that
 /// line — immeasurable next to it, and it buys every reader of these counters (`FinishAsync`'s
 /// stderr capture, the buffered verbs' captures) a consistent snapshot instead of a race.
-type internal GuardedLineBuffer(policy: OutputBufferPolicy) =
+///
+/// It is also **the** capture-backlog boundary, which is why the configured `ICapturePolicy` is
+/// applied here rather than at each of the several call sites that add a line: every retained line in
+/// the library passes through this one `Add` (the buffered verbs' stdout/stderr captures and the
+/// stderr capture of each streaming/chunk session), so a site added later is shaped by construction
+/// instead of by remembering to. `stream` says which of the child's two streams this backlog holds,
+/// so one policy can treat them differently.
+type internal GuardedLineBuffer(policy: OutputBufferPolicy, stream: CaptureStream, capture: ICapturePolicy option) =
     let gate = obj ()
     let buffer = Pump.LineBuffer policy
 
-    member _.Add(line: string) = lock gate (fun () -> buffer.Add line)
+    /// Retain one framed line, shaped by the capture policy first (a no-op when none is configured).
+    /// The shaping happens OUTSIDE the lock — it runs consumer code, which must not be able to hold
+    /// this buffer's gate — and before `LineBuffer.Add`, so the retention decision, the byte
+    /// accounting and the `Truncated`/`TooLarge` signals are all computed from the text actually
+    /// retained. The per-stream line counters are bumped by the pumps before this call and so remain
+    /// counts of what the child produced, unaffected by any shaping.
+    member _.Add(line: string) =
+        let retained = CapturePolicy.shapeLine capture stream line
+        lock gate (fun () -> buffer.Add retained)
+
     member _.Text = lock gate (fun () -> buffer.Text)
     member _.Truncated = lock gate (fun () -> buffer.Truncated)
     member _.TooLarge = lock gate (fun () -> buffer.TooLarge)
@@ -547,9 +563,13 @@ type internal OutputSessions
     member _.SessionStderrTotalLines = stderrStreamBuffer.TotalLines
     member _.SessionStderrTotalBytes = stderrStreamBuffer.TotalBytes
 
-    /// A fresh line capture under this run's `OutputBuffer` policy, owned by the buffered verb that
-    /// asks for it (see `GuardedLineBuffer`: the verb, not the pump, must outlive the bound).
-    member _.NewCaptureBuffer() = GuardedLineBuffer config.OutputBuffer
+    /// A fresh line capture for `stream` under this run's `OutputBuffer` policy — and this run's
+    /// `CapturePolicy`, which the buffer applies to every line it retains — owned by the buffered verb
+    /// that asks for it (see `GuardedLineBuffer`: the verb, not the pump, must outlive the bound).
+    /// `stream` must be the stream whose pump will fill it, so a policy that treats stdout and stderr
+    /// differently is told the truth.
+    member _.NewCaptureBuffer(stream: CaptureStream) =
+        GuardedLineBuffer(config.OutputBuffer, stream, config.CapturePolicy)
 
     /// This handle's stderr readiness watch, created on first use and shared by every later stderr
     /// readiness wait (see `stderrWatch`). Called by `RunningProcess`'s stderr readiness verbs — from
@@ -677,7 +697,9 @@ type internal OutputSessions
     /// claims the session from fresh — so the whole session is constructed (channel + pumps + outcome)
     /// before any concurrent verb can observe the claim.
     member _.StartLineSession() =
-        let stderrBuffer = GuardedLineBuffer config.OutputBuffer
+        let stderrBuffer =
+            GuardedLineBuffer(config.OutputBuffer, CaptureStream.Stderr, config.CapturePolicy)
+
         stderrStreamBuffer <- stderrBuffer
 
         // Where a framed stdout line goes. Normally into the line channel for the streaming consumer;
@@ -819,7 +841,9 @@ type internal OutputSessions
     /// session, but its pump deliberately does no decoding or line framing: one channel item is one
     /// non-empty OS read. Called by `ConsumptionGate.TryClaimStdoutChunkStreaming` under its lock.
     member _.StartChunkSession() =
-        let stderrBuffer = GuardedLineBuffer config.OutputBuffer
+        let stderrBuffer =
+            GuardedLineBuffer(config.OutputBuffer, CaptureStream.Stderr, config.CapturePolicy)
+
         stderrStreamBuffer <- stderrBuffer
 
         let stdoutPump =
@@ -916,7 +940,9 @@ type internal OutputSessions
         // caller's channel: `Finished.Stderr` is "" (documented on the verb) and `Truncated`/`TooLarge`
         // then report on a capture that genuinely holds nothing, instead of dereferencing an unassigned
         // buffer.
-        let stderrBuffer = GuardedLineBuffer config.OutputBuffer
+        let stderrBuffer =
+            GuardedLineBuffer(config.OutputBuffer, CaptureStream.Stderr, config.CapturePolicy)
+
         stderrStreamBuffer <- stderrBuffer
 
         let stderrPump =

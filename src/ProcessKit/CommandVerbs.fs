@@ -43,7 +43,10 @@ module internal DetachedLaunch =
     /// verb ever reads (`StdoutEncoding`/`StderrEncoding`, the line terminators, `OutputBuffer`,
     /// `OkCodes`, `UncheckedInPipe`) are no-ops here exactly as they are on the verbs that ignore them
     /// today; they are documented as such rather than refused, since a default-valued knob cannot be told
-    /// apart from an explicitly set one.
+    /// apart from an explicitly set one. `CapturePolicy` joins that list for the same reason and with no
+    /// secret-hygiene cost: it shapes a capture backlog, and a detached launch retains no output at all
+    /// (its streams go to the null device), so there is nothing for a policy to shape and nothing it
+    /// could have kept out of a result this verb never produces.
     let incompatibleKnob (command: Command) : ProcessError option =
         let config = command.Config
 

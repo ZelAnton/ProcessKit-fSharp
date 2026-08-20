@@ -341,7 +341,9 @@ echo is controlled by the *child's own* console mode, and ConPTY has no supporte
 parent-side way to force it off before the child starts — so a Windows password
 prompt must suppress its own echo, and `PtyConfig.Echo = false` is not a Windows
 guarantee. Never rely on echo suppression alone to keep a secret out of a log or a
-test fixture — see the next section.
+test fixture — see the next section, and
+[Redacting output at capture](#redacting-output-at-capture) for scrubbing a secret
+that was echoed anyway before it settles in the captured result.
 
 ## Clearing the inherited environment
 
@@ -379,7 +381,11 @@ everywhere:
   the opt-in [`RecordReplayOptions.WithRedaction`](testing.md#record-and-replay)
   hook (applied to a string capture's stdout/stderr, a bytes capture's stderr,
   and every one of those failure fields; a raw `byte[]` stdout capture is stored
-  opaquely and is *not* passed through the redactor). A
+  opaquely and is *not* passed through the redactor). A command that already
+  carries a [`CapturePolicy`](#redacting-output-at-capture) never hands the
+  recorder the raw line in the first place, since the recording is made from the
+  already-scrubbed capture — the two hooks stack rather than duplicating each
+  other, and only `WithRedaction` reaches a recorded typed failure's own fields. A
   PTY recording's merged stream goes through the same `WithRedaction` hook, which
   is how an echoed credential is kept out of a PTY cassette even with
   `PtyConfig.Echo = true`. **`WithRedaction` does not reach `program`/`args`** —
@@ -421,6 +427,82 @@ everywhere:
   [Testing your code → Record and replay](testing.md#record-and-replay) and
   [A crash writes nothing before Complete](testing.md#a-crash-writes-nothing-before-complete)
   for the full cassette contract.
+
+## Redacting output at capture
+
+The sections above keep a secret out of the *child's* environment and out of the
+diagnostic channels. `Command.CapturePolicy` closes the remaining hole: a secret
+the child itself **prints**, which would otherwise settle verbatim in the result
+your code (and your test fixtures, and whatever you log the result to) then
+carries. Give it an `ICapturePolicy` and every decoded line is passed through
+`OnCapture` **before** it is retained, so what lands in `ProcessResult.Stdout` /
+`Stderr` and `Finished.Stderr` is what you returned, never the raw line.
+
+**F#**
+
+```fsharp
+type RedactTokens() =
+    interface ICapturePolicy with
+        member _.Name = "redact-tokens"
+
+        member _.OnCapture(_stream, line) =
+            System.Text.RegularExpressions.Regex.Replace(line, "gh[pous]_[A-Za-z0-9]{16,}", "[REDACTED]")
+
+// The retained capture is scrubbed; the child's real output is unchanged.
+let deploy = Command.create "deploy" |> Command.capturePolicy (RedactTokens())
+```
+
+**C#**
+
+<!-- docsnippet:imports System.Text.RegularExpressions -->
+```csharp
+sealed class RedactTokens : ICapturePolicy
+{
+    public string Name => "redact-tokens";
+
+    public string OnCapture(CaptureStream stream, string line) =>
+        Regex.Replace(line, "gh[pous]_[A-Za-z0-9]{16,}", "[REDACTED]");
+}
+
+var deploy = new Command("deploy").CapturePolicy(new RedactTokens());
+```
+
+**Know exactly what it covers — the boundary is deliberately narrow.** The policy
+shapes the in-memory **capture backlog** and nothing else. These keep seeing the
+line the child actually wrote, and each is a place a secret can still escape if
+you use it:
+
+- the per-line handlers `Command.OnStdoutLine` / `OnStderrLine` and the decoded/raw
+  tees `Command.StdoutTee` / `StderrTee` — they exist to *observe* real output; if
+  one of them writes to a log or a file, redact in that sink too;
+- the **streaming** verbs, which hand each line to a live consumer instead of
+  retaining it: `StdoutLinesAsync`, `OutputEventsAsync`, `WaitForLineAsync`, the
+  byte-chunk streams, a `PtySession` window/transcript, `ContentLengthSession`
+  frames, and the stderr readiness probes. (The *retained* stderr those sessions
+  hand back from `FinishAsync` **is** backlog, and is scrubbed.)
+- a **raw byte** capture, which has no decoded line to shape: `OutputBytesAsync`'s
+  stdout. A bytes run's line-pumped **stderr** is still scrubbed — the same split
+  the cassette [`WithRedaction`](testing.md#record-and-replay) hook already makes.
+- **every capture a [`Pipeline`](pipelines.md) makes** — its final stdout *and*
+  each stage's stderr are raw byte captures, so a stage's `CapturePolicy` never
+  fires, exactly as that stage's `OnStdoutLine`/tees never fire. Run a command
+  whose output must be scrubbed on its own rather than as a pipeline stage.
+
+**A failing policy fails closed.** If `OnCapture` throws — or returns `null` — that
+line is retained **empty**, never the raw line it was meant to scrub, the run is
+not failed, and the policy stays active for the lines that follow. This is the
+deliberate opposite of a throwing `OnStdoutLine` handler, which faults the run: a
+handler's failure has nothing to hide, a redactor's does. Nothing else reports the
+failure, so prefer a policy that cannot throw. One instance serves both streams
+and the two pumps run concurrently, so a policy that keeps mutable state must
+guard it.
+
+`CapturePolicy` composes with, and does not replace, the two hooks above it:
+`Command.OutputBuffer` still decides *how much* of the scrubbed output survives,
+and a `RecordReplayRunner` recording made through a policy is already scrubbed
+before `WithRedaction` ever sees it — see
+[Testing your code → Record and replay](testing.md#record-and-replay) for how the
+two interact on a cassette round trip.
 
 ## Putting it together
 

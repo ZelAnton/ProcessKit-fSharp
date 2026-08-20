@@ -175,3 +175,133 @@ type StreamBufferPolicy internal (capacity: int, fullMode: StreamFullMode) =
 
     /// A copy with the full-mode changed, composable with any policy.
     member _.WithFullMode(fullMode: StreamFullMode) = StreamBufferPolicy(capacity, fullMode)
+
+/// Which of a child's two captured streams a decoded line came from.
+///
+/// Handed to `ICapturePolicy.OnCapture` so one policy can treat the two streams differently (redact
+/// only the stream a passphrase prompt is echoed on, say). It mirrors `OutputEvent`'s stdout/stderr
+/// split, but is a bare discriminator carrying no line: the capture seam should not force a consumer
+/// that only wants to shape text to depend on the streaming event type.
+///
+/// Deliberately carries no stable machine identifier (no `Name`/`FromName`, and no entry in
+/// `spec/identifiers.json`), unlike `RlimitResource` or `IoPriorityClass`: nothing serializes it — it
+/// is an argument passed to a callback within one process, never a value ProcessKit writes to a
+/// report, a log field, or a cassette.
+[<RequireQualifiedAccess; NoComparison>]
+type CaptureStream =
+
+    /// The child's standard output.
+    | Stdout
+
+    /// The child's standard error.
+    | Stderr
+
+/// A consumer-supplied, typed seam that shapes each decoded line **just before it enters the capture
+/// backlog** — the redaction-at-capture extension point, set with `Command.CapturePolicy`.
+///
+/// For every framed line handed to a capture, `OnCapture` runs *before* the line is retained, so the
+/// text it returns — never the raw line — is what lands in the backlog, and therefore in
+/// `ProcessResult.Stdout`/`Stderr` and `Finished.Stderr`. That is what the observing
+/// `Command.OnStdoutLine`/`OnStderrLine` handlers cannot do: they run *alongside* capture and can see
+/// a line, not shape what is kept.
+///
+/// **Scope and boundaries (read before relying on it for secret hygiene).** This seam shapes the
+/// in-memory capture backlog and nothing else. It deliberately does **not** reach the independent
+/// observation sinks, each of which keeps its existing contract and sees the line **unshaped**:
+///
+///  - the per-line handlers `Command.OnStdoutLine`/`OnStderrLine` and the tees
+///    `Command.StdoutTee`/`StderrTee` — they exist to observe the real output; if you also write to a
+///    log or a file there, redact in that sink too;
+///  - the **streaming** verbs, which hand each line to a live consumer rather than retaining it:
+///    `RunningProcess.StdoutLinesAsync`, `OutputEventsAsync`, `WaitForLineAsync`, the byte-chunk
+///    streams, `PtySession`'s window/transcript, `ContentLengthSession`'s frames, and the stderr
+///    readiness probes. (`FinishAsync`'s retained *stderr* on those same sessions **is** backlog, and
+///    is shaped.)
+///  - a **raw byte** capture, which has no decoded line to shape: `OutputBytesAsync`'s stdout and a
+///    pipeline's captured stdout/stderr. A bytes run's line-pumped **stderr** is still shaped.
+///
+/// **A failing policy fails closed.** If `OnCapture` throws — or returns `null` — the offending line
+/// is retained **empty**, never the raw line it was meant to scrub, and the policy stays active for
+/// the lines that follow. A redactor that throws blanks its output rather than leaking it. Nothing
+/// else reports that failure, so prefer a policy that cannot throw.
+///
+/// **It must be thread-safe.** One policy instance serves both of a run's streams, whose pumps are
+/// independent tasks, so `OnCapture` can be called for a stdout line and a stderr line at the same
+/// time (and for several concurrent runs sharing one policy). A pure transform of its argument — the
+/// shape this seam is for — needs nothing extra; a policy that keeps mutable state has to guard it.
+///
+/// **What it does not decide.** *How much* is retained, and what is evicted on overflow, remain
+/// `OutputBufferPolicy`'s job; the two compose orthogonally — this decides each retained line's
+/// content, that decides how many survive. Retention bookkeeping (the retained-byte total, the
+/// `DropNewest` seal, `Truncated`/`TooLarge`) is computed from the text you return, while the
+/// cumulative line counters and the raw-pipe byte counters (`RunningProcess.StdoutBytesSeen`) are
+/// taken before this seam and are untouched by it.
+type ICapturePolicy =
+
+    /// A short, stable, human-readable name for this policy (`"redact-tokens"`, say), surfaced by
+    /// `Command.ConfiguredCapturePolicyName` so a configured policy is introspectable in a test or a
+    /// diagnostic dump rather than an anonymous callback.
+    abstract Name: string
+
+    /// Shape one decoded `line` from `stream` just before it enters the capture backlog, returning the
+    /// text to retain: the line itself to keep it unchanged, a rewrite to redact it, or `""` to blank
+    /// it while keeping its slot (and the line/byte counters). The line arrives with its terminator
+    /// already stripped — the shape `StdoutLinesAsync` yields. Keep it cheap: it runs on the capture
+    /// pump, in front of every retained line.
+    abstract OnCapture: stream: CaptureStream * line: string -> string
+
+/// Applies a configured `ICapturePolicy` at the one seam that owns the capture backlog. The whole
+/// point of routing every capture write through here is that the fail-closed rule cannot be
+/// implemented differently — or forgotten — at one of the several places a line reaches a backlog.
+[<RequireQualifiedAccess>]
+module internal CapturePolicy =
+
+    /// What a failing policy retains in place of the line it was asked to shape.
+    [<Literal>]
+    let FailClosedLine = ""
+
+    /// Shape one framed line for the backlog. `None` (no policy configured — the default) returns the
+    /// line unchanged and costs one match.
+    let shapeLine (policy: ICapturePolicy option) (stream: CaptureStream) (line: string) : string =
+        match policy with
+        | None -> line
+        | Some configured ->
+            try
+                let shaped = configured.OnCapture(stream, line)
+
+                // A policy declared to return a string handed back `null` — a bug in it, and one that
+                // must not retain the raw line: a consumer compiled without nullable reference types
+                // can return null where Rust's `Cow<str>` could not, so this is the .NET-specific half
+                // of the same fail-closed rule the `with` handler below implements for a throwing
+                // policy. `ReferenceEquals` because the declared type is non-nullable here, so a `null`
+                // pattern would not compile against it.
+                if obj.ReferenceEquals(shaped, null) then
+                    FailClosedLine
+                else
+                    shaped
+            with _ ->
+                // FAIL CLOSED, deliberately catching everything a consumer's policy can raise. The
+                // policy exists to keep a secret out of the retained capture, so the one thing the
+                // failure path must never do is fall back to the raw line it was handed. Retaining the
+                // blank line instead keeps the run going (a buggy redactor does not fail the command)
+                // with the secret still scrubbed, and leaves the policy active for later lines. This
+                // is the deliberate opposite of a throwing `OnStdoutLine` handler, which faults the
+                // run: a handler's failure has nothing to hide, this one does.
+                FailClosedLine
+
+    /// Shape an already-assembled capture — the newline-joined text a `Pump.LineBuffer` produces — by
+    /// running `shapeLine` over each of its lines. Used where a retained capture is reconstructed
+    /// rather than pumped (a `RecordReplayRunner` cassette hit), so that path shapes its retained text
+    /// exactly as the live pump would have shaped the same lines. `'\n'` is the separator because it is
+    /// the one `Pump.LineBuffer.Text` joins retained lines with, whatever `LineTerminator` framed them.
+    let shapeText (policy: ICapturePolicy option) (stream: CaptureStream) (text: string) : string =
+        match policy with
+        | None -> text
+        | Some _ ->
+            // An empty capture has no framed line, so a live run would never have called the policy at
+            // all; returning it unchanged keeps the reconstructed path faithful to that (and covers the
+            // null a malformed cassette entry could carry).
+            if String.IsNullOrEmpty text then
+                text
+            else
+                text.Split '\n' |> Array.map (shapeLine policy stream) |> String.concat "\n"

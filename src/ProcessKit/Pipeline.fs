@@ -364,8 +364,12 @@ module internal PipelineTotals =
 /// a chatty stage can never exhaust memory regardless of its position in the chain. Per-stage *stdout/
 /// stderr observation* hooks are still **not** applied — intermediate stages' `StdoutTee`, every
 /// stage's `StderrTee`, and `OnStdoutLine`/`OnStderrLine` — because the chain wires stdout into the
-/// next stage's stdin and captures only the final stage's output. Observe an individual command by
-/// running it on its own, not as a pipeline stage.
+/// next stage's stdin and captures only the final stage's output. A stage's `CapturePolicy` does not
+/// apply either, and for the reason that governs this whole paragraph: every capture a pipeline makes
+/// (the final stdout, and each stage's stderr) is a RAW BYTE capture with no line framing, so there is
+/// no decoded line for a line-oriented transform to shape — the same boundary that leaves
+/// `OutputBuffer.MaxLines` inapplicable here. A command whose captured output must be scrubbed has to
+/// be run on its own, not as a pipeline stage. Observe an individual command the same way.
 ///
 /// Per-stage config a pipeline cannot honour is **rejected when the stage is piped** (an
 /// `ArgumentException` from `Pipe`, naming the field and stage index), rather than silently dropped:
