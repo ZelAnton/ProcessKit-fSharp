@@ -149,6 +149,102 @@ type private ConcurrencyProbeRunner(cap: int) =
         member _.SpawnAsync(_command, _cancellationToken) =
             raise (NotSupportedException "this test runner only supports text capture")
 
+/// Echoes a large artificial batch through both capture seams while tracking the live overlap. The
+/// asynchronous yield makes the worker pool exercise its scheduler rather than completing every
+/// command inline.
+type private BatchEchoRunner() =
+    let sync = obj ()
+    let mutable active = 0
+    let mutable peak = 0
+
+    let enter () =
+        lock sync (fun () ->
+            active <- active + 1
+            peak <- max peak active)
+
+    let leave () =
+        lock sync (fun () -> active <- active - 1)
+
+    let textResult (command: Command) =
+        ProcessResult<string>(command.Program, command.Program, "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ])
+
+    let bytesResult (command: Command) =
+        ProcessResult<byte[]>(
+            command.Program,
+            Text.Encoding.UTF8.GetBytes command.Program,
+            "",
+            Outcome.Exited 0,
+            TimeSpan.Zero,
+            false,
+            [ 0 ]
+        )
+
+    member _.Peak = lock sync (fun () -> peak)
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(command, _cancellationToken) =
+            task {
+                enter ()
+
+                try
+                    do! Task.Yield()
+                    return Ok(textResult command)
+                finally
+                    leave ()
+            }
+
+        member _.CaptureBytesAsync(command, _cancellationToken) =
+            task {
+                enter ()
+
+                try
+                    do! Task.Yield()
+                    return Ok(bytesResult command)
+                finally
+                    leave ()
+            }
+
+        member _.SpawnAsync(_command, _cancellationToken) =
+            raise (NotSupportedException "this test runner only supports capture")
+
+/// Holds the first worker generation at the capture boundary so a test can measure scheduler setup
+/// before any worker advances to another input item.
+type private SchedulerAllocationProbeRunner() =
+    let release =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable started = 0
+
+    member _.Started = Volatile.Read(&started)
+    member _.Release() = release.TrySetResult() |> ignore
+
+    interface IProcessRunner with
+        member _.CaptureStringAsync(command, _cancellationToken) =
+            Interlocked.Increment(&started) |> ignore
+
+            task {
+                do! release.Task
+
+                return
+                    Ok(
+                        ProcessResult<string>(
+                            command.Program,
+                            command.Program,
+                            "",
+                            Outcome.Exited 0,
+                            TimeSpan.Zero,
+                            false,
+                            [ 0 ]
+                        )
+                    )
+            }
+
+        member _.CaptureBytesAsync(_command, _cancellationToken) =
+            failwith "this test runner only supports text capture"
+
+        member _.SpawnAsync(_command, _cancellationToken) =
+            raise (NotSupportedException "this test runner only supports text capture")
+
 /// A runner for the abandoned-stream contract: "fast" completes immediately, "holding" never
 /// completes on its own and ends only when ITS OWN capture token is cancelled (what abandoning the
 /// stream has to do to an in-flight command), and "queued" must never reach capture at all.
@@ -806,6 +902,116 @@ type ExecBatchTests() =
         | ex -> Assert.That(ex.ParamName, Is.EqualTo "concurrency")
 
         Assert.That(runner.CaptureCount, Is.Zero)
+
+    [<Test>]
+    member _.``large buffered and streaming batches do not allocate scheduler state per input``() : Task =
+        task {
+            let concurrency = 4
+            let commandCount = 100_000
+            let maxStartupBytes = 8L * 1024L * 1024L
+            let commands = Array.init commandCount (fun index -> Command.create $"cmd{index}")
+
+            let bufferedRunner = SchedulerAllocationProbeRunner()
+            let bufferedBefore = GC.GetAllocatedBytesForCurrentThread()
+
+            let buffered =
+                Exec.outputAll concurrency (bufferedRunner :> IProcessRunner) commands CancellationToken.None
+
+            let bufferedStartupBytes = GC.GetAllocatedBytesForCurrentThread() - bufferedBefore
+
+            try
+                Assert.That(bufferedRunner.Started, Is.EqualTo concurrency)
+
+                Assert.That(
+                    bufferedStartupBytes,
+                    Is.LessThan maxStartupBytes,
+                    $"buffered scheduler allocated {bufferedStartupBytes:N0} bytes while starting {commandCount:N0} items"
+                )
+            finally
+                bufferedRunner.Release()
+
+            let! bufferedResults = buffered.WaitAsync(TimeSpan.FromSeconds 30.0)
+            Assert.That(bufferedResults.Length, Is.EqualTo commandCount)
+
+            let streamingRunner = SchedulerAllocationProbeRunner()
+
+            let stream =
+                Exec.outputStream concurrency (streamingRunner :> IProcessRunner) commands CancellationToken.None
+
+            use enumerator = stream.GetAsyncEnumerator()
+            let streamingBefore = GC.GetAllocatedBytesForCurrentThread()
+            let firstMove = enumerator.MoveNextAsync().AsTask()
+            let streamingStartupBytes = GC.GetAllocatedBytesForCurrentThread() - streamingBefore
+
+            try
+                Assert.That(streamingRunner.Started, Is.EqualTo concurrency)
+
+                Assert.That(
+                    streamingStartupBytes,
+                    Is.LessThan maxStartupBytes,
+                    $"stream scheduler allocated {streamingStartupBytes:N0} bytes while starting {commandCount:N0} items"
+                )
+            finally
+                streamingRunner.Release()
+
+            let! moved = firstMove.WaitAsync(TimeSpan.FromSeconds 5.0)
+            Assert.That(moved, Is.True)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``large text and bytes batches preserve every input under bounded capture overlap``() : Task =
+        task {
+            let concurrency = 4
+            let commands = [| for i in 0..4095 -> Command.create $"cmd{i}" |]
+            let runner = BatchEchoRunner()
+
+            let! textResults = Exec.outputAll concurrency (runner :> IProcessRunner) commands CancellationToken.None
+
+            Assert.That(textResults.Length, Is.EqualTo commands.Length)
+
+            for i in 0 .. commands.Length - 1 do
+                match textResults[i] with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo $"cmd{i}")
+                | Error error -> Assert.Fail $"text command {i} failed: {error}"
+
+            let! byteResults =
+                Exec.outputAllBytes concurrency (runner :> IProcessRunner) commands CancellationToken.None
+
+            Assert.That(byteResults.Length, Is.EqualTo commands.Length)
+
+            for i in 0 .. commands.Length - 1 do
+                match byteResults[i] with
+                | Ok result -> Assert.That(result.Stdout, Is.EqualTo<byte>(Text.Encoding.UTF8.GetBytes $"cmd{i}"))
+                | Error error -> Assert.Fail $"byte command {i} failed: {error}"
+
+            let textStream =
+                Exec.outputStream concurrency (runner :> IProcessRunner) commands CancellationToken.None
+
+            use textEnumerator = textStream.GetAsyncEnumerator()
+            let! textItems = BatchStreaming.drain textEnumerator
+            Assert.That(textItems.Count, Is.EqualTo commands.Length)
+
+            Assert.That(
+                textItems |> Seq.map (fun item -> item.Index) |> Seq.sort |> Seq.toArray,
+                Is.EqualTo<int[]>([| 0..4095 |])
+            )
+
+            let byteStream =
+                Exec.outputStreamBytes concurrency (runner :> IProcessRunner) commands CancellationToken.None
+
+            use byteEnumerator = byteStream.GetAsyncEnumerator()
+            let! byteItems = BatchStreaming.drain byteEnumerator
+            Assert.That(byteItems.Count, Is.EqualTo commands.Length)
+
+            Assert.That(
+                byteItems |> Seq.map (fun item -> item.Index) |> Seq.sort |> Seq.toArray,
+                Is.EqualTo<int[]>([| 0..4095 |])
+            )
+
+            Assert.That(runner.Peak, Is.LessThanOrEqualTo concurrency)
+        }
+        :> Task
 
     [<Test>]
     member _.``outputAll cancels queued commands without changing completed results``() : Task =

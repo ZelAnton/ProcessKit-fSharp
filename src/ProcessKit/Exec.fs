@@ -64,12 +64,12 @@ type BatchItem<'T> internal (index: int, result: Result<ProcessResult<'T>, Proce
 /// failure into that command's own `Result` instead of faulting the whole fan-out.
 ///
 /// Deliberately only these two primitives, not a shared driver. The two fan-outs SCHEDULE differently
-/// (one collects into an input-ordered array through `Task.WhenAll`, the other hands each result to a
-/// bounded channel before releasing its slot) and the buffering driver's `BatchPolicy.FailFast`
-/// behaviour is already stabilized; sharing the scheduler would have meant editing that stabilized
-/// path to grow a streaming hand-off. Sharing just these two changes neither driver's observable
-/// behaviour, while keeping the one invariant that must never drift between them — the
-/// post-acquisition cancellation recheck below — in a single place.
+/// (one collects into an input-ordered array, the other hands each result to a bounded channel before
+/// releasing its slot) and the buffering driver's `BatchPolicy.FailFast` behaviour is already
+/// stabilized; sharing the scheduler would have meant editing that stabilized path to grow a
+/// streaming hand-off. Sharing just these two changes neither driver's observable behaviour, while
+/// keeping the one invariant that must never drift between them — the post-acquisition cancellation
+/// recheck below — in a single place.
 module internal BatchGate =
 
     /// Wait for one of `gate`'s concurrency slots on behalf of a batch command. `true` means the slot
@@ -135,9 +135,10 @@ module internal BatchGate =
 ///
 /// - **Nothing runs until the consumer pulls.** The fan-out starts on the FIRST `MoveNextAsync`, not
 ///   when the verb builds the stream — a stream that has not been enumerated has spawned nothing.
-/// - **One task per command, gated exactly like `Exec.runAll`.** Every command waits for a slot
-///   through the shared `BatchGate.tryAcquireSlot`, so the concurrency cap and the
-///   nothing-starts-after-cancellation guarantee cannot drift from the buffering verbs'.
+/// - **A fixed worker pool, gated exactly like `Exec.runAll`.** At most `concurrency` workers claim
+///   commands and wait for a slot through the shared `BatchGate.tryAcquireSlot`, so a large batch does
+///   not create one task per input element and the concurrency/cancellation guarantees cannot drift
+///   from the buffering verbs'.
 /// - **Backpressure by construction.** A finished command hands its item to a channel bounded at the
 ///   concurrency cap and releases its slot only afterwards, so a consumer that stops reading
 ///   eventually stops the fan-out instead of letting it run the whole batch ahead into memory.
@@ -199,6 +200,7 @@ type internal BatchStreamEnumerator<'T>
     let mutable current = Unchecked.defaultof<BatchItem<'T>>
     let mutable fanout: Task option = None
     let mutable disposed = false
+    let mutable nextIndex = -1
 
     // Cancel one of this enumerator's own token sources without letting a caller-owned callback's bug
     // escape. `Cancel()` synchronously re-invokes every callback registered on the token (including a
@@ -211,47 +213,106 @@ type internal BatchStreamEnumerator<'T>
         with ex ->
             ignore ex
 
-    // One command's whole life: wait for a slot, capture, hand the item to the consumer, free the
-    // slot. The hand-off happens BEFORE the release (backpressure, above) and the release is in a
-    // `finally` so an abandoned stream cannot leak the slot.
-    let runOne (index: int) (command: Command) : Task<unit> =
+    // One worker repeatedly claims a command, waits for a slot, captures it, hands the item to the
+    // consumer, and frees the slot. The hand-off happens BEFORE the release (backpressure, above)
+    // and the release is in a `finally` so an abandoned stream cannot leak the slot. Keeping the
+    // index claim inside this fixed worker pool is what prevents a large batch from creating one
+    // waiting task per command.
+    let runWorker () : Task<unit> =
         task {
             try
-                let! started = BatchGate.tryAcquireSlot gate runToken
+                let mutable running = true
 
-                let! result =
-                    if started then
-                        BatchGate.captureGuarded capture runner runToken command
+                while running do
+                    let index = Interlocked.Increment(&nextIndex)
+
+                    if index >= items.Length then
+                        running <- false
                     else
-                        Task.FromResult(Error(ProcessError.Cancelled command.Program))
+                        let command = items[index]
+                        let! started = BatchGate.tryAcquireSlot gate runToken
 
-                try
-                    do! results.Writer.WriteAsync(BatchItem<'T>(index, result), disposalToken)
-                finally
-                    if started then
-                        gate.Release() |> ignore
+                        let! result =
+                            if started then
+                                BatchGate.captureGuarded capture runner runToken command
+                            else
+                                Task.FromResult(Error(ProcessError.Cancelled command.Program))
+
+                        try
+                            do! results.Writer.WriteAsync(BatchItem<'T>(index, result), disposalToken)
+                        finally
+                            if started then
+                                gate.Release() |> ignore
             with :? OperationCanceledException ->
                 // Only reachable from the hand-off above, and only once `DisposeAsync` has cancelled
-                // `disposalToken`: the consumer abandoned the stream while this command's item was
-                // still waiting for room. There is nobody left to hand it to, and `DisposeAsync`
-                // awaits this very task, so ending quietly IS the teardown — faulting here would only
-                // produce an exception no one can observe. (`BatchGate.captureGuarded` already turned
-                // a cancelled RUN into this command's own `Cancelled` result, so that path never
-                // reaches here.)
+                // `disposalToken`: the consumer abandoned the stream while a result was still waiting
+                // for room. There is nobody left to hand it to, and `DisposeAsync` awaits this worker,
+                // so ending quietly IS the teardown — faulting here would only produce an exception no
+                // one can observe. (`BatchGate.captureGuarded` already turned a cancelled RUN into
+                // this command's own `Cancelled` result, so that path never reaches here.)
                 ()
         }
 
-    // Start the whole fan-out. Called once, from the first `MoveNextAsync`.
+    // Start the whole fan-out. Called once, from the first `MoveNextAsync`. The worker count is bounded
+    // by the concurrency cap, independently of the number of input commands.
     let start () =
-        let producers = items |> Array.mapi runOne
+        let workers = Array.init (min concurrency items.Length) (fun _ -> runWorker ())
+        let workersFinished = new CancellationTokenSource()
+        let workerCompletion = Task.WhenAll workers
+
+        // Cancellation completes every still-unclaimed command as data even while all fixed workers
+        // remain inside captures that have not finished reacting to the token. This single coordinator
+        // preserves the stream's completion-order contract without recreating one waiter task per input.
+        let cancelUnstartedWhenRunStops =
+            task {
+                use stopWaiting =
+                    CancellationTokenSource.CreateLinkedTokenSource(runToken, workersFinished.Token)
+
+                try
+                    try
+                        do! Task.Delay(Timeout.InfiniteTimeSpan, stopWaiting.Token)
+                    with :? OperationCanceledException ->
+                        // Either the run was cancelled or every worker finished normally. The token
+                        // state below distinguishes those terminal states; the wait itself has no result.
+                        ()
+
+                    if runToken.IsCancellationRequested then
+                        let mutable running = true
+
+                        while running do
+                            let index = Interlocked.Increment(&nextIndex)
+
+                            if index >= items.Length then
+                                running <- false
+                            else
+                                let command = items[index]
+
+                                do!
+                                    results.Writer.WriteAsync(
+                                        BatchItem<'T>(index, Error(ProcessError.Cancelled command.Program)),
+                                        disposalToken
+                                    )
+                with :? OperationCanceledException ->
+                    // The consumer disposed the stream while this coordinator was waiting for room in
+                    // the hand-off. Nobody remains to receive cancellation items, so ending the one
+                    // coordinator is the teardown; claimed indices cannot subsequently start.
+                    ()
+            }
 
         fanout <-
             task {
+                use _workersFinishedCts = workersFinished
+
                 try
-                    let! _ = Task.WhenAll producers
+                    let! firstCompleted = Task.WhenAny(workerCompletion, cancelUnstartedWhenRunStops)
+
+                    if obj.ReferenceEquals(firstCompleted, workerCompletion) then
+                        cancelQuietly workersFinished
+
+                    let! _ = Task.WhenAll(workerCompletion, cancelUnstartedWhenRunStops)
                     results.Writer.TryComplete() |> ignore
                 with ex ->
-                    // `runOne` turns every per-command failure into that command's own `Result` and
+                    // `runWorker` turns every per-command failure into that command's own `Result` and
                     // swallows its own disposal race, so reaching here means an unexpected fault.
                     // Complete the channel WITH the cause, so the consumer sees it from
                     // `MoveNextAsync` instead of a silently short stream.
@@ -428,6 +489,8 @@ module Exec =
         : Task<Result<ProcessResult<'T>, ProcessError>[]> =
         task {
             use gate = new SemaphoreSlim(concurrency, concurrency)
+            let results = Array.zeroCreate<Result<ProcessResult<'T>, ProcessError>> items.Length
+            let mutable nextIndex = -1
 
             // Every command's concurrency-slot wait and its capture go through this linked token instead
             // of `cancellationToken` directly. Under `CollectAll` it only ever fires when the caller's own
@@ -438,48 +501,65 @@ module Exec =
             use internalCts = CancellationTokenSource.CreateLinkedTokenSource cancellationToken
             let effectiveToken = internalCts.Token
 
-            let runOne (command: Command) =
+            let runWorker () =
                 task {
-                    // The slot wait, including the post-acquisition cancellation recheck that keeps a
-                    // command the FailFast contract promised to leave unstarted from ever performing a
-                    // side effect, is the one shared with the completion-ordered fan-out — see
-                    // `BatchGate.tryAcquireSlot` for why that recheck exists and why only these
-                    // primitives are shared between the two drivers.
-                    let! acquired = BatchGate.tryAcquireSlot gate effectiveToken
+                    let mutable running = true
 
-                    if not acquired then
-                        return Error(ProcessError.Cancelled command.Program)
-                    else
-                        try
-                            let! result = BatchGate.captureGuarded capture runner effectiveToken command
+                    while running do
+                        let index = Interlocked.Increment(&nextIndex)
 
-                            match policy, result with
-                            | BatchPolicy.FailFast, Error _ ->
-                                // `internalCts` is disposed only after every `runOne` (this one included)
-                                // has returned, so it is always live here — `Cancel` is also idempotent, so
-                                // a race between two failing commands cancels the batch exactly once either
-                                // way, and both keep their own real errors since both had already finished.
+                        if index >= items.Length then
+                            running <- false
+                        else
+                            let command = items[index]
+
+                            // The slot wait, including the post-acquisition cancellation recheck that
+                            // keeps a command the FailFast contract promised to leave unstarted from
+                            // ever performing a side effect, is the one shared with the
+                            // completion-ordered fan-out — see `BatchGate.tryAcquireSlot` for why that
+                            // recheck exists and why only these primitives are shared between the two
+                            // drivers.
+                            let! acquired = BatchGate.tryAcquireSlot gate effectiveToken
+
+                            if not acquired then
+                                results[index] <- Error(ProcessError.Cancelled command.Program)
+                            else
                                 try
-                                    internalCts.Cancel()
-                                with ex ->
-                                    // `Cancel()` synchronously re-invokes every callback registered on
-                                    // `effectiveToken` (including a sibling `IProcessRunner`'s own
-                                    // kill-the-child registration) and re-throws if any of them faults. A
-                                    // buggy registration must never fault THIS command's already-computed
-                                    // `result` — and, through it, the whole batch's `Task.WhenAll` — so
-                                    // swallow it here; there is nothing this batch can do to recover a
-                                    // caller-owned callback's own bug, and every other command still needs
-                                    // its own `Result` regardless.
-                                    ignore ex
-                            | _ -> ()
+                                    let! result = BatchGate.captureGuarded capture runner effectiveToken command
 
-                            return result
-                        finally
-                            gate.Release() |> ignore
+                                    match policy, result with
+                                    | BatchPolicy.FailFast, Error _ ->
+                                        // `internalCts` is disposed only after every worker (this one
+                                        // included) has returned, so it is always live here — `Cancel`
+                                        // is also idempotent, so a race between two failing commands
+                                        // cancels the batch exactly once either way, and both keep their
+                                        // own real errors since both had already finished.
+                                        try
+                                            internalCts.Cancel()
+                                        with ex ->
+                                            // `Cancel()` synchronously re-invokes every callback
+                                            // registered on `effectiveToken` (including a sibling
+                                            // `IProcessRunner`'s own kill-the-child registration) and
+                                            // re-throws if any of them faults. A buggy registration must
+                                            // never fault THIS command's already-computed `result` — and,
+                                            // through it, the whole batch — so swallow it here; there is
+                                            // nothing this batch can do to recover a caller-owned
+                                            // callback's own bug, and every other command still needs
+                                            // its own `Result` regardless.
+                                            ignore ex
+                                    | _ -> ()
+
+                                    results[index] <- result
+                                finally
+                                    gate.Release() |> ignore
                 }
 
-            // Array.map preserves order, and Task.WhenAll returns results in task order.
-            return! Task.WhenAll(items |> Array.map runOne)
+            // A fixed worker pool keeps scheduler state O(concurrency); each worker claims a unique
+            // input index, so assigning into the results array preserves input order without one task
+            // per command.
+            let workers = Array.init (min concurrency items.Length) (fun _ -> runWorker ())
+            let! _ = Task.WhenAll workers
+            return results
         }
 
     /// Run every command in `commands` through `runner`, keeping at most `concurrency` live at once,
