@@ -1928,20 +1928,34 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
             :> Task
 
     // Take the entry this key's cursor is on, in capture order then repeating the last. `accept` is the
-    // caller's veto — a candidate it refuses is NOT consumed (the cursor stays put), so a refused
-    // compatibility lookup can never eat a group's next recording on the way past.
-    let play (slots: Dictionary<Key, ReplaySlot>) (key: Key) (accept: CassetteEntry -> bool) : CassetteEntry option =
-        match slots.TryGetValue key with
-        | true, slot ->
-            let index = min slot.Next (slot.Entries.Length - 1)
-            let entry = slot.Entries[index]
+    // caller's compatibility veto, while cancellation is the call's acceptance veto: neither consumes
+    // a candidate. The caller holds `gate` across key construction and this commit, so a normalizer that
+    // cancels during lookup is observed here before `Next` moves. Once the final cancellation check passes,
+    // the entry is accepted and the cursor increment is the linearization point; a later cancellation
+    // belongs to the already-accepted call and must not roll the shared cursor back.
+    let play
+        (slots: Dictionary<Key, ReplaySlot>)
+        (key: Key)
+        (accept: CassetteEntry -> bool)
+        (cancellationToken: CancellationToken)
+        (program: string)
+        : Result<CassetteEntry option, ProcessError> =
+        if cancellationToken.IsCancellationRequested then
+            Error(ProcessError.Cancelled program)
+        else
+            match slots.TryGetValue key with
+            | true, slot ->
+                let index = min slot.Next (slot.Entries.Length - 1)
+                let entry = slot.Entries[index]
 
-            if accept entry then
-                slot.Next <- slot.Next + 1
-                Some entry
-            else
-                None
-        | _ -> None
+                if not (accept entry) then
+                    Ok None
+                elif cancellationToken.IsCancellationRequested then
+                    Error(ProcessError.Cancelled program)
+                else
+                    slot.Next <- slot.Next + 1
+                    Ok(Some entry)
+            | _ -> Ok None
 
     // Register a freshly-recorded (missed) entry into the live replay index, so a repeat of the same key
     // in an Auto session replays it instead of hitting the inner runner again.
@@ -1962,26 +1976,30 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
         (slots: Dictionary<Key, ReplaySlot>)
         (command: Command)
         (digest: string option)
+        (cancellationToken: CancellationToken)
         : Result<CassetteEntry option, ProcessError> =
         let liveWiring = outputWiring command
         let anyEntry (_: CassetteEntry) = true
         let legacyWiringFits = legacyEntryFits command
 
         let attempt (stdin: string option) (wiring: string) (accept: CassetteEntry -> bool) =
-            lock gate (fun () -> play slots (keyWith command stdin wiring) accept)
+            lock gate (fun () -> play slots (keyWith command stdin wiring) accept cancellationToken command.Program)
 
         match attempt digest liveWiring anyEntry with
-        | Some entry -> Ok(Some entry)
-        | None ->
+        | Error error -> Error error
+        | Ok(Some entry) -> Ok(Some entry)
+        | Ok None ->
             match attempt digest legacyOutputWiring legacyWiringFits with
-            | Some entry -> Ok(Some entry)
-            | None ->
+            | Error error -> Error error
+            | Ok(Some entry) -> Ok(Some entry)
+            | Ok None ->
                 match stdinDigest true command with
                 | Error error -> Error error
                 | Ok legacyDigest ->
                     match attempt legacyDigest liveWiring anyEntry with
-                    | Some entry -> Ok(Some entry)
-                    | None -> Ok(attempt legacyDigest legacyOutputWiring legacyWiringFits)
+                    | Error error -> Error error
+                    | Ok(Some entry) -> Ok(Some entry)
+                    | Ok None -> attempt legacyDigest legacyOutputWiring legacyWiringFits
 
     // The whole save critical section, shared by `Save` and the drop-time flush: this recorder's own
     // save gate, then the cross-instance/cross-process advisory lock on the target, and only then
@@ -2271,24 +2289,16 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
                                 return Ok result
                     | ReplayMode slots ->
-                        match replayEntry slots command digest with
+                        match replayEntry slots command digest effectiveToken with
                         | Error error -> return Error error
-                        | Ok(Some entry) ->
-                            if effectiveToken.IsCancellationRequested then
-                                return Error(ProcessError.Cancelled command.Program)
-                            else
-                                return! replayed entry
+                        | Ok(Some entry) -> return! replayed entry
                         | Ok None -> return Error(ProcessError.CassetteMiss command.Program)
                     | AutoMode(inner, slots, recorded, dirty) ->
                         let key = keyOf command digest
 
-                        match replayEntry slots command digest with
+                        match replayEntry slots command digest effectiveToken with
                         | Error error -> return Error error
-                        | Ok(Some entry) ->
-                            if effectiveToken.IsCancellationRequested then
-                                return Error(ProcessError.Cancelled command.Program)
-                            else
-                                return! replayed entry
+                        | Ok(Some entry) -> return! replayed entry
                         | Ok None ->
                             match! captureInner inner command effectiveToken with
                             | Error error ->
@@ -2364,7 +2374,7 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
                 match stdinDigest false command with
                 | Error error -> Error error
                 | Ok digest ->
-                    match replayEntry slots command digest with
+                    match replayEntry slots command digest cancellationToken with
                     | Error error -> Error error
                     | Ok(Some entry) -> spawnFromEntry command entry
                     | Ok None ->

@@ -1037,6 +1037,11 @@ that call creates no cassette and changes none already on disk. That mark is the
 is never told how the scope ended — so a throw *after* `Complete()` still flushes the run's verbatim
 argv/output: complete last, after whatever can fail. `Save()` stays the unconditional,
 error-reporting way to persist a recording.
+Duplicate matches replay in capture order and then repeat the last entry. If a strict `Replay` or an
+`Auto` hit is cancelled before its matched entry is accepted, it returns `ProcessError.Cancelled`
+without advancing that order; the next non-cancelled text, bytes, or `SpawnAsync` call receives the
+same entry. Lookup, cancellation acceptance, and cursor advancement are one gated operation, so a
+cancelled call cannot require a rollback that could undo a concurrent replay.
 Capture replay and live handles reconstructed by `SpawnAsync` both preserve the recorded duration
 and truncation state; a stricter output-buffer policy on the replay command can additionally mark
 the reconstructed handle's result as truncated.
