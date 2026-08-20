@@ -177,6 +177,9 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
         | :? ProcessException as ex -> Error ex.Error
         | ex -> Error(ProcessError.Io ex.Message)
 
+    let invalidPatternError: Result<ExpectMatch, ProcessError> =
+        Error(ProcessError.Unsupported "expect patterns must match at least one character")
+
     let expectCore
         (matcher: string -> (int * int) option)
         (timeout: TimeSpan)
@@ -207,6 +210,7 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
                 // end for a match already in the window (see `ExpectWindow.TryConsume`).
                 match window.TryConsume matcher with
                 | ExpectStep.Matched(before, matched) -> result <- ValueSome(Ok(ExpectMatch(before, matched)))
+                | ExpectStep.InvalidPattern -> result <- ValueSome invalidPatternError
                 // The child's output has ended (it closed the terminal, or exited) and the pattern
                 // never arrived: report it now rather than burning the rest of the timeout on output
                 // that can no longer come.
@@ -284,8 +288,9 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     /// found the moment it arrives. Note that a terminal ends its own lines with `\r\n`: match on the
     /// prompt text itself rather than on a trailing `\n`. Everything up to and including the match is
     /// consumed, so the next call starts after it; a pattern that has not arrived by the deadline leaves
-    /// the window untouched, so a longer retry still sees what did arrive. `pattern` must be non-null
-    /// and non-empty (an empty pattern matches everywhere and would make a script silently pass).
+    /// the window untouched, so a longer retry still sees what did arrive. `pattern` must be non-null;
+    /// an empty pattern returns a typed `Unsupported` result because it cannot advance the session
+    /// window.
     ///
     /// Ends promptly with `NotReady` if the child's output ends first (it exited, or closed the
     /// terminal) rather than waiting out the whole `timeout`, and with `ProcessError.Io` if reading it
@@ -296,15 +301,15 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
         ArgumentNullException.ThrowIfNull(pattern, nameof pattern)
 
         if pattern.Length = 0 then
-            raise (ArgumentException("expected a non-empty pattern", nameof pattern))
-
-        expectCore
-            (fun text ->
-                match text.IndexOf(pattern, StringComparison.Ordinal) with
-                | -1 -> None
-                | index -> Some(index, pattern.Length))
-            timeout
-            cancellationToken
+            Task.FromResult invalidPatternError
+        else
+            expectCore
+                (fun text ->
+                    match text.IndexOf(pattern, StringComparison.Ordinal) with
+                    | -1 -> None
+                    | index -> Some(index, pattern.Length))
+                timeout
+                cancellationToken
 
     /// Wait until `pattern` matches somewhere in the child's terminal output — the regular-expression
     /// form of the overload above, with the identical timeout, consumption, early-end, and error
@@ -312,7 +317,8 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     ///
     /// Matching runs over the same sliding, unframed session view as the string overload, so `^`/`$`
     /// anchor against the window's bounds rather than the child's line structure unless you pass
-    /// `RegexOptions.Multiline`.
+    /// `RegexOptions.Multiline`. A zero-width match is rejected with a typed `Unsupported` result,
+    /// because it cannot advance the session window.
     member _.ExpectAsync
         (pattern: Regex, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<ExpectMatch, ProcessError>> =

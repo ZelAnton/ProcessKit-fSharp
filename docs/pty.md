@@ -253,8 +253,11 @@ Console.WriteLine(await session.WaitForExitAsync());
 ```
 
 `ExpectAsync` also takes a `Regex` for a prompt that varies (`new Regex(@"psql \(\d+\.\d+\)")`), with
-the same contract. Matching runs over the unframed session view rather than one line, so `^`/`$`
-anchor to the window unless you pass `RegexOptions.Multiline`.
+the same contract. Every string or regex match must consume at least one character; an empty string,
+or an empty, anchor-only, or lookaround regex match, returns the typed `ProcessError.Unsupported`
+result so an expect loop cannot repeatedly consume an unchanged window. Regex matching runs over the
+unframed session view rather than one line, so `^`/`$` anchor to the window unless you pass
+`RegexOptions.Multiline`.
 
 Each pattern deadline uses the command's `TimeProvider` (`TimeProvider.System` by default), just like
 `WaitForLineAsync`. Attach a deterministic provider with `Command.TimeProvider(provider)` /

@@ -16,6 +16,10 @@ type internal ExpectStep =
     /// from the window by the same step that reports them.
     | Matched of before: string * text: string
 
+    /// The matcher found a zero-width match, which cannot advance the window and is therefore not a
+    /// valid expect pattern.
+    | InvalidPattern
+
     /// Nothing matched, and the child's output has not ended — the pattern may still arrive.
     | Waiting
 
@@ -229,9 +233,13 @@ type internal ExpectWindow(maxWindowChars: int, maxTranscriptChars: int option) 
             let text = window.ToString()
 
             match matcher text with
-            | Some(start, length) ->
+            | Some(start, length) when length > 0 ->
                 window.Remove(0, start + length) |> ignore
                 ExpectStep.Matched(text.Substring(0, start), text.Substring(start, length))
+            | Some(_, _) ->
+                // A zero-length match cannot advance the window, so treating it as successful would let
+                // the same expect pattern succeed repeatedly without consuming any child output.
+                ExpectStep.InvalidPattern
             | None when completed -> ExpectStep.Ended readFault
             | None -> ExpectStep.Waiting)
 

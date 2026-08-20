@@ -183,6 +183,40 @@ type PtySessionTests() =
         }
 
     [<Test>]
+    member _.``zero-width string and Regex matches share a typed error and leave the window unchanged``() : Task =
+        task {
+            let fake =
+                FakeProcess.Create("zero-width-regex").WithPty().WithStdout("primedready")
+
+            use running = fake.Build()
+            let session = PtySession running
+
+            match! session.ExpectAsync(Regex "primed", TimeSpan.FromSeconds 10.0) with
+            | Ok matched -> Assert.That(matched.Text, Is.EqualTo "primed")
+            | Error error -> Assert.Fail $"the non-zero regex should have primed the pending window: {error}"
+
+            let! emptyString = session.ExpectAsync("", TimeSpan.FromSeconds 10.0)
+
+            let expectedMessage =
+                match emptyString with
+                | Error(ProcessError.Unsupported message) -> message
+                | Error error ->
+                    Assert.Fail $"an empty string pattern should return a typed Unsupported error, got {error}"
+                    ""
+                | Ok matched ->
+                    Assert.Fail $"an empty string pattern must not match, got '{matched.Text}'"
+                    ""
+
+            for pattern in [ Regex ""; Regex "^"; Regex "$"; Regex "(?=ready)" ] do
+                match! session.ExpectAsync(pattern, TimeSpan.FromSeconds 10.0) with
+                | Error(ProcessError.Unsupported message) -> Assert.That(message, Is.EqualTo expectedMessage)
+                | Error error -> Assert.Fail $"a zero-width regex should be rejected, got {error}"
+                | Ok matched -> Assert.Fail $"a zero-width regex must not match, got '{matched.Text}'"
+
+                Assert.That(session.Pending, Is.EqualTo "ready")
+        }
+
+    [<Test>]
     member _.``ANSI filtering makes styled prompts matchable and cleans the transcript``() : Task =
         task {
             let fake =
@@ -389,6 +423,25 @@ type PtySessionTests() =
         match window.TryConsume(literal "answer=42") with
         | ExpectStep.Ended None -> ()
         | other -> Assert.Fail $"an ended window with nothing left to match must report Ended, got {other}"
+
+    [<Test>]
+    member _.``a zero-length window match never consumes or repeats``() =
+        let window = ExpectWindow(1024, None)
+        let zeroWidth _ = Some(0, 0)
+        window.Append "ready"
+
+        match window.TryConsume zeroWidth with
+        | ExpectStep.InvalidPattern -> ()
+        | other -> Assert.Fail $"a zero-length match on a live window must be rejected, got {other}"
+
+        Assert.That(window.Pending, Is.EqualTo "ready")
+        window.Complete None
+
+        match window.TryConsume zeroWidth with
+        | ExpectStep.InvalidPattern -> ()
+        | other -> Assert.Fail $"a zero-length match after completion must be rejected, got {other}"
+
+        Assert.That(window.Pending, Is.EqualTo "ready")
 
     [<Test>]
     member _.``a match that landed with a read fault is reported first, and the fault after it``() =
