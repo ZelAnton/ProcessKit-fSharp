@@ -165,7 +165,9 @@ jobs:
       # (build order comes from ProcessKit.slnx's BuildDependency entries) guarantees it.
       - name: Build
         working-directory: _released
-        run: dotnet build ProcessKit.slnx --no-restore --configuration Release
+        # Published tags are immutable, so keep every warning strict except the
+        # known FS1182 in v2.11.0 that was fixed after that release.
+        run: dotnet build ProcessKit.slnx --no-restore --configuration Release -p:WarningsNotAsErrors=FS1182
 
       # Resolves the real Pages base URL (e.g. https://zelanton.github.io/ProcessKit-fSharp)
       # so generated absolute links/assets are correct without hardcoding it here —
