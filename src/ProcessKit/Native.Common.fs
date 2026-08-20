@@ -287,12 +287,13 @@ module internal Common =
             PathExt: string
             PreferLocal: string list
             WorkingDirectory: string option
-            /// `true` when `Path` is exactly the CURRENT PROCESS's own `PATH` — the value an OS bare-name
-            /// search walks before the child exists. While this is `true` the native search and this
-            /// resolution can only find the same PATH match, so Windows and POSIX can safely defer to it.
-            /// When a command overrides or clears the child's `PATH` it turns `false`; the launch resolver
-            /// then substitutes the resolved absolute path (or refuses a miss) instead of letting the OS
-            /// answer out of a `PATH` the child never had.
+            /// `true` only when the command inherits a non-empty CURRENT PROCESS `PATH` unchanged — the
+            /// value an OS bare-name search walks before the child exists. While this is `true` the native
+            /// search and this resolution can only find the same PATH match, so Windows and POSIX can safely
+            /// defer to it. An explicit clear/remove/override, or an absent/empty process `PATH`, turns it
+            /// `false`; the launch resolver then substitutes the resolved absolute path (or refuses a miss)
+            /// instead of exposing libc default/current-directory fallback semantics that the resolver does
+            /// not share.
             PathIsProcessPath: bool
         }
 
@@ -348,14 +349,30 @@ module internal Common =
                     | None -> dir)
             |> List.ofSeq
 
+        let pathComparison =
+            if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                StringComparison.OrdinalIgnoreCase
+            else
+                StringComparison.Ordinal
+
+        let explicitlyChangesPath =
+            command.Config.ClearEnv
+            || (command.Config.EnvOverrides
+                |> Seq.exists (fun (key, _) -> String.Equals(key, "PATH", pathComparison)))
+
+        let processPath = processSearchPath ()
+
         { Path = path
           PathExt = lookup "PATHEXT"
           PreferLocal = preferLocal
           WorkingDirectory = baseDir
-          // Ordinal on purpose: anything but the process's own `PATH`, byte for byte, is a `PATH` the OS's
-          // parent-context search would not walk, and the safe answer for a value this resolution cannot
-          // prove identical is to resolve the launch here rather than defer to that search.
-          PathIsProcessPath = String.Equals(path, processSearchPath (), StringComparison.Ordinal) }
+          // Equality alone is insufficient proof: an explicit child-PATH operation can produce the same
+          // managed string, and libc assigns absent/empty PATH searches default/current-directory semantics
+          // that this resolver deliberately does not. Defer only for an untouched, non-empty inherited PATH.
+          PathIsProcessPath =
+            not explicitlyChangesPath
+            && not (String.IsNullOrEmpty processPath)
+            && String.Equals(path, processPath, StringComparison.Ordinal) }
 
     [<DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "NeedCurrentDirectoryForExePathW")>]
     extern bool private needCurrentDirectoryForExePath(string fileName)

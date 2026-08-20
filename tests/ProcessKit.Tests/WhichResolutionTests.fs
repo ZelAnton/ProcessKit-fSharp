@@ -23,6 +23,9 @@ module private NativeEnv =
     [<DllImport("libc", CharSet = CharSet.Ansi, SetLastError = true)>]
     extern int setenv(string name, string value, int overwrite)
 
+    [<DllImport("libc", CharSet = CharSet.Ansi, SetLastError = true)>]
+    extern int unsetenv(string name)
+
 /// Covers `Exec.which` / `CliClient.EnsureAvailableAsync` — the no-spawn preflight helper — and its
 /// contract with the real spawn path: both go through the SAME PATH/PATHEXT-aware resolution
 /// (`Common.resolveProgram`), so for the same program name they must always agree on
@@ -1929,6 +1932,15 @@ type PosixChildPathLaunchTests() =
         Environment.SetEnvironmentVariable("PATH", value)
         NativeEnv.setenv ("PATH", value, 1) |> ignore
 
+    let unsetPath () =
+        Environment.SetEnvironmentVariable("PATH", null)
+        NativeEnv.unsetenv "PATH" |> ignore
+
+    let restorePath (value: string option) =
+        match value with
+        | Some path -> setPath path
+        | None -> unsetPath ()
+
     let writeTool (dir: string) (name: string) (marker: string) =
         let path = Path.Combine(dir, name)
 
@@ -1969,6 +1981,36 @@ type PosixChildPathLaunchTests() =
             // The detached script normally exits before cleanup reaches it; an already-gone process needs
             // no further teardown, and cleanup must not obscure the launch assertion.
             ()
+
+    let assertRefusedBeforeSpawn (toolName: string) (marker: string) (command: Command) : Task =
+        task {
+            let expectedSearched =
+                match command.ResolveProgram() with
+                | Ok resolved -> failwith $"the effective empty PATH must not resolve '{toolName}', got '{resolved}'"
+                | Error(ProcessError.NotFound(_, searched)) -> searched
+                | Error other -> failwith $"expected NotFound from preflight, got {other}"
+
+            let assertRefused (label: string) (error: ProcessError) =
+                match error with
+                | ProcessError.NotFound(program, searched) ->
+                    Assert.That(program, Is.EqualTo toolName, label)
+                    Assert.That(searched, Is.EqualTo expectedSearched, label)
+                | other -> Assert.Fail $"{label}: expected NotFound, got {other}"
+
+            match! command.OutputStringAsync() with
+            | Ok result -> Assert.Fail $"ordinary spawn executed '{toolName}' (outcome {result.Outcome})"
+            | Error error -> assertRefused "ordinary spawn" error
+
+            Assert.That(File.Exists marker, Is.False, "ordinary pre-spawn refusal must leave no marker")
+
+            match (command |> Command.stdoutToFile marker false).LaunchDetached() with
+            | Ok detached ->
+                killQuietly detached.Pid
+                Assert.Fail $"detached spawn executed '{toolName}'"
+            | Error error -> assertRefused "detached spawn" error
+
+            Assert.That(File.Exists marker, Is.False, "detached pre-spawn refusal must leave no marker")
+        }
 
     member private _.WithPlantedPair(toolName: string, body: string -> string -> Task) : Task =
         task {
@@ -2117,6 +2159,72 @@ type PosixChildPathLaunchTests() =
                     setPath originalPath
                     deleteFileQuietly marker
                     deleteDirQuietly parentDir
+        }
+        :> Task
+
+    [<Test>]
+    member _.``POSIX absent process PATH cannot enable libc default-path launch``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: this guards libc's absent-PATH default search."
+            else
+                let originalPath = Environment.GetEnvironmentVariable "PATH" |> Option.ofObj
+
+                try
+                    unsetPath ()
+
+                    for label, configure in
+                        [ "inherited", id
+                          "EnvClear", Command.envClear
+                          "EnvRemove", Command.envRemove "PATH" ] do
+                        let marker =
+                            Path.Combine(Path.GetTempPath(), $"processkit-absent-path-{label}-{Guid.NewGuid():N}.log")
+
+                        try
+                            let shellScript = $"printf 'LIBC-DEFAULT-PATH' > '{marker}'"
+
+                            let command = Command.create "sh" |> Command.args [ "-c"; shellScript ] |> configure
+
+                            do! assertRefusedBeforeSpawn "sh" marker command
+                        finally
+                            deleteFileQuietly marker
+                finally
+                    restorePath originalPath
+        }
+        :> Task
+
+    [<Test>]
+    member _.``POSIX empty process PATH cannot enable current-directory launch``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: this guards libc's empty-PATH current-directory search."
+            else
+                let originalPath = Environment.GetEnvironmentVariable "PATH" |> Option.ofObj
+                let originalDirectory = Directory.GetCurrentDirectory()
+                let dir = freshDir "empty-current-dir"
+
+                try
+                    Directory.SetCurrentDirectory dir
+                    setPath ""
+
+                    for label, configure in
+                        [ "inherited", id
+                          "EnvClear", Command.envClear
+                          "EnvRemove", Command.envRemove "PATH"
+                          "EnvOverride", Command.env "PATH" "" ] do
+                        let toolName = $"processkit-empty-path-{label.ToLowerInvariant()}"
+                        let marker = Path.Combine(dir, $"{toolName}.log")
+
+                        try
+                            writeTool dir toolName "CURRENT-DIRECTORY-FALLBACK" |> ignore
+                            let command = Command.create toolName |> configure
+                            do! assertRefusedBeforeSpawn toolName marker command
+                        finally
+                            deleteFileQuietly marker
+                finally
+                    Directory.SetCurrentDirectory originalDirectory
+                    restorePath originalPath
+                    deleteDirQuietly dir
         }
         :> Task
 
