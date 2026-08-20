@@ -186,6 +186,22 @@ type internal StderrReadinessWatch(retentionBytes: int) =
         tail.Clear() |> ignore
         tailBytes <- 0
 
+    // The pending lines and the in-flight tail share one retention budget. The tail is newer, so when
+    // it needs room, evict older framed lines first. Keep a newest line that is itself oversized, as
+    // `retainLine` does, and drop the tail instead when that is the only way to stay within the cap.
+    let trimPendingForTail () =
+        let canEvict () =
+            pendingBytes + tailBytes > retentionBytes
+            && pendingLines.Count > 0
+            && (pendingLines.Count > 1 || pendingBytes <= retentionBytes)
+
+        while canEvict () do
+            let struct (_, evicted) = pendingLines.Dequeue()
+            pendingBytes <- pendingBytes - evicted
+
+        if pendingBytes + tailBytes > retentionBytes then
+            clearTail ()
+
     // Scan what is retained, oldest first — the framed lines, then (for a TAIL wait) the tail the pump
     // is still assembling — consuming everything up to and including a match. Runs under `gate`, on the
     // ARMING caller's thread, so a throwing predicate simply faults that caller's own wait.
@@ -230,10 +246,13 @@ type internal StderrReadinessWatch(retentionBytes: int) =
                         // pump's own assembly buffer is untouched, so this text still reaches the
                         // capture exactly once, later, inside the line it is framed into.
                         clearTail ()
-                    elif tailBytes >= retentionBytes then
-                        // Force-flushed at the cap, having just been offered — the readiness twin of
-                        // `OutputBufferPolicy.MaxBytes`'s in-flight force-flush.
-                        clearTail ())
+                    else
+                        trimPendingForTail ()
+
+                        if tailBytes >= retentionBytes then
+                            // Force-flushed at the cap, having just been offered — the readiness twin of
+                            // `OutputBufferPolicy.MaxBytes`'s in-flight force-flush.
+                            clearTail ())
 
     /// One complete framed stderr line, exactly as the session's capture and `Command.OnStderrLine`
     /// receive it. The in-flight tail is over by definition, so it is cleared here; the tail waits have
