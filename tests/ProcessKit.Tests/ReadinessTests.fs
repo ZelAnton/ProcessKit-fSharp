@@ -2962,3 +2962,73 @@ type StderrReadinessTests() =
                 )
         }
         :> Task
+
+    [<Test>]
+    member _.``pending stderr lines and a partial tail share one retention cap``() =
+        // At the exact boundary, both retained shapes remain available. Once the tail crosses it, the
+        // oldest framed line is evicted so the newest line and the current tail fit the same budget.
+        let atBoundary = StderrReadinessWatch 16
+        atBoundary.ObserveLine "line-a"
+        atBoundary.ObserveLine "line-b"
+        atBoundary.ObserveTail "xx"
+
+        let boundaryLines = ResizeArray<string>()
+
+        let boundaryPredicate =
+            Func<string, bool>(fun line ->
+                boundaryLines.Add line
+                false)
+
+        match atBoundary.TryStart(StderrReadinessMode.Line, boundaryPredicate) with
+        | StderrReadinessStart.Armed waiter -> atBoundary.Release waiter
+        | other -> Assert.Fail $"expected an armed boundary probe, got {other}"
+
+        Assert.That(List.ofSeq boundaryLines, Is.EqualTo<string list> [ "line-a"; "line-b" ])
+
+        match atBoundary.TryStart(StderrReadinessMode.Tail, Func<string, bool>(fun tail -> tail = "xx")) with
+        | StderrReadinessStart.Matched tail -> Assert.That(tail, Is.EqualTo "xx")
+        | other -> Assert.Fail $"expected the boundary tail to remain retained, got {other}"
+
+        let overBoundary = StderrReadinessWatch 16
+        overBoundary.ObserveLine "line-a"
+        overBoundary.ObserveLine "line-b"
+        overBoundary.ObserveTail "xxy"
+
+        let retainedLines = ResizeArray<string>()
+
+        let retainedPredicate =
+            Func<string, bool>(fun line ->
+                retainedLines.Add line
+                false)
+
+        match overBoundary.TryStart(StderrReadinessMode.Line, retainedPredicate) with
+        | StderrReadinessStart.Armed waiter -> overBoundary.Release waiter
+        | other -> Assert.Fail $"expected an armed overflow probe, got {other}"
+
+        Assert.That(List.ofSeq retainedLines, Is.EqualTo<string list> [ "line-b" ])
+
+        match overBoundary.TryStart(StderrReadinessMode.Tail, Func<string, bool>(fun tail -> tail = "xxy")) with
+        | StderrReadinessStart.Matched tail -> Assert.That(tail, Is.EqualTo "xxy")
+        | other -> Assert.Fail $"expected the newest tail to remain retained, got {other}"
+
+        let oversized = StderrReadinessWatch 16
+        let oversizedLine = String('z', 16)
+        oversized.ObserveLine oversizedLine
+        oversized.ObserveTail "x"
+
+        let seenOversized = ResizeArray<string>()
+
+        let oversizedPredicate =
+            Func<string, bool>(fun line ->
+                seenOversized.Add line
+                false)
+
+        match oversized.TryStart(StderrReadinessMode.Line, oversizedPredicate) with
+        | StderrReadinessStart.Armed waiter -> oversized.Release waiter
+        | other -> Assert.Fail $"expected an armed oversized-line probe, got {other}"
+
+        Assert.That(List.ofSeq seenOversized, Is.EqualTo<string list> [ oversizedLine ])
+
+        match oversized.TryStart(StderrReadinessMode.Tail, Func<string, bool>(fun _ -> true)) with
+        | StderrReadinessStart.Armed waiter -> oversized.Release waiter
+        | other -> Assert.Fail $"expected the dropped tail to leave the watch live, got {other}"
