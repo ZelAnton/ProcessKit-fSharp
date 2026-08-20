@@ -798,16 +798,21 @@ the same `Searched` value the preflight reports — is returned before any proce
 that entire search, the child's `PATH` included, finds nothing. A command that leaves the child's
 `PATH` alone keeps the OS's own search unchanged.
 
-**POSIX resolves a bare name from the launching process's `PATH`.** There is no POSIX counterpart to
-the Windows resolution above. A bare name goes to `posix_spawnp`, whose `PATH` search happens inside
-libc and reads the launching process's own environment — the native `environ`, what `getenv("PATH")`
-returns — while the `envp` block ProcessKit hands it becomes the child's environment only once the
-image has been chosen. So `Env("PATH", …)`, `EnvRemove("PATH")`, and `EnvClear` do not decide which
-file a bare name launches on Linux/macOS/BSD, while `Command.ResolveProgram()` answers from that
-child `PATH` — for a command that changes `PATH`, the two can name different files. Prefer-local does not go through that search (a `PreferLocal` hit is
-substituted into the launch as an absolute path on POSIX as well), and neither does a path-form
-program, which is passed to the spawn as it stands — a relative one resolving against the child's
-working directory. Either is the way to pin an image there.
+**POSIX also launches a bare name from the effective child `PATH`.** libc's `posix_spawnp` searches
+the launching process's native environment rather than the separate `envp` block supplied for the
+child. A command using `Env("PATH", …)`, `EnvRemove("PATH")`, or `EnvClear` is therefore resolved
+first even when its resulting PATH string equals the process value, and the absolute executable is
+substituted into both direct POSIX launch paths (ordinary and `LaunchDetached`). The selected image is
+exactly the one `Command.ResolveProgram()` reports for the same configuration; a miss returns its
+identical `ProcessError.NotFound` / `Searched` before any native spawn, so a same-named executable from
+the process `PATH` cannot run instead. An inherited absent or empty process `PATH` is resolved too:
+libc may otherwise use a default system path or the current directory, search locations that
+`ResolveProgram()` deliberately does not invent for an empty PATH. POSIX resolution is narrower than
+Windows resolution: after `PreferLocal`, it walks only the effective `PATH`, without
+application/current/system-directory entries around it. Only an untouched, non-empty inherited child
+`PATH` delegates its bare name to `posix_spawnp` exactly as before. Prefer-local hits and path-form
+programs likewise keep their existing behavior; a relative path-form program still resolves against
+the child's working directory.
 
 **`Command.WindowsRawArg` is Windows-only.** It appends a trusted fragment verbatim after all
 ordinarily quoted arguments for children with a non-MSVCRT parser. POSIX has an argv vector rather
