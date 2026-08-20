@@ -10,6 +10,8 @@
 
 	<!-- F# compile order is significant — list test files in dependency order. -->
 	<ItemGroup>
+		<!-- The assembly-wide process safety net, ahead of the [<SetUpFixture>] that installs it. -->
+		<Compile Include="GlobalProcessGuard.fs" />
 		<Compile Include="TestHostErrorMode.fs" />
 		<Compile Include="CommandTests.fs" />
 		<Compile Include="ProcessErrorSanitizationTests.fs" />
@@ -58,6 +60,7 @@
 		<Compile Include="JsonRpcSessionTests.fs" />
 		<Compile Include="StdinInheritTests.fs" />
 		<Compile Include="DetachedLaunchTests.fs" />
+		<Compile Include="ProcessGuardTests.fs" />
 		<Compile Include="CorrectnessBugTests.fs" />
 		<Compile Include="ApiParityTests.fs" />
 		<Compile Include="TestabilityTests.fs" />

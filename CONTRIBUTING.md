@@ -84,6 +84,15 @@ dotnet test ProcessKit.slnx --filter "FullyQualifiedName~TestMethodName"
   `ProjectReference`. Build order comes from `BuildDependency` in the `.slnx`.
 - Match the surrounding code's style for exception handling, comments, and
   architecture; keep the public API surface small and intentional.
+- **A test run cannot leave a process behind.** Each test host enrols itself in a
+  Windows Job Object carrying `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+  ([`tests/ProcessKit.Tests/GlobalProcessGuard.fs`](tests/ProcessKit.Tests/GlobalProcessGuard.fs),
+  and its C# twin), so everything the run spawned — including the children no
+  `ProcessGroup` contains by contract, a `Command.LaunchDetached` child and the
+  ConPTY console host — is terminated when the host exits, however it exits. It is
+  a backstop, not a licence: keep killing what a test starts in a `finally`, since
+  the guard fires only at the end of the run, and off Windows it is a documented
+  no-op.
 - **The public API is locked.** `ApiSurfaceTests` snapshots the exported surface
   against `tests/ProcessKit.Tests/PublicApi.*.approved.txt`. If you change the
   public API on purpose, run the tests, review the generated `*.received.txt`

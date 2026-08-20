@@ -31,12 +31,19 @@ module internal TestHostErrorMode =
 
     let getErrorMode () = GetErrorMode()
 
+/// The one assembly-wide setup for the test host itself (NUnit runs it before any fixture in this
+/// namespace). Both steps are about what the run leaves on the operator's desktop: no modal dialog from a
+/// child that fails to start, and no process at all once the host is gone.
 [<SetUpFixture>]
 type TestHostSetUp() =
 
     [<OneTimeSetUp>]
-    member _.SuppressModalDialogs() =
+    member _.PrepareTestHost() =
         TestHostErrorMode.suppressModalDialogs ()
+        // Deliberately NOT paired with a `[<OneTimeTearDown>]`: the guard's Job handle must stay open
+        // until the kernel closes it during process rundown — that is what reaps a child stranded by a
+        // test that never reached its own cleanup. See `GlobalProcessGuard`.
+        GlobalProcessGuard.install ()
 
 [<TestFixture>]
 type TestHostErrorModeTests() =
