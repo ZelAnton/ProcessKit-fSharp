@@ -4775,6 +4775,25 @@ module internal Posix =
             )
         | None -> command
 
+    /// Prepare a direct POSIX launch before any helper rewrite embeds the target program in its argv.
+    /// Prefer-local keeps its existing first-match substitution. When the remaining bare name carries an
+    /// effective child `PATH` different from the process path, the shared launch resolver either pins the
+    /// same absolute target `Command.ResolveProgram()` reports or returns its identical `NotFound` before
+    /// `posix_spawnp` can consult the parent environment. Unchanged-PATH and path-form commands stay as-is.
+    let private preparePosixLaunch (command: Command) : Result<Command, ProcessError> =
+        let command = applyPreferLocal command
+
+        match resolvePosixLaunch command with
+        | Error error -> Error error
+        | Ok PosixLaunch.AsIs -> Ok command
+        | Ok(PosixLaunch.DirectPath resolved) ->
+            Ok(
+                Command(
+                    { command.Config with
+                        Program = resolved }
+                )
+            )
+
     /// Resolve the target exactly as an ordinary POSIX spawn would, then wrap it in the system shell
     /// long enough to apply `RLIMIT_CPU` immediately before `exec`. Resolving before the rewrite preserves
     /// `PreferLocal`, PATH lookup, and the typed `NotFound` contract; arguments remain positional (`"$@"`),
@@ -5055,10 +5074,7 @@ module internal Posix =
     /// never a silently un-dropped / un-armed child. Any `Command.Rlimit` values are applied here too, by
     /// the `prlimit` rewrite every POSIX entry point performs (`withProcessLimits`) — a no-op for a command
     /// carrying none, and already spent when a backend folded a group `CpuTimeMax` into it beforehand.
-    let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
-        // Resolve any prefer-local program to its absolute path first, so every downstream helper rewrite
-        // (setpriv / setsid --ctty) carries the substituted path (T-182).
-        let command = applyPreferLocal command
+    let private spawnPreparedPosix (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
 
         // The Windows-only token knobs are refused first, before any other dispatch: a POSIX host has no
@@ -5132,6 +5148,14 @@ module internal Posix =
                                         | Ok dropping -> spawnPosixViaSpawn dropping |> remapSetprivNotFound command
                                 else
                                     spawnPosixViaSpawn limited
+
+    /// Resolve a changed effective child `PATH` before either the native launch or a helper chain can
+    /// perform a bare-name lookup in the parent context. The prepared command otherwise follows the
+    /// established POSIX dispatch unchanged.
+    let spawnPosix (command: Command) : Result<Spawned, ProcessError> =
+        match preparePosixLaunch command with
+        | Error error -> Error error
+        | Ok prepared -> spawnPreparedPosix prepared
 
     // ----------------------------------------------------------------------------------
     // Linux cgroup v2: place the child INSIDE its cgroup atomically with its own execution
@@ -5668,10 +5692,7 @@ module internal Posix =
     /// missing helper to an honest `ProcessError.Spawn`. `Command.KillOnParentDeath` never reaches here:
     /// the verb layer refuses it up front, since arming a parent-death signal on a process whose whole
     /// purpose is to outlive the parent is a contradiction, not a composition.
-    let spawnDetachedPosix (command: Command) : Result<DetachedSpawn, ProcessError> =
-        // Resolve any prefer-local program to its absolute path first, so a `setpriv` rewrite carries the
-        // substituted path — exactly as `spawnPosix` does (T-182).
-        let command = applyPreferLocal command
+    let private spawnPreparedDetachedPosix (command: Command) : Result<DetachedSpawn, ProcessError> =
         let config = command.Config
 
         // The Windows-only token knobs are refused here too, before any launch work: a detached child gets
@@ -5721,6 +5742,13 @@ module internal Posix =
                                 | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
                         else
                             spawnDetachedPosixCore limited
+
+    /// The detached entry point shares the same pre-spawn effective-child-PATH resolution as the ordinary
+    /// POSIX path, before its independent native spawn and helper rewrites.
+    let spawnDetachedPosix (command: Command) : Result<DetachedSpawn, ProcessError> =
+        match preparePosixLaunch command with
+        | Error error -> Error error
+        | Ok prepared -> spawnPreparedDetachedPosix prepared
 
     // ----------------------------------------------------------------------------------
     // Capability probes — read-only, no spawn, no side effects

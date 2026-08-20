@@ -225,10 +225,20 @@ not a way to pin one particular image — pass an absolute program path, or use
 run fails `NotFound` — carrying the same `Searched` — before anything is spawned
 only when that whole search, the child's `PATH` included, finds nothing. A command
 that leaves the child's `PATH` alone is unaffected: the OS's own bare-name search
-reads the very `PATH` the resolver walked, so it still applies in full. The change
-is Windows-only; on POSIX a bare name is resolved by `posix_spawnp` itself, whose
-`PATH` search reads the launching process's environment rather than the child
-block ([Platform support → Caveats](platform-support.md#caveats)).
+reads the very `PATH` the resolver walked, so it still applies in full.
+
+**POSIX: a changed child `PATH` is resolved before spawn.** `posix_spawnp` has the
+same parent/child split: libc searches the launching process's `PATH`, while the
+separate `envp` block becomes the selected image's environment. ProcessKit therefore
+resolves a bare name itself whenever `Env("PATH", …)`, `EnvRemove("PATH")`, or
+`EnvClear` makes the effective child `PATH` differ from the process's. The ordinary
+and `LaunchDetached` paths receive the absolute executable that `ResolveProgram()`
+reports; a miss returns its identical `ProcessError.NotFound` / `Searched` before
+`posix_spawnp` runs. Unlike Windows, POSIX adds no application/current/system
+directories around `PATH`: the shared resolver checks `PreferLocal`, then the
+effective `PATH`. An unchanged child `PATH` keeps libc's native bare-name search,
+and path-form programs, `CurrentDir`, and `Arg0` retain their existing behavior
+([Platform support → Caveats](platform-support.md#caveats)).
 
 ### Preferring a project-local tool (`PreferLocal`)
 

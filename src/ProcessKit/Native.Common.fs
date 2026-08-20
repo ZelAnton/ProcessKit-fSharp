@@ -287,14 +287,12 @@ module internal Common =
             PathExt: string
             PreferLocal: string list
             WorkingDirectory: string option
-            /// `true` when `Path` is exactly the CURRENT PROCESS's own `PATH` — the value the OS's own
-            /// bare-name search walks. Windows resolves a `CreateProcessW(lpApplicationName = NULL)` launch
-            /// in the PARENT's context, before the child exists, so it reads the parent's `PATH` and never
-            /// the environment block it is handed for the child. While this is `true` the OS search and this
-            /// resolution can only ever find the same file, which is what makes deferring to it
-            /// (`WindowsLaunch.AsIs`) safe; when a command overrides or clears the child's `PATH` it turns
-            /// `false`, and `resolveWindowsLaunch` substitutes the resolved absolute path (or refuses a
-            /// miss) instead of letting the OS answer out of a `PATH` the child never had.
+            /// `true` when `Path` is exactly the CURRENT PROCESS's own `PATH` — the value an OS bare-name
+            /// search walks before the child exists. While this is `true` the native search and this
+            /// resolution can only find the same PATH match, so Windows and POSIX can safely defer to it.
+            /// When a command overrides or clears the child's `PATH` it turns `false`; the launch resolver
+            /// then substitutes the resolved absolute path (or refuses a miss) instead of letting the OS
+            /// answer out of a `PATH` the child never had.
             PathIsProcessPath: bool
         }
 
@@ -567,6 +565,28 @@ module internal Common =
             None
         else
             findPreferLocal (commandContext command) program
+
+    /// How a POSIX spawn should launch `program` after prefer-local substitution has had its say. libc's
+    /// `posix_spawnp` searches the invoking process's `PATH`, not the `envp` block supplied for the child,
+    /// so deferring a bare name is safe only while the effective child `PATH` is byte-for-byte identical to
+    /// that process path. A command that changes or clears it is resolved here through the same
+    /// `commandContext` used by `Command.ResolveProgram`; a hit is pinned by absolute path and a miss is the
+    /// identical pre-spawn `ProcessError.NotFound`. Path-form programs remain native launches unchanged.
+    [<RequireQualifiedAccess; NoComparison; NoEquality>]
+    type PosixLaunch =
+        | AsIs
+        | DirectPath of ResolvedPath: string
+
+    let resolvePosixLaunch (command: Command) : Result<PosixLaunch, ProcessError> =
+        let program = command.Program
+        let ctx = commandContext command
+
+        if isBareName program && not ctx.PathIsProcessPath then
+            match resolveWith ctx program with
+            | Ok resolved -> Ok(PosixLaunch.DirectPath resolved)
+            | Error error -> Error error
+        else
+            Ok PosixLaunch.AsIs
 
     /// How a Windows spawn should launch `program` once the shared PATHEXT-aware resolver above has had
     /// its say (T-181). It reconciles two `which`/spawn divergences of the same shape — the OS's own

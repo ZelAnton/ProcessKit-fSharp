@@ -1196,9 +1196,8 @@ type WhichResolutionTests() =
                 // A genuinely-absent program, with an `Env "PATH"` override naming an (empty) directory.
                 // Both the no-spawn ResolveProgram and a real spawn of the SAME command must fail NotFound,
                 // and — since both derive the diagnostic from the one shared effective-PATH resolver — must
-                // report the identical `Searched`. No native `setenv` (K-064) is needed: the OS search
-                // failing is the point, and the diagnostic is derived from the command's effective env, not
-                // from whatever PATH `posix_spawnp` actually walked.
+                // report the identical `Searched`. No native `setenv` is needed: a changed child PATH miss is
+                // refused by that resolver before `posix_spawnp` can walk the process environment.
                 let command = Command.create missingProgram |> Command.env "PATH" dir
 
                 let resolveResult = command.ResolveProgram()
@@ -1879,6 +1878,272 @@ type WindowsChildPathLaunchTests() =
                         Assert.That(result.Outcome, Is.EqualTo(Outcome.Exited childHitCode), stillLaunches)
                 finally
                     Environment.SetEnvironmentVariable("PATH", originalPath)
+                    deleteDirQuietly dir
+        }
+        :> Task
+
+/// POSIX counterpart of the child-PATH launch contract. libc's `posix_spawnp` searches the launching
+/// process's native environment rather than the `envp` supplied for the child, so the pair below makes a
+/// wrong lookup observable: the process PATH names a parent marker while the command's effective child
+/// PATH names a different executable. Direct ordinary and detached launches must pin the latter, and a
+/// child-PATH miss must be refused before the parent namesake can run.
+[<TestFixture>]
+type PosixChildPathLaunchTests() =
+
+    let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+
+    let freshDir (tag: string) =
+        let dir =
+            Path.Combine(Path.GetTempPath(), "processkit-posix-child-path-" + tag + "-" + Guid.NewGuid().ToString "N")
+
+        Directory.CreateDirectory dir |> ignore
+        dir
+
+    let deleteDirQuietly (dir: string) =
+        try
+            if Directory.Exists dir then
+                Directory.Delete(dir, true)
+        with
+        | :? IOException
+        | :? UnauthorizedAccessException ->
+            // Best-effort cleanup of test-only temporary files; a locked file is unrelated to the launch
+            // contract already asserted by the test.
+            ()
+
+    let deleteFileQuietly (path: string) =
+        try
+            if File.Exists path then
+                File.Delete path
+        with
+        | :? IOException
+        | :? UnauthorizedAccessException ->
+            // Best-effort cleanup of a detached child's output file after its behavior was already asserted.
+            ()
+
+    let currentPath () =
+        match Environment.GetEnvironmentVariable "PATH" with
+        | null -> ""
+        | value -> value
+
+    let setPath (value: string) =
+        Environment.SetEnvironmentVariable("PATH", value)
+        NativeEnv.setenv ("PATH", value, 1) |> ignore
+
+    let writeTool (dir: string) (name: string) (marker: string) =
+        let path = Path.Combine(dir, name)
+
+        File.WriteAllText(path, "#!/bin/sh\nprintf '%s' '" + marker + "'\n")
+
+        File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+        Path.GetFullPath path
+
+    let readIfPresent (path: string) =
+        try
+            use stream =
+                new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
+
+            use reader = new StreamReader(stream)
+            reader.ReadToEnd()
+        with
+        | :? FileNotFoundException
+        | :? IOException ->
+            // A detached child has not created or flushed the file yet; polling until the deadline is the
+            // expected synchronization path.
+            ""
+
+    let waitUntil (timeout: TimeSpan) (predicate: unit -> bool) =
+        let deadline = DateTime.UtcNow + timeout
+        let mutable matched = predicate ()
+
+        while not matched && DateTime.UtcNow < deadline do
+            Thread.Sleep 50
+            matched <- predicate ()
+
+        matched
+
+    let killQuietly (pid: int) =
+        try
+            use childProcess = System.Diagnostics.Process.GetProcessById pid
+            childProcess.Kill()
+        with _ ->
+            // The detached script normally exits before cleanup reaches it; an already-gone process needs
+            // no further teardown, and cleanup must not obscure the launch assertion.
+            ()
+
+    member private _.WithPlantedPair(toolName: string, body: string -> string -> Task) : Task =
+        task {
+            let parentDir = freshDir "parent"
+            let childDir = freshDir "child"
+            let originalPath = currentPath ()
+
+            try
+                writeTool parentDir toolName "PARENT-PATH" |> ignore
+                let childTool = writeTool childDir toolName "CHILD-PATH"
+                setPath (parentDir + string Path.PathSeparator + originalPath)
+                do! body childDir childTool
+            finally
+                setPath originalPath
+                deleteDirQuietly parentDir
+                deleteDirQuietly childDir
+        }
+
+    [<Test>]
+    member this.``POSIX ordinary spawn launches the effective child-PATH match``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: this exercises posix_spawnp's parent-environment search."
+            else
+                do!
+                    this.WithPlantedPair(
+                        "processkit-child-path-ordinary",
+                        fun childDir childTool ->
+                            task {
+                                let command =
+                                    Command.create "processkit-child-path-ordinary"
+                                    |> Command.env "PATH" childDir
+                                    |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                                match command.ResolveProgram() with
+                                | Error error -> Assert.Fail $"the child-PATH executable must preflight, got {error}"
+                                | Ok resolved -> Assert.That(resolved, Is.EqualTo childTool)
+
+                                match! command.OutputStringAsync() with
+                                | Error error -> Assert.Fail $"the child-PATH executable must launch, got {error}"
+                                | Ok result -> Assert.That(result.Stdout, Is.EqualTo "CHILD-PATH")
+                            }
+                            :> Task
+                    )
+        }
+        :> Task
+
+    [<Test>]
+    member this.``POSIX detached spawn launches the effective child-PATH match``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: this exercises the detached posix_spawnp call site."
+            else
+                let marker =
+                    Path.Combine(Path.GetTempPath(), $"processkit-detached-child-path-{Guid.NewGuid():N}.log")
+
+                try
+                    do!
+                        this.WithPlantedPair(
+                            "processkit-child-path-detached",
+                            fun childDir childTool ->
+                                task {
+                                    let command =
+                                        Command.create "processkit-child-path-detached"
+                                        |> Command.env "PATH" childDir
+                                        |> Command.stdoutToFile marker false
+
+                                    match command.ResolveProgram() with
+                                    | Error error ->
+                                        Assert.Fail $"the detached child-PATH executable must preflight, got {error}"
+                                    | Ok resolved -> Assert.That(resolved, Is.EqualTo childTool)
+
+                                    match command.LaunchDetached() with
+                                    | Error error ->
+                                        Assert.Fail $"the detached child-PATH executable must launch, got {error}"
+                                    | Ok detached ->
+                                        try
+                                            let ranChild =
+                                                waitUntil (TimeSpan.FromSeconds 30.0) (fun () ->
+                                                    (readIfPresent marker).Contains "CHILD-PATH")
+
+                                            Assert.That(
+                                                ranChild,
+                                                Is.True,
+                                                "the detached launch must run the child-PATH image, not the parent-PATH namesake"
+                                            )
+                                        finally
+                                            killQuietly detached.Pid
+                                }
+                                :> Task
+                        )
+                finally
+                    deleteFileQuietly marker
+        }
+        :> Task
+
+    [<Test>]
+    member _.``POSIX EnvClear miss is NotFound before ordinary or detached spawn``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: this guards both direct posix_spawnp call sites."
+            else
+                let toolName = "processkit-child-path-miss"
+                let parentDir = freshDir "miss-parent"
+
+                let marker =
+                    Path.Combine(Path.GetTempPath(), $"processkit-child-path-miss-{Guid.NewGuid():N}.log")
+
+                let originalPath = currentPath ()
+
+                try
+                    writeTool parentDir toolName "PARENT-LEAK" |> ignore
+                    setPath (parentDir + string Path.PathSeparator + originalPath)
+
+                    let command = Command.create toolName |> Command.envClear
+
+                    let expectedSearched =
+                        match command.ResolveProgram() with
+                        | Ok resolved -> failwith $"an EnvClear command must not resolve '{toolName}', got '{resolved}'"
+                        | Error(ProcessError.NotFound(_, searched)) -> searched
+                        | Error other -> failwith $"expected NotFound from preflight, got {other}"
+
+                    let assertRefused (label: string) (error: ProcessError) =
+                        match error with
+                        | ProcessError.NotFound(program, searched) ->
+                            Assert.That(program, Is.EqualTo toolName, label)
+                            Assert.That(searched, Is.EqualTo expectedSearched, label)
+                        | other -> Assert.Fail $"{label}: expected NotFound, got {other}"
+
+                    match! command.OutputStringAsync() with
+                    | Ok result -> Assert.Fail $"ordinary spawn ran the parent-PATH namesake (outcome {result.Outcome})"
+                    | Error error -> assertRefused "ordinary spawn" error
+
+                    match (command |> Command.stdoutToFile marker false).LaunchDetached() with
+                    | Ok detached ->
+                        killQuietly detached.Pid
+                        Assert.Fail "detached spawn ran the parent-PATH namesake"
+                    | Error error -> assertRefused "detached spawn" error
+
+                    Assert.That(
+                        (readIfPresent marker).Contains "PARENT-LEAK",
+                        Is.False,
+                        "the parent-PATH namesake must never execute"
+                    )
+                finally
+                    setPath originalPath
+                    deleteFileQuietly marker
+                    deleteDirQuietly parentDir
+        }
+        :> Task
+
+    [<Test>]
+    member _.``POSIX unchanged child PATH keeps native bare-name launch``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: this preserves the native posix_spawnp search."
+            else
+                let toolName = "processkit-unchanged-path"
+                let dir = freshDir "unchanged"
+                let originalPath = currentPath ()
+
+                try
+                    let tool = writeTool dir toolName "UNCHANGED-PATH"
+                    setPath (dir + string Path.PathSeparator + originalPath)
+                    let command = Command.create toolName |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                    match command.ResolveProgram() with
+                    | Error error -> Assert.Fail $"the process-PATH tool must preflight, got {error}"
+                    | Ok resolved -> Assert.That(resolved, Is.EqualTo tool)
+
+                    match! command.OutputStringAsync() with
+                    | Error error -> Assert.Fail $"the unchanged-PATH command must launch, got {error}"
+                    | Ok result -> Assert.That(result.Stdout, Is.EqualTo "UNCHANGED-PATH")
+                finally
+                    setPath originalPath
                     deleteDirQuietly dir
         }
         :> Task
