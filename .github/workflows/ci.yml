@@ -87,9 +87,9 @@ jobs:
         run: dotnet restore
 
       # The CLI does not discover MSBuild PackageReference analyzers on its own. Ionide.Analyzers
-      # 0.15.0 is built for fsharp-analyzers 0.36.0, so the tool manifest deliberately pins that
-      # compatible version. Resolve the restored version from the manifest instead of repeating it
-      # here, so a future coordinated update has only one version to change.
+      # is built for a matching fsharp-analyzers SDK version, so the central package file and tool
+      # manifest deliberately pin compatible versions. Resolve both restored versions from those
+      # sources of truth instead of repeating them here.
       #
       # fsharp-analyzers ships only a net8.0 executable (see .config/dotnet-tools.json
       # and the `tools/net8.0/any` layout of the restored package) — it relies on its
@@ -108,13 +108,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          analyzers_path="${NUGET_PACKAGES:-$HOME/.nuget/packages}/ionide.analyzers/0.15.0/analyzers/dotnet/fs"
+          nuget_packages="${NUGET_PACKAGES:-$HOME/.nuget/packages}"
+          mapfile -t analyzer_versions < <(
+            sed -n 's/.*<PackageVersion Include="Ionide\.Analyzers" Version="\([^"]*\)".*/\1/p' \
+              Directory.Packages.props
+          )
+          if [ "${#analyzer_versions[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one central Ionide.Analyzers version"
+            exit 1
+          fi
+
+          analyzer_version="${analyzer_versions[0]}"
+          analyzers_path="$nuget_packages/ionide.analyzers/$analyzer_version/analyzers/dotnet/fs"
           if [ ! -d "$analyzers_path" ]; then
             echo "::error::Ionide.Analyzers package was not restored under $analyzers_path"
             exit 1
           fi
 
-          nuget_packages="${NUGET_PACKAGES:-$HOME/.nuget/packages}"
           tool_version="$(dotnet tool list --local | awk '$1 == "fsharp-analyzers" { print $2 }')"
           if [ -z "$tool_version" ]; then
             echo "::error::fsharp-analyzers was not restored from .config/dotnet-tools.json"

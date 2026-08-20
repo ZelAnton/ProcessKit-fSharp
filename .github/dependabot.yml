@@ -25,11 +25,12 @@ updates:
     # FSharp.Core is deliberately coupled to the .NET SDK band (see
     # Directory.Packages.props): you bump it by moving global.json to a newer band
     # and realigning the pin to that band's bundled FSharp.Core, not via an
-    # independent package bump. The fsharp-analyzers tool must likewise stay on
-    # the analyzer SDK version used to build the latest Ionide.Analyzers package;
-    # update both together after a compatible rules package is published.
+    # independent package bump. Ionide.Analyzers and the fsharp-analyzers tool
+    # must stay on the same analyzer SDK version; update both together after a
+    # compatible rules package is published.
     ignore:
       - dependency-name: FSharp.Core
+      - dependency-name: Ionide.Analyzers
       - dependency-name: fsharp-analyzers
     groups:
       # One PR per weekly run for routine bumps keeps the changelog auto-fill tidy.
