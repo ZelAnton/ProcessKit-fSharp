@@ -1235,8 +1235,10 @@ type Command internal (config: CommandConfig) =
     ///
     /// It shapes the retained backlog **only**. The per-line handlers (`OnStdoutLine`/`OnStderrLine`),
     /// the tees (`StdoutTee`/`StderrTee`), the streaming verbs and a raw byte capture
-    /// (`OutputBytesAsync`'s stdout, a pipeline's captured stdout) all keep seeing the unshaped line —
-    /// see `ICapturePolicy` for the whole boundary and why it is drawn there. Unset (the default)
+    /// (`OutputBytesAsync`'s stdout) all keep seeing the unshaped line — see `ICapturePolicy` for the
+    /// whole boundary and why it is drawn there. A command carrying one cannot be used as a `Pipeline`
+    /// stage (`Pipe` rejects it with an `ArgumentException`: a pipeline captures raw bytes only, so the
+    /// seam would have nothing to shape). Unset (the default)
     /// retains exactly what the child wrote. Composes with `OutputBuffer`, which decides how much of
     /// the shaped output survives; the last `CapturePolicy` call in a chain wins.
     member _.CapturePolicy(policy: ICapturePolicy) =

@@ -761,9 +761,12 @@ since they change how invocations are keyed):
 knob, not a cassette one, so it applies on both halves of a round trip and the two doubles stay in
 step with a live run:
 
-- **Recording** goes through the real capture path, so the entry written to disk holds the
-  **already-shaped** text — the raw secret never reaches the file at all, without any
-  `RecordReplayOptions` configured. `WithRedaction` remains the hook for what a policy cannot
+- **Recording** stores the capture the run produced, so text the policy shaped is written to disk
+  already shaped, with no `RecordReplayOptions` configured: a string recording's stdout and stderr,
+  and a bytes recording's stderr. A bytes recording's `byte[]` stdout is shaped by neither the
+  policy (a raw capture hands it no decoded line) nor `WithRedaction` (which skips that field, as
+  its bullet above says), so it is stored as captured — a bytes fixture can hold whatever the child
+  printed, policy or not. `WithRedaction` remains the hook for what a policy cannot
   reach: a recorded typed **failure**'s own fields, and a fixture recorded by a command that had
   no policy.
 - **Replaying** shapes the recorded text with the *replaying* command's policy, exactly as the live

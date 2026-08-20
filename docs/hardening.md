@@ -381,11 +381,15 @@ everywhere:
   the opt-in [`RecordReplayOptions.WithRedaction`](testing.md#record-and-replay)
   hook (applied to a string capture's stdout/stderr, a bytes capture's stderr,
   and every one of those failure fields; a raw `byte[]` stdout capture is stored
-  opaquely and is *not* passed through the redactor). A command that already
-  carries a [`CapturePolicy`](#redacting-output-at-capture) never hands the
-  recorder the raw line in the first place, since the recording is made from the
-  already-scrubbed capture — the two hooks stack rather than duplicating each
-  other, and only `WithRedaction` reaches a recorded typed failure's own fields. A
+  opaquely and is *not* passed through the redactor). A recording stores the
+  capture the run produced, so text a
+  [`CapturePolicy`](#redacting-output-at-capture) shaped is written to disk
+  already shaped — a string recording's stdout and stderr, and a bytes recording's
+  stderr — and the two hooks stack on those fields rather than duplicating each
+  other. A bytes recording's `byte[]` **stdout** is the field neither reaches: the
+  policy has no decoded line to shape there, the redactor skips it, and it is
+  stored as captured. `WithRedaction` alone reaches a recorded typed failure's own
+  fields. A
   PTY recording's merged stream goes through the same `WithRedaction` hook, which
   is how an echoed credential is kept out of a PTY cassette even with
   `PtyConfig.Echo = true`. **`WithRedaction` does not reach `program`/`args`** —
@@ -483,10 +487,15 @@ you use it:
 - a **raw byte** capture, which has no decoded line to shape: `OutputBytesAsync`'s
   stdout. A bytes run's line-pumped **stderr** is still scrubbed — the same split
   the cassette [`WithRedaction`](testing.md#record-and-replay) hook already makes.
-- **every capture a [`Pipeline`](pipelines.md) makes** — its final stdout *and*
-  each stage's stderr are raw byte captures, so a stage's `CapturePolicy` never
-  fires, exactly as that stage's `OnStdoutLine`/tees never fire. Run a command
-  whose output must be scrubbed on its own rather than as a pipeline stage.
+
+A [`Pipeline`](pipelines.md) is the one place where the seam is refused instead of
+narrowed. Every capture a pipeline makes — its final stdout *and* each stage's
+stderr — is a raw byte capture, so a stage's policy would have nothing to shape;
+rather than run the chain with the redactor quietly inactive and hand back the raw
+secret, `Pipe` **rejects** a stage that carries a `CapturePolicy` with an
+`ArgumentException` naming the field and the stage index, like every other
+per-stage knob a chain cannot honour. Run a command whose captured output must be
+scrubbed on its own.
 
 **A failing policy fails closed.** If `OnCapture` throws — or returns `null` — that
 line is retained **empty**, never the raw line it was meant to scrub, the run is
@@ -499,8 +508,9 @@ guard it.
 
 `CapturePolicy` composes with, and does not replace, the two hooks above it:
 `Command.OutputBuffer` still decides *how much* of the scrubbed output survives,
-and a `RecordReplayRunner` recording made through a policy is already scrubbed
-before `WithRedaction` ever sees it — see
+and a `RecordReplayRunner` records the capture as the policy shaped it. A bytes
+recording's `byte[]` stdout is shaped by neither this seam nor `WithRedaction`,
+and reaches the file as captured. See
 [Testing your code → Record and replay](testing.md#record-and-replay) for how the
 two interact on a cassette round trip.
 

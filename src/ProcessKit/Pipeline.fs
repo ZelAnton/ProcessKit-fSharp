@@ -35,6 +35,11 @@ module internal PipelineStageGuard =
     ///   pipeline;
     /// - `KeepStdinOpen` on **any** stage — a pipeline exposes no per-stage `RunningProcess.TakeStdin`
     ///   handle through which the caller could use the kept-open pipe;
+    /// - a per-stage `CapturePolicy` on **any** stage — every capture a pipeline makes (its final
+    ///   stdout and each stage's stderr) is a raw byte capture, so there is no decoded line for that
+    ///   seam to shape. Rejected rather than dropped for the same reason as the knobs above, and with
+    ///   more at stake: a redaction hook that silently stops running would hand back the very secret it
+    ///   was installed to remove;
     /// - a `Stdin` source on a stage **after the first** — every stage past stage 0 reads from the
     ///   previous stage's stdout, so only stage 0 may feed a source.
     /// - `StopSignal`, `CancelGrace`, or `CancelSignal` on a stage **after the first** — a graceful
@@ -107,6 +112,19 @@ module internal PipelineStageGuard =
             raise (
                 ArgumentException(
                     $"pipeline stage {stageIndex} ('{command.Program}') sets KeepStdinOpen, which a pipeline cannot honour: a pipeline exposes no per-stage RunningProcess.TakeStdin handle through which the caller could use the kept-open stdin pipe. Run the command on its own for interactive stdin.",
+                    paramName
+                )
+            )
+
+        // The one guard here whose failure direction is a leak rather than an ignored knob: a
+        // `CapturePolicy` is installed to keep a secret out of the retained capture, and every capture a
+        // pipeline makes is a raw byte capture with no decoded line to hand it. Accepting the stage would
+        // return the raw secret from `OutputStringAsync` with nothing to signal that the redactor never
+        // ran — so this is refused at build time, like every other per-stage knob a chain cannot honour.
+        if config.CapturePolicy.IsSome then
+            raise (
+                ArgumentException(
+                    $"pipeline stage {stageIndex} ('{command.Program}') sets a CapturePolicy, which a pipeline cannot honour: every capture a pipeline makes — its final stdout and each stage's stderr — is a raw byte capture, so there is no decoded line for the policy to shape. Run the command on its own to scrub its captured output.",
                     paramName
                 )
             )
@@ -364,12 +382,12 @@ module internal PipelineTotals =
 /// a chatty stage can never exhaust memory regardless of its position in the chain. Per-stage *stdout/
 /// stderr observation* hooks are still **not** applied — intermediate stages' `StdoutTee`, every
 /// stage's `StderrTee`, and `OnStdoutLine`/`OnStderrLine` — because the chain wires stdout into the
-/// next stage's stdin and captures only the final stage's output. A stage's `CapturePolicy` does not
-/// apply either, and for the reason that governs this whole paragraph: every capture a pipeline makes
-/// (the final stdout, and each stage's stderr) is a RAW BYTE capture with no line framing, so there is
-/// no decoded line for a line-oriented transform to shape — the same boundary that leaves
-/// `OutputBuffer.MaxLines` inapplicable here. A command whose captured output must be scrubbed has to
-/// be run on its own, not as a pipeline stage. Observe an individual command the same way.
+/// next stage's stdin and captures only the final stage's output. Observe an individual command by
+/// running it on its own, not as a pipeline stage. A stage's `CapturePolicy` is bound by that same
+/// boundary — every capture a pipeline makes (the final stdout, and each stage's stderr) is a RAW BYTE
+/// capture with no line framing, which is also what leaves `OutputBuffer.MaxLines` inapplicable here —
+/// but it is **rejected** rather than left unapplied, because a redaction hook that quietly stops
+/// running hands back the secret it was installed to remove (see the rejected-config paragraph below).
 ///
 /// Per-stage config a pipeline cannot honour is **rejected when the stage is piped** (an
 /// `ArgumentException` from `Pipe`, naming the field and stage index), rather than silently dropped:
@@ -382,7 +400,9 @@ module internal PipelineTotals =
 /// bypassing it), and a per-stage `CancelOn` on any stage (a stage's own `Command.CancelOn` token is
 /// likewise a verb-layer mechanism the direct stage spawn bypasses; only the chain-level
 /// `Pipeline.CancelOn` cancels a pipeline), `KeepStdinOpen` on any stage (the pipeline exposes no
-/// per-stage `RunningProcess.TakeStdin` handle through which the kept-open pipe could be used),
+/// per-stage `RunningProcess.TakeStdin` handle through which the kept-open pipe could be used), a
+/// per-stage `CapturePolicy` on any stage (every capture a pipeline makes is a raw byte capture, so
+/// the seam has no decoded line to shape — run such a command on its own to scrub what it captured),
 /// `StdoutToFile` on any stage (stdout is instead pipeline wiring or final captured output), and
 /// `Stdout(StdioMode.Null|Inherit)` on any stage (the pipeline must use a pipe rather than silently
 /// override that destination). `StderrToFile` remains supported:
@@ -425,9 +445,9 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
 
     /// Append another stage; its stdin is fed from the current last stage's stdout. Rejects
     /// (`ArgumentException`) a stage that sets a per-stage
-    /// `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`, `KeepStdinOpen`, `StdoutToFile`, non-piped `Stdout`, or
-    /// a `Stdin` source — a pipeline cannot honour those (see the type doc); the appended stage is always
-    /// after the first.
+    /// `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`/`CapturePolicy`, `KeepStdinOpen`, `StdoutToFile`,
+    /// non-piped `Stdout`, or a `Stdin` source — a pipeline cannot honour those (see the type doc); the
+    /// appended stage is always after the first.
     member _.Pipe(command: Command) =
         ArgumentNullException.ThrowIfNull command
         PipelineStageGuard.validate (nameof command) commands.Length command
@@ -673,7 +693,8 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
 type PipelineExtensions =
 
     /// Start a pipeline that feeds this command's stdout into `next`'s stdin. Rejects
-    /// (`ArgumentException`) either stage setting a per-stage `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`
+    /// (`ArgumentException`) either stage setting a per-stage
+    /// `Timeout`/`IdleTimeout`/`Retry`/`CancelOn`/`CapturePolicy`
     /// or `KeepStdinOpen`, or `next` (stage 1) setting a `Stdin` source — a pipeline cannot honour those
     /// (see the `Pipeline` type doc). `command` is stage 0, so a `Stdin` source on it (feeding the whole
     /// chain) is allowed.

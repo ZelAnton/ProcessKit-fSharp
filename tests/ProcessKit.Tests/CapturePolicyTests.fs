@@ -2,7 +2,6 @@ namespace ProcessKit.Tests
 
 open System
 open System.IO
-open System.Runtime.InteropServices
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -385,33 +384,45 @@ type CapturePolicyTests() =
         }
 
     [<Test>]
-    member _.``A pipeline stage's policy does not fire, because a pipeline captures raw bytes``() : Task =
-        task {
-            // Pins the documented boundary rather than assuming it: a pipeline's final stdout (and every
-            // stage's stderr) is a RAW byte capture with no line framing, so a line-oriented transform
-            // has nothing to shape — exactly why that stage's `OnStdoutLine`/tees do not fire either.
-            // A change that silently started (or stopped) applying it here must update
-            // `docs/hardening.md` and `Pipeline`'s own contract, which this test is the guard for.
-            let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
+    member _.``A pipeline stage carrying a policy is rejected rather than run with the seam inactive``() =
+        // A pipeline's final stdout (and every stage's stderr) is a RAW byte capture with no line
+        // framing, so a line-oriented transform has nothing to shape there. Unlike the observation hooks
+        // the same boundary disables (`OnStdoutLine`, the tees), an unapplied redactor hands back the
+        // very secret it was installed to remove — so the chain refuses to be built at all, the way the
+        // other per-stage knobs a pipeline cannot honour do. This is the guard for that fail-closed
+        // direction: a change that started accepting such a stage must first make the policy actually
+        // fire, and update `docs/hardening.md` / `docs/pipelines.md` / `Pipeline`'s own contract.
+        let withPolicy (command: Command) =
+            command |> Command.capturePolicy (RedactingPolicy "s3cr3t-value")
 
-            let shell (script: string) =
-                if isWindows then
-                    Command.create "cmd.exe" |> Command.args [ "/c"; script ]
-                else
-                    Command.create "/bin/sh" |> Command.args [ "-c"; script ]
+        // Stage 0, through the two-argument `Command.Pipe`...
+        match
+            Assert.Throws<ArgumentException>(
+                Action(fun () -> (withPolicy (Command.create "emit")).Pipe(Command.create "sort") |> ignore)
+            )
+        with
+        | null -> Assert.Fail "expected a CapturePolicy on pipeline stage 0 to be rejected"
+        | stage0Error ->
+            Assert.That(stage0Error.Message, Does.Contain "pipeline stage 0")
+            Assert.That(stage0Error.Message, Does.Contain "emit")
+            Assert.That(stage0Error.Message, Does.Contain "CapturePolicy")
 
-            // `sort` reads stdin on both platforms — a portable, shell-free last stage.
-            let lastStage =
-                Command.create "sort" |> Command.capturePolicy (RedactingPolicy "s3cr3t-value")
+        // ...the appended stage 1 of that same builder...
+        Assert.Throws<ArgumentException>(
+            Action(fun () -> (Command.create "emit").Pipe(withPolicy (Command.create "sort")) |> ignore)
+        )
+        |> ignore
 
-            let pipeline = (shell $"echo {secretLine}").Pipe lastStage
-
-            match! pipeline.OutputStringAsync() with
-            | Error error -> Assert.Fail $"pipeline failed: {error.Message}"
-            | Ok result ->
-                Assert.That(result.Stdout.Contains("s3cr3t-value", StringComparison.Ordinal), Is.True)
-                Assert.That(result.Stdout.Contains("***", StringComparison.Ordinal), Is.False)
-        }
+        // ...and a still-later stage appended through `Pipeline.Pipe`.
+        match
+            Assert.Throws<ArgumentException>(
+                Action(fun () ->
+                    (Command.create "emit").Pipe(Command.create "sort").Pipe(withPolicy (Command.create "wc"))
+                    |> ignore)
+            )
+        with
+        | null -> Assert.Fail "expected a CapturePolicy on pipeline stage 2 to be rejected"
+        | stage2Error -> Assert.That(stage2Error.Message, Does.Contain "pipeline stage 2")
 
     // ---- (4) parity across the three test doubles ---------------------------------------------------
 
@@ -445,7 +456,7 @@ type CapturePolicyTests() =
         }
 
     [<Test>]
-    member _.``A cassette records the shaped capture, so the secret never reaches the file``() : Task =
+    member _.``A string cassette recording stores the shaped capture, so the secret never reaches the file``() : Task =
         task {
             let path = tempCassette ()
 
@@ -468,6 +479,46 @@ type CapturePolicyTests() =
                 let onDisk = File.ReadAllText path
                 Assert.That(onDisk.Contains("s3cr3t-value", StringComparison.Ordinal), Is.False)
                 Assert.That(onDisk.Contains("token=***", StringComparison.Ordinal), Is.True)
+            finally
+                if File.Exists path then
+                    File.Delete path
+        }
+
+    [<Test>]
+    member _.``A bytes cassette recording stores the raw stdout no policy shapes``() : Task =
+        task {
+            let path = tempCassette ()
+
+            try
+                // The narrow half of the same recording story, pinned so the prose above it cannot drift
+                // back into promising that a policy keeps every secret off a cassette: a bytes capture's
+                // stdout is stored opaquely (base64) exactly as captured, because no decoded line ever
+                // reached the seam — and `RecordReplayOptions.WithRedaction` does not cover that field
+                // either. The line-pumped stderr of the very same run IS shaped, which is the split
+                // `docs/testing.md` and `docs/hardening.md` describe.
+                let command =
+                    Command.create "svc" |> Command.capturePolicy (RedactingPolicy "s3cr3t-value")
+
+                do!
+                    task {
+                        use recorder =
+                            RecordReplayRunner.Record(path, FakeBackedRunner(secretLine, $"err {secretLine}"))
+
+                        let! _ = (recorder :> IProcessRunner).OutputBytesAsync(command, CancellationToken.None)
+
+                        match recorder.Save() with
+                        | Ok() -> ()
+                        | Error error -> Assert.Fail $"save: {error.Message}"
+                    }
+
+                let onDisk = File.ReadAllText path
+
+                // Scan for the base64 of the raw line, not for its plain text: the plain text is absent
+                // only because the field is encoded, which is exactly the misreading this test guards.
+                let encodedSecret = Convert.ToBase64String(Encoding.UTF8.GetBytes secretLine)
+
+                Assert.That(onDisk.Contains(encodedSecret, StringComparison.Ordinal), Is.True)
+                Assert.That(onDisk.Contains("err token=***", StringComparison.Ordinal), Is.True)
             finally
                 if File.Exists path then
                     File.Delete path

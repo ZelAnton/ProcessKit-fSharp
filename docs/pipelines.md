@@ -255,6 +255,11 @@ The two ends of the chain behave like a single `Command`:
 - A per-stage `Timeout`, `Retry`, or `CancelOn` is rejected when the stage is piped (see
   [Timeouts and cancellation](#timeouts-and-cancellation)); a per-stage `Logger` or `StreamBuffer`
   has no effect inside a chain — observe or bound an individual command by running it on its own.
+- A per-stage [`CapturePolicy`](hardening.md#redacting-output-at-capture) is rejected on **any**
+  stage: every capture a pipeline makes — the final stdout and each stage's stderr — is a raw byte
+  capture, so that seam has no decoded line to shape. `.Pipe` throws an `ArgumentException` naming
+  the stage rather than running the chain with the redaction hook inactive; run a command whose
+  captured output must be scrubbed on its own.
 - The **last** stage's [`OutputBuffer`](commands.md#raw-byte-captures-obey-the-byte-cap-too) byte
   cap (`MaxBytes` + `Overflow`) bounds the captured **stdout** — the same way a single command's
   `OutputBytesAsync` does (`Error` -> `OutputTooLarge`, `DropOldest`/`DropNewest` -> a tail/head with

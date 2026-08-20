@@ -217,8 +217,12 @@ type CaptureStream =
 ///    streams, `PtySession`'s window/transcript, `ContentLengthSession`'s frames, and the stderr
 ///    readiness probes. (`FinishAsync`'s retained *stderr* on those same sessions **is** backlog, and
 ///    is shaped.)
-///  - a **raw byte** capture, which has no decoded line to shape: `OutputBytesAsync`'s stdout and a
-///    pipeline's captured stdout/stderr. A bytes run's line-pumped **stderr** is still shaped.
+///  - a **raw byte** capture, which has no decoded line to shape: `OutputBytesAsync`'s stdout. A bytes
+///    run's line-pumped **stderr** is still shaped.
+///
+/// A `Pipeline` captures nothing but raw bytes — its final stdout and every stage's stderr — so it
+/// cannot shape anything at all; a stage carrying a policy is therefore **rejected** by `Pipe`
+/// (`ArgumentException`) rather than run with the seam quietly inactive. Run such a command on its own.
 ///
 /// **A failing policy fails closed.** If `OnCapture` throws — or returns `null` — the offending line
 /// is retained **empty**, never the raw line it was meant to scrub, and the policy stays active for
