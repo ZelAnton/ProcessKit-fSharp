@@ -356,6 +356,7 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
     let sendStaged
         (payload: byte[])
         (cancellationToken: CancellationToken)
+        (authorizeFirstWrite: ((unit -> Task) -> Result<Task, ProcessError>) option)
         : Task<Result<unit, ProcessError * FramedSendStage>> =
         task {
             let mutable stage = FramedSendStage.BeforeWrite
@@ -384,11 +385,22 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                         if cancellationToken.IsCancellationRequested then
                             return Error(ProcessError.Cancelled program, stage)
                         else
-                            stage <- FramedSendStage.Writing
-                            do! pipe.WriteAsync(header, cancellationToken)
-                            do! pipe.WriteAsync(payload, cancellationToken)
-                            do! pipe.FlushAsync cancellationToken
-                            return Ok()
+                            let startWriting () =
+                                stage <- FramedSendStage.Writing
+                                pipe.WriteAsync(header, cancellationToken)
+
+                            let firstWrite =
+                                match authorizeFirstWrite with
+                                | Some authorize -> authorize startWriting
+                                | None -> Ok(startWriting ())
+
+                            match firstWrite with
+                            | Error error -> return Error(error, stage)
+                            | Ok writing ->
+                                do! writing
+                                do! pipe.WriteAsync(payload, cancellationToken)
+                                do! pipe.FlushAsync cancellationToken
+                                return Ok()
                     finally
                         sendGate.Release() |> ignore
             with
@@ -427,7 +439,7 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
         validatePayload payload
 
         task {
-            match! sendStaged payload cancellationToken with
+            match! sendStaged payload cancellationToken None with
             | Ok() -> return Ok()
             | Error(error, _) -> return Error error
         }
@@ -444,7 +456,19 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
         (payload: byte[], cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError * FramedSendStage>> =
         validatePayload payload
-        sendStaged payload cancellationToken
+        sendStaged payload cancellationToken None
+
+    /// The JSON-RPC form additionally authorizes the first write at its own terminal-state boundary.
+    /// `authorizeFirstWrite` must invoke the supplied starter synchronously before returning `Ok`, so the
+    /// caller can make that invocation atomic with publishing its terminal state.
+    member internal _.SendStagedAsync
+        (
+            payload: byte[],
+            cancellationToken: CancellationToken,
+            authorizeFirstWrite: (unit -> Task) -> Result<Task, ProcessError>
+        ) : Task<Result<unit, ProcessError * FramedSendStage>> =
+        validatePayload payload
+        sendStaged payload cancellationToken (Some authorizeFirstWrite)
 
     /// Close the child's framed input so it observes EOF. Sending is unsupported when the command did
     /// not keep stdin open; repeated close calls follow `ProcessStdin.FinishAsync`'s idempotent contract.

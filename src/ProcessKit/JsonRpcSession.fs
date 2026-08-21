@@ -209,7 +209,13 @@ type private DropCounter() =
 [<Sealed>]
 type JsonRpcSession
     internal
-    (running: RunningProcess, maxFrameBytes: int, messageBacklog: int, beforePendingCompletion: Action<int64> | null) =
+    (
+        running: RunningProcess,
+        maxFrameBytes: int,
+        messageBacklog: int,
+        beforePendingCompletion: Action<int64> | null,
+        beforeFirstByteAuthorization: Action | null
+    ) =
     do ArgumentNullException.ThrowIfNull(running, nameof running)
     do ArgumentOutOfRangeException.ThrowIfLessThan(messageBacklog, 1, nameof messageBacklog)
 
@@ -229,12 +235,15 @@ type JsonRpcSession
     // framing layer is the one that knows whether it was still claiming the run's stdin (a
     // `Command.Stdin(source)` feeder can own that pipe for as long as the source takes to drain) or
     // genuinely writing, so it reports that stage through `SendStagedAsync` and only the writing kind may
-    // end the conversation.
+    // end the conversation. The terminal signal is linked into both waits so `endSession` can stop a send
+    // that has not reached its first byte and let every queued sender observe the stored terminal error.
     let sendGate = new SemaphoreSlim(1, 1)
+    let terminalSignal = new CancellationTokenSource()
 
     let gate = obj ()
     let pending = Dictionary<int64, PendingRequest>()
     let beforePendingCompletion = Option.ofObj beforePendingCompletion
+    let beforeFirstByteAuthorization = Option.ofObj beforeFirstByteAuthorization
     let dropped = DropCounter()
     let mutable nextId = 0L
     let mutable ended: ProcessError option = None
@@ -367,15 +376,23 @@ type JsonRpcSession
                 Ok())
 
     let endSession (error: ProcessError) =
-        lock gate (fun () ->
-            if ended.IsNone then
-                ended <- Some error
+        let endedNow =
+            lock gate (fun () ->
+                let firstTransition = ended.IsNone
 
-            let waiters = pending.Values |> Seq.toArray
-            pending.Clear()
+                if firstTransition then
+                    ended <- Some error
 
-            for waiter in waiters do
-                waiter.Completion.TrySetResult(Error error) |> ignore)
+                let waiters = pending.Values |> Seq.toArray
+                pending.Clear()
+
+                for waiter in waiters do
+                    waiter.Completion.TrySetResult(Error error) |> ignore
+
+                firstTransition)
+
+        if endedNow && not terminalSignal.IsCancellationRequested then
+            terminalSignal.Cancel()
 
     let currentFault () = lock gate (fun () -> ended)
 
@@ -570,15 +587,15 @@ type JsonRpcSession
 
     /// A session over `running` with a custom maximum frame size, using the default 1024-message
     /// inbound backlog.
-    new(running: RunningProcess, maxFrameBytes: int) = JsonRpcSession(running, maxFrameBytes, 1024, null)
+    new(running: RunningProcess, maxFrameBytes: int) = JsonRpcSession(running, maxFrameBytes, 1024, null, null)
 
     /// A session over `running` with custom frame and decoded-message backlog limits.
     new(running: RunningProcess, maxFrameBytes: int, messageBacklog: int) =
-        JsonRpcSession(running, maxFrameBytes, messageBacklog, null)
+        JsonRpcSession(running, maxFrameBytes, messageBacklog, null, null)
 
     /// A session over `running` using the framing layer's default 16 MiB maximum frame size and a
     /// 1024-message inbound backlog.
-    new(running: RunningProcess) = JsonRpcSession(running, 16 * 1024 * 1024, 1024, null)
+    new(running: RunningProcess) = JsonRpcSession(running, 16 * 1024 * 1024, 1024, null, null)
 
     // ---- message construction -------------------------------------------------------------------
 
@@ -604,10 +621,13 @@ type JsonRpcSession
         (payload: byte[], cancellationToken: CancellationToken, classifyInterrupt: ProcessError -> ProcessError)
         : Task<Result<unit, ProcessError * FramedSendStage>> =
         task {
+            use linked =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, terminalSignal.Token)
+
             let mutable entered = false
 
             try
-                do! sendGate.WaitAsync cancellationToken
+                do! sendGate.WaitAsync linked.Token
                 entered <- true
             with :? OperationCanceledException ->
                 // Cancelled or timed out while queued behind another send, or handed a token that was
@@ -616,17 +636,34 @@ type JsonRpcSession
                 ()
 
             if not entered then
-                return Error(classifyInterrupt (ProcessError.Cancelled program), FramedSendStage.BeforeWrite)
+                match currentFault () with
+                | Some error -> return Error(error, FramedSendStage.BeforeWrite)
+                | None -> return Error(classifyInterrupt (ProcessError.Cancelled program), FramedSendStage.BeforeWrite)
             else
                 try
-                    // The same check once more, for a token that fired in the instant the gate was being
-                    // handed over: still nothing written, so still not the session's failure.
-                    if cancellationToken.IsCancellationRequested then
-                        return Error(classifyInterrupt (ProcessError.Cancelled program), FramedSendStage.BeforeWrite)
-                    else
-                        match! transport.SendStagedAsync(payload, cancellationToken) with
-                        | Ok() -> return Ok()
-                        | Error(error, stage) ->
+                    // The framing layer invokes this at its final pre-write boundary, after claiming stdin
+                    // and its own gate. Starting the first WriteAsync while this session state lock is held
+                    // makes authorization atomic with `endSession`: either terminal state was published and
+                    // no write starts, or the write starts before that publication can occur.
+                    let authorizeFirstWrite startWriting =
+                        beforeFirstByteAuthorization |> Option.iter (fun callback -> callback.Invoke())
+
+                        lock gate (fun () ->
+                            match ended with
+                            | Some error -> Error error
+                            | None when cancellationToken.IsCancellationRequested ->
+                                Error(classifyInterrupt (ProcessError.Cancelled program))
+                            | None -> Ok(startWriting ()))
+
+                    match! transport.SendStagedAsync(payload, linked.Token, authorizeFirstWrite) with
+                    | Ok() ->
+                        match currentFault () with
+                        | Some error -> return Error(error, FramedSendStage.Writing)
+                        | None -> return Ok()
+                    | Error(error, stage) ->
+                        match currentFault () with
+                        | Some terminalError -> return Error(terminalError, stage)
+                        | None ->
                             let reported = classifyInterrupt error
                             endTornSend stage reported
                             return Error(reported, stage)
