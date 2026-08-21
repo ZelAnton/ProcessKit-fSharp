@@ -2229,6 +2229,94 @@ type PosixChildPathLaunchTests() =
         :> Task
 
     [<Test>]
+    member _.``POSIX inherited empty PATH components keep preflight and native spawn on the current directory``
+        ()
+        : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: this exercises an inherited empty PATH component through posix_spawnp."
+            else
+                let originalPath = Environment.GetEnvironmentVariable "PATH" |> Option.ofObj
+                let originalDirectory = Directory.GetCurrentDirectory()
+                let currentDir = freshDir "inherited-empty-current"
+                let laterDir = freshDir "inherited-empty-later"
+                let toolName = "processkit-inherited-empty-path"
+
+                try
+                    let currentTool = writeTool currentDir toolName "CURRENT-DIRECTORY"
+                    writeTool laterDir toolName "LATER-DIRECTORY" |> ignore
+                    Directory.SetCurrentDirectory currentDir
+
+                    for label, path in
+                        [ "leading", string Path.PathSeparator + laterDir
+                          "trailing", "missing" + string Path.PathSeparator ] do
+                        // These launches deliberately leave PATH inherited, so keep the managed resolver
+                        // and libc's native posix_spawnp search on the same empty-component value.
+                        setPath path
+
+                        match Exec.which toolName with
+                        | Error error ->
+                            Assert.Fail $"{label}: Exec.which must resolve the empty component, got {error}"
+                        | Ok resolved -> Assert.That(resolved, Is.EqualTo currentTool, label)
+
+                        let command = Command.create toolName |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                        match command.ResolveProgram() with
+                        | Error error ->
+                            Assert.Fail
+                                $"{label}: Command.ResolveProgram must resolve the current-directory tool, got {error}"
+                        | Ok resolved -> Assert.That(resolved, Is.EqualTo currentTool, label)
+
+                        match! command.OutputStringAsync() with
+                        | Error error ->
+                            Assert.Fail $"{label}: the inherited empty-component command must launch, got {error}"
+                        | Ok result -> Assert.That(result.Stdout, Is.EqualTo "CURRENT-DIRECTORY", label)
+                finally
+                    Directory.SetCurrentDirectory originalDirectory
+                    restorePath originalPath
+                    deleteDirQuietly currentDir
+                    deleteDirQuietly laterDir
+        }
+        :> Task
+
+    [<Test>]
+    member _.``POSIX child PATH preserves empty-component order against CurrentDir and relative entries``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: Windows deliberately keeps its fixed-directory search unchanged."
+            else
+                let baseDir = freshDir "empty-component-order"
+                let laterDir = Path.Combine(baseDir, "later")
+                let toolName = "processkit-empty-component-order"
+
+                try
+                    Directory.CreateDirectory laterDir |> ignore
+                    let currentTool = writeTool baseDir toolName "CURRENT-DIRECTORY"
+                    writeTool laterDir toolName "LATER-DIRECTORY" |> ignore
+
+                    for label, path, expectedPath, expectedMarker in
+                        [ "leading", ":later", currentTool, "CURRENT-DIRECTORY"
+                          "trailing", "missing:", currentTool, "CURRENT-DIRECTORY"
+                          "middle", "missing::later", currentTool, "CURRENT-DIRECTORY" ] do
+                        let command =
+                            Command.create toolName
+                            |> Command.currentDir baseDir
+                            |> Command.env "PATH" path
+                            |> Command.timeout (TimeSpan.FromSeconds 30.0)
+
+                        match command.ResolveProgram() with
+                        | Error error -> Assert.Fail $"{label}: expected PATH resolution, got {error}"
+                        | Ok resolved -> Assert.That(resolved, Is.EqualTo expectedPath, label)
+
+                        match! command.OutputStringAsync() with
+                        | Error error -> Assert.Fail $"{label}: the resolved command must launch, got {error}"
+                        | Ok result -> Assert.That(result.Stdout, Is.EqualTo expectedMarker, label)
+                finally
+                    deleteDirQuietly baseDir
+        }
+        :> Task
+
+    [<Test>]
     member _.``POSIX unchanged child PATH keeps native bare-name launch``() : Task =
         task {
             if isWindows then

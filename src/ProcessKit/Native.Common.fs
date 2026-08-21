@@ -384,12 +384,15 @@ module internal Common =
     /// directories, and the Windows directory before `PATH`; the process's current directory is deliberately
     /// used rather than `ctx.WorkingDirectory`, because `lpCurrentDirectory` only sets the child's directory
     /// after executable resolution. Relative `PATH` entries are anchored to the effective working directory
-    /// before probing, and every hit is normalized to a full path. Returns `(found, searched)`: `found` is the
-    /// first matching directory's resolved path; `searched` is the raw `PATH` value, for the `NotFound`
-    /// diagnostic (`""` when the `PATH` is unset/empty).
+    /// before probing. On POSIX, each empty component of a non-empty `PATH` is the effective working directory
+    /// at that exact search position; Windows continues to ignore empty `PATH` entries. Every hit is normalized
+    /// to a full path. Returns `(found, searched)`: `found` is the first matching directory's resolved path;
+    /// `searched` is the raw `PATH` value, for the `NotFound` diagnostic (`""` when the `PATH` is unset/empty).
     ///
     /// `PATH` is split on the raw `Path.PathSeparator` with NO quote handling, on Windows as on POSIX —
-    /// deliberate and verified. The real bare-name launch is `CreateProcessW` with
+    /// deliberate and verified. Positional empty components are preserved only on POSIX, after the non-empty
+    /// `PATH` guard above distinguishes them from the wholly absent/empty value. The real Windows bare-name
+    /// launch is `CreateProcessW` with
     /// `lpApplicationName = NULL` (see `spawnWindowsCore`), which lets the OS resolve the program, and
     /// neither that search nor `SearchPathW` strips surrounding double quotes from a `PATH` entry: a
     /// quoted directory (`"C:\Program Files\Foo"`) is a literal, non-existent path to them, so a program
@@ -405,7 +408,9 @@ module internal Common =
             | None -> Directory.GetCurrentDirectory()
 
         let resolvePathEntry (directory: string) =
-            if Path.IsPathRooted directory then
+            if String.IsNullOrEmpty directory then
+                effectiveWorkingDirectory
+            elif Path.IsPathRooted directory then
                 directory
             else
                 Path.Combine(effectiveWorkingDirectory, directory)
@@ -414,9 +419,15 @@ module internal Common =
             if String.IsNullOrEmpty ctx.Path then
                 [||]
             else
-                ctx.Path.Split Path.PathSeparator
-                |> Array.filter (fun d -> d <> "")
-                |> Array.map resolvePathEntry
+                let entries = ctx.Path.Split Path.PathSeparator
+
+                let entries =
+                    if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
+                        entries |> Array.filter (fun directory -> directory <> "")
+                    else
+                        entries
+
+                entries |> Array.map resolvePathEntry
 
         let dirs =
             if RuntimeInformation.IsOSPlatform OSPlatform.Windows then

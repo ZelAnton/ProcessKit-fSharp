@@ -807,12 +807,17 @@ exactly the one `Command.ResolveProgram()` reports for the same configuration; a
 identical `ProcessError.NotFound` / `Searched` before any native spawn, so a same-named executable from
 the process `PATH` cannot run instead. An inherited absent or empty process `PATH` is resolved too:
 libc may otherwise use a default system path or the current directory, search locations that
-`ResolveProgram()` deliberately does not invent for an empty PATH. POSIX resolution is narrower than
-Windows resolution: after `PreferLocal`, it walks only the effective `PATH`, without
-application/current/system-directory entries around it. Only an untouched, non-empty inherited child
-`PATH` delegates its bare name to `posix_spawnp` exactly as before. Prefer-local hits and path-form
-programs likewise keep their existing behavior; a relative path-form program still resolves against
-the child's working directory.
+`ResolveProgram()` deliberately does not invent for an empty PATH. By contrast, each empty component
+inside a **non-empty** POSIX `PATH` is the effective working directory at that exact position: `:dir`,
+`dir:`, and `dir::other` search it before, after, or between the named entries. Relative named entries
+use that same base. For a command this is its configured `CurrentDir`, or the process's current
+directory when none is set; `Exec.which` always uses the process current directory because it resolves
+the host process `PATH`. A wholly empty or absent `PATH` still has no entries and never gains this
+current-directory search. POSIX resolution is narrower than Windows resolution: after `PreferLocal`,
+it walks only the effective `PATH`, without application/current/system-directory entries around it.
+Only an untouched, non-empty inherited child `PATH` delegates its bare name to `posix_spawnp` exactly
+as before. Prefer-local hits and path-form programs likewise keep their existing behavior; a relative
+path-form program still resolves against the child's working directory.
 
 **`Command.WindowsRawArg` is Windows-only.** It appends a trusted fragment verbatim after all
 ordinarily quoted arguments for children with a non-MSVCRT parser. POSIX has an argv vector rather
