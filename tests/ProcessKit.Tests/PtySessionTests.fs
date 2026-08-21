@@ -71,6 +71,25 @@ type PtySessionTests() =
     let isLinux = RuntimeInformation.IsOSPlatform OSPlatform.Linux
     let runner: IProcessRunner = JobRunner()
 
+    let hostForStdinFeeder (command: Command) (stdin: Stream) (feedComplete: unit -> unit) : RunningHost =
+        { Config = command.Config
+          Pid = None
+          Stdout = Some(new MemoryStream() :> Stream)
+          Stderr = None
+          Stdin = Some stdin
+          StartTime = DateTime.UtcNow
+          StartedTimestamp = Stopwatch.GetTimestamp()
+          StartTimeIdentity = None
+          Wait = fun () -> Task.FromResult(Outcome.Exited 0)
+          StdinError = fun () -> Task.FromResult None
+          StdinFeedComplete = feedComplete
+          StartKill = ignore
+          Signal = fun _ -> Ok()
+          GracefulKill = fun _ -> Task.CompletedTask
+          ResizePty = None
+          TreeStats = None
+          Teardown = fun () -> ValueTask() }
+
     // A child that stays alive for a few seconds and prints nothing at all, on either platform — so a
     // pattern wait against it can only ever end at its own deadline, never at an early end-of-output.
     let silentSleeper () =
@@ -284,6 +303,107 @@ type PtySessionTests() =
             | Ok() -> Assert.Fail "closing an absent stdin must not report success"
 
             Assert.That(fake.StdinBytes, Is.Empty)
+        }
+
+    [<Test>]
+    member _.``PtySession construction does not wait for a blocked feeder, and sends after its source``() : Task =
+        task {
+            let feeder =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let stdin = new MemoryStream()
+
+            let command =
+                Command.create "non-reading-child"
+                |> Command.stdin (Stdin.FromString "source bytes")
+                |> Command.keepStdinOpen
+
+            use running =
+                new RunningProcess(
+                    hostForStdinFeeder command (stdin :> Stream) (fun () ->
+                        // A real non-reading child can leave the source feeder parked in its pipe write.
+                        // This gate models that completion without relying on platform pipe sizes.
+                        feeder.Task.GetAwaiter().GetResult())
+                )
+
+            try
+                let construction = Task.Run(fun () -> PtySession running)
+                let! completed = Task.WhenAny(construction :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(completed, construction),
+                    Is.True,
+                    "PtySession construction must not wait for a source feeder blocked by a non-reading child"
+                )
+
+                let! session = construction
+                use cancellation = new CancellationTokenSource()
+                let sending = session.SendAsync("answer", cancellation.Token)
+                let! stillWaiting = Task.WhenAny(sending :> Task, Task.Delay 200)
+
+                Assert.That(
+                    obj.ReferenceEquals(stillWaiting, sending),
+                    Is.False,
+                    "SendAsync must wait for the source feeder before writing interactive stdin"
+                )
+
+                cancellation.Cancel()
+
+                match! sending with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"expected feeder-wait cancellation, got {other}"
+
+                feeder.TrySetResult() |> ignore
+
+                match! session.SendAsync "answer" with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the send should complete after the feeder, got {error}"
+
+                Assert.That(Encoding.UTF8.GetString(stdin.ToArray()), Is.EqualTo "answer")
+            finally
+                feeder.TrySetResult() |> ignore
+        }
+
+    [<Test>]
+    member _.``PtySession close waits for a source feeder before closing interactive stdin``() : Task =
+        task {
+            let feeder =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let stdin = new MemoryStream()
+
+            let command =
+                Command.create "non-reading-child"
+                |> Command.stdin (Stdin.FromString "source bytes")
+                |> Command.keepStdinOpen
+
+            use running =
+                new RunningProcess(
+                    hostForStdinFeeder command (stdin :> Stream) (fun () -> feeder.Task.GetAwaiter().GetResult())
+                )
+
+            try
+                let session = PtySession running
+                let closing = session.CloseStdinAsync()
+                let! stillWaiting = Task.WhenAny(closing :> Task, Task.Delay 200)
+
+                Assert.That(
+                    obj.ReferenceEquals(stillWaiting, closing),
+                    Is.False,
+                    "CloseStdinAsync must wait for the source feeder before closing the pipe"
+                )
+
+                Assert.That(stdin.CanWrite, Is.True, "close must not close stdin while the source feeder is active")
+
+                feeder.TrySetResult() |> ignore
+
+                match! closing with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the close should complete after the feeder, got {error}"
+
+                Assert.That(stdin.CanWrite, Is.False, "close must finish the interactive stdin after the feeder")
+            finally
+                feeder.TrySetResult() |> ignore
         }
 
     // ----------------------------------------------------------------------------------

@@ -162,12 +162,10 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
         | Ok w -> w
         | Error error -> raise (InvalidOperationException error.Message)
 
-    // `None` when the run has no interactive stdin (no `Command.KeepStdinOpen`) — the send verbs then
-    // report a typed `Unsupported` rather than pretending the input went somewhere. Taken once, here,
-    // rather than per send: `TakeStdin` hands out its stream exactly once, and it also waits for any
-    // `Command.Stdin` source feeder to finish, which must happen before the session writes a byte
-    // (two concurrent writers on one pipe is forbidden).
-    let stdin = running.TakeStdin()
+    // Claim interactive stdin once, but do not wait here for a `Command.Stdin` source feeder. The
+    // session constructor must return even when a child is not reading and the feeder is blocked; the
+    // send and close verbs await this task before touching the pipe, preserving the single-writer rule.
+    let stdin: Task<ProcessStdin option> = running.TakeStdinAsync()
 
     // Turn a genuine reader fault into the same typed error the streaming verbs surface. The pumps
     // already reclassified an OS read failure into `ProcessError.Io`; anything else is reported as
@@ -235,31 +233,32 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
         }
 
     let sendBytes (bytes: byte[]) (cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
-        match stdin with
-        | None ->
-            Task.FromResult(
-                Error(
-                    ProcessError.Unsupported
-                        "Send (this run has no interactive stdin - build the command with Command.KeepStdinOpen)"
-                )
-            )
-        | Some pipe ->
-            task {
-                try
+        task {
+            try
+                let! claimed = stdin.WaitAsync cancellationToken
+
+                match claimed with
+                | None ->
+                    return
+                        Error(
+                            ProcessError.Unsupported
+                                "Send (this run has no interactive stdin - build the command with Command.KeepStdinOpen)"
+                        )
+                | Some pipe ->
                     do! pipe.WriteAsync(bytes, cancellationToken)
                     // Flush explicitly: an unflushed write can sit in a buffered stdin stream while the
                     // child waits for the very input this call was supposed to deliver - a deadlock the
                     // session's own per-pattern timeout would then report as a spurious `NotReady`.
                     do! pipe.FlushAsync cancellationToken
                     return Ok()
-                with
-                | :? OperationCanceledException -> return Error(ProcessError.Cancelled program)
-                | :? IOException as ex ->
-                    // The child closed its end (it exited, or stopped reading) - an honest typed failure,
-                    // never a silently dropped write.
-                    return Error(ProcessError.Io ex.Message)
-                | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
-            }
+            with
+            | :? OperationCanceledException -> return Error(ProcessError.Cancelled program)
+            | :? IOException as ex ->
+                // The child closed its end (it exited, or stopped reading) - an honest typed failure,
+                // never a silently dropped write.
+                return Error(ProcessError.Io ex.Message)
+            | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
+        }
 
     /// A raw-output session over `running` with explicit tuning. ANSI/VT escape sequences remain in
     /// pattern matching, `Pending`, and `Transcript`; use `WithAnsiFiltering` to remove them.
@@ -339,7 +338,9 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     ///
     /// Returns a typed `Unsupported` when the run has no interactive stdin (build the command with
     /// `Command.KeepStdinOpen`), `Cancelled` if `cancellationToken` fires, and `Io` if the child has
-    /// closed its input — never a silently dropped write. As with any cancellable stream write, a
+    /// closed its input — never a silently dropped write. With `Command.Stdin(source)` plus
+    /// `Command.KeepStdinOpen`, the source feeder is awaited here before the first interactive byte;
+    /// construction itself does not wait for that source. As with any cancellable stream write, a
     /// cancelled send may already have delivered *some* of its bytes, so recover by abandoning the
     /// conversation rather than resending (which would duplicate the delivered prefix). Sent bytes are
     /// never logged, traced, or added to `Transcript`; a terminal with echo on will nevertheless reflect
@@ -361,7 +362,8 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
 
     /// Close the child's stdin, so it sees end-of-file — how a conversation that feeds input ends for a
     /// child that reads until EOF. Idempotent; returns the same typed `Unsupported` as the send verbs
-    /// when the run has no interactive stdin.
+    /// when the run has no interactive stdin. A `Command.Stdin` source is awaited before closing so its
+    /// bytes cannot be truncated by the interactive close.
     ///
     /// On a **PTY** there is no stdin pipe to close — input goes into the same terminal the conversation's
     /// output comes from — so the end of input is delivered as that terminal's own end-of-input gesture
@@ -377,26 +379,27 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     /// child waiting — while a child that has already closed its terminal is reported as the `Ok` it is:
     /// there is nothing left to tell it.
     member _.CloseStdinAsync() : Task<Result<unit, ProcessError>> =
-        match stdin with
-        | None ->
-            Task.FromResult(
-                Error(
-                    ProcessError.Unsupported
-                        "CloseStdin (this run has no interactive stdin - build the command with Command.KeepStdinOpen)"
-                )
-            )
-        | Some pipe ->
-            task {
-                try
+        task {
+            try
+                let! claimed = stdin
+
+                match claimed with
+                | None ->
+                    return
+                        Error(
+                            ProcessError.Unsupported
+                                "CloseStdin (this run has no interactive stdin - build the command with Command.KeepStdinOpen)"
+                        )
+                | Some pipe ->
                     do! pipe.FinishAsync()
                     return Ok()
-                with
-                | :? IOException as ex ->
-                    // The end of input could not be delivered (the terminal refused the write) - the same
-                    // honest typed failure the send verbs report, never a close that silently did nothing.
-                    return Error(ProcessError.Io ex.Message)
-                | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
-            }
+            with
+            | :? IOException as ex ->
+                // The end of input could not be delivered (the terminal refused the write) - the same
+                // honest typed failure the send verbs report, never a close that silently did nothing.
+                return Error(ProcessError.Io ex.Message)
+            | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
+        }
 
     /// The output received but not yet consumed by a pattern — what the next `ExpectAsync` will match
     /// against. Reading it consumes nothing; it is for diagnosing a pattern that did not arrive
