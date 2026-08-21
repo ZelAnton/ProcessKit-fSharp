@@ -144,6 +144,8 @@ type FaultInjectingRunner private (inner: IProcessRunner, mode: FaultInjectionMo
         FaultInjectingRunner(inner, FaultInjectionMode.Seeded(seed, probability, injection))
 
     override this.CaptureStringAsync(command, cancellationToken) =
+        Seam.validate command
+
         match nextInjection () with
         | None -> inner.CaptureStringAsync(command, cancellationToken)
         | Some injection ->
@@ -166,6 +168,8 @@ type FaultInjectingRunner private (inner: IProcessRunner, mode: FaultInjectionMo
             }
 
     override this.CaptureBytesAsync(command, cancellationToken) =
+        Seam.validate command
+
         match nextInjection () with
         | None -> inner.CaptureBytesAsync(command, cancellationToken)
         | Some injection ->
@@ -188,6 +192,8 @@ type FaultInjectingRunner private (inner: IProcessRunner, mode: FaultInjectionMo
             }
 
     override this.SpawnAsync(command, cancellationToken) =
+        Seam.validate command
+
         match nextInjection () with
         | None -> inner.SpawnAsync(command, cancellationToken)
         | Some injection ->

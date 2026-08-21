@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using NUnit.Framework;
@@ -15,6 +16,26 @@ namespace ProcessKit.CSharp.Tests;
 [TestFixture]
 public class TestDoublesTests
 {
+    private static void AssertNullCommandRejected(IProcessRunner runner, Func<int> sideEffectCount)
+    {
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        Action[] calls =
+        [
+            () => runner.CaptureStringAsync(null!, cancelled.Token),
+            () => runner.CaptureBytesAsync(null!, cancelled.Token),
+            () => runner.SpawnAsync(null!, cancelled.Token),
+        ];
+
+        foreach (var call in calls)
+        {
+            var exception = Assert.Throws<ArgumentNullException>(() => call());
+            Assert.That(exception!.ParamName, Is.EqualTo("command"));
+            Assert.That(sideEffectCount(), Is.Zero);
+        }
+    }
+
     /// A small typed wrapper, generic over the runner it is given - the seam every C# consumer is
     /// meant to depend on (`IProcessRunner`), mirroring `docs/testing.md`'s `Git` example.
     private static Task<Microsoft.FSharp.Core.FSharpResult<string, ProcessError>> Head(
@@ -93,5 +114,71 @@ public class TestDoublesTests
         var ex = Assert.Throws<ArgumentNullException>(() => new ScriptedRunner().On(null!, Reply.Ok("")));
 
         Assert.That(ex!.ParamName, Is.EqualTo("tokens"));
+    }
+
+    [Test]
+    public void ScriptedRunner_primitives_reject_null_without_recording_an_invocation()
+    {
+        var runner = new ScriptedRunner();
+
+        AssertNullCommandRejected(runner, () => runner.Received.Count);
+    }
+
+    [Test]
+    public void DryRunRunner_primitives_reject_null_without_recording_history()
+    {
+        var runner = new DryRunRunner();
+
+        AssertNullCommandRejected(runner, () => runner.History.Count);
+    }
+
+    [Test]
+    public void FaultInjectingRunner_primitives_reject_null_without_consuming_an_injection()
+    {
+        var runner = new FaultInjectingRunner(new ScriptedRunner(), 3, FaultInjection.Delegate());
+
+        AssertNullCommandRejected(runner, () => runner.InvocationCount);
+    }
+
+    [Test]
+    public void RecordReplayRunner_record_primitives_reject_null_without_delegating_or_writing()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"processkit-null-{Guid.NewGuid():N}.json");
+        var inner = new ScriptedRunner();
+
+        using (var runner = RecordReplayRunner.Record(path, inner))
+        {
+            AssertNullCommandRejected(runner, () => inner.Received.Count);
+        }
+
+        Assert.That(File.Exists(path), Is.False);
+    }
+
+    [Test]
+    public async Task RecordReplayRunner_replay_primitives_reject_null_without_consuming_the_entry()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"processkit-null-{Guid.NewGuid():N}.json");
+        var command = new Command("probe");
+
+        try
+        {
+            using (var recorder = RecordReplayRunner.Record(path, new ScriptedRunner().Fallback(Reply.Ok("ready"))))
+            {
+                var recorded = await ((IProcessRunner)recorder).CaptureStringAsync(command, CancellationToken.None);
+                Assert.That(recorded.IsOk, Is.True);
+                Assert.That(recorder.Save().IsOk, Is.True);
+            }
+
+            using var replayer = RecordReplayRunner.Replay(path).GetValueOrThrow();
+            AssertNullCommandRejected(replayer, () => 0);
+
+            var replayed = await ((IProcessRunner)replayer).CaptureStringAsync(command, CancellationToken.None);
+            Assert.That(replayed.IsOk, Is.True);
+            Assert.That(replayed.ResultValue.Stdout, Is.EqualTo("ready"));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 }

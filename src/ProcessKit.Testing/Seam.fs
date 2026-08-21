@@ -1,5 +1,6 @@
 namespace ProcessKit.Testing
 
+open System
 open System.Threading
 open System.Threading.Tasks
 open ProcessKit
@@ -13,13 +14,18 @@ open ProcessKit
 /// matching `JobRunner`/`ProcessGroup`) and the verb projection itself.
 module internal Seam =
 
-    /// Guard the one-shot spawn token, then hand off to `resolve` for an already-validated command.
+    let validate (command: Command) =
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+
+    /// Validate the command, guard the one-shot spawn token, then hand off to `resolve`.
     /// `CancelOn` deliberately does not apply here: a live handle is caller-driven after spawning.
     let serve
         (resolve: Command -> Result<RunningProcess, ProcessError>)
         (command: Command)
         (cancellationToken: CancellationToken)
         : Result<RunningProcess, ProcessError> =
+        validate command
+
         if cancellationToken.IsCancellationRequested then
             Error(ProcessError.Cancelled command.Program)
         else
@@ -36,6 +42,8 @@ module internal Seam =
         (command: Command)
         (cancellationToken: CancellationToken)
         : Task<Result<'a, ProcessError>> =
+        validate command
+
         task {
             use linkedCts =
                 match command.Config.CancelOn with

@@ -617,6 +617,8 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     member this.StartAsync
         (command: Command, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<RunningProcess, ProcessError>> =
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+
         task {
             if cancellationToken.IsCancellationRequested then
                 return Error(ProcessError.Cancelled command.Program)
@@ -1295,12 +1297,15 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     // survivors out from under a container it shares with everyone else's.
     interface IProcessRunner with
         member this.SpawnAsync(command, cancellationToken) =
+            ArgumentNullException.ThrowIfNull(command, nameof command)
             this.StartAsync(command, cancellationToken)
 
         member this.CaptureStringAsync(command, cancellationToken) =
+            ArgumentNullException.ThrowIfNull(command, nameof command)
             this.CaptureShared command cancellationToken (fun running -> running.OutputStringAsync())
 
         member this.CaptureBytesAsync(command, cancellationToken) =
+            ArgumentNullException.ThrowIfNull(command, nameof command)
             this.CaptureShared command cancellationToken (fun running -> running.OutputBytesAsync())
 
     interface IDisposable with

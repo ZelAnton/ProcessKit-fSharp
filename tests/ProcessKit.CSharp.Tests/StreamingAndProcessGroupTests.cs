@@ -1,5 +1,6 @@
 using System;
 using System.IO.Pipes;
+using System.Threading;
 using System.Threading.Tasks;
 using NUnit.Framework;
 using ProcessKit;
@@ -25,6 +26,65 @@ public class StreamingAndProcessGroupTests
 
         Assert.That(createException!.ParamName, Is.EqualTo("options"));
         Assert.That(capabilitiesException!.ParamName, Is.EqualTo("options"));
+    }
+
+    [Test]
+    public void ProcessGroup_StartAsync_null_command_wins_over_cancellation_without_mutating_the_group()
+    {
+        using var group = ProcessGroup.Create().GetValueOrThrow();
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        var membersBefore = group.Members().GetValueOrThrow();
+
+        var exception = Assert.Throws<ArgumentNullException>(() => group.StartAsync(null!, cancelled.Token));
+
+        Assert.That(exception!.ParamName, Is.EqualTo("command"));
+        Assert.That(group.Members().GetValueOrThrow(), Is.EqualTo(membersBefore));
+    }
+
+    [TestCase("capture-string")]
+    [TestCase("capture-bytes")]
+    [TestCase("spawn")]
+    public void JobRunner_primitives_reject_null_command_before_cancellation_or_spawn(string primitive)
+    {
+        IProcessRunner runner = new JobRunner();
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        Action call = primitive switch
+        {
+            "capture-string" => () => runner.CaptureStringAsync(null!, cancelled.Token),
+            "capture-bytes" => () => runner.CaptureBytesAsync(null!, cancelled.Token),
+            _ => () => runner.SpawnAsync(null!, cancelled.Token),
+        };
+
+        var exception = Assert.Throws<ArgumentNullException>(() => call());
+
+        Assert.That(exception!.ParamName, Is.EqualTo("command"));
+    }
+
+    [TestCase("capture-string")]
+    [TestCase("capture-bytes")]
+    [TestCase("spawn")]
+    public void ProcessGroup_runner_primitives_reject_null_without_mutating_the_group(string primitive)
+    {
+        using var group = ProcessGroup.Create().GetValueOrThrow();
+        IProcessRunner runner = group;
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        var membersBefore = group.Members().GetValueOrThrow();
+
+        Action call = primitive switch
+        {
+            "capture-string" => () => runner.CaptureStringAsync(null!, cancelled.Token),
+            "capture-bytes" => () => runner.CaptureBytesAsync(null!, cancelled.Token),
+            _ => () => runner.SpawnAsync(null!, cancelled.Token),
+        };
+
+        var exception = Assert.Throws<ArgumentNullException>(() => call());
+
+        Assert.That(exception!.ParamName, Is.EqualTo("command"));
+        Assert.That(group.Members().GetValueOrThrow(), Is.EqualTo(membersBefore));
     }
 
     [Test]
