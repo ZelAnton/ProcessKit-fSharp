@@ -100,6 +100,7 @@ type private PeerInputStream() =
 
     let buffered = ResizeArray<byte>()
     let gate = obj ()
+    let mutable totalBytesWritten = 0L
 
     // `None` while the peer drains its stdin; a pending completion while it does not, which every write
     // waits on — the way a real write blocks once the OS pipe buffer fills behind a peer that stopped
@@ -145,6 +146,7 @@ type private PeerInputStream() =
 
     let append (payload: byte[]) =
         lock gate (fun () ->
+            totalBytesWritten <- totalBytesWritten + int64 payload.Length
             buffered.AddRange payload
             extract ())
 
@@ -189,6 +191,9 @@ type private PeerInputStream() =
     /// Completes once a write has begun waiting on the stall.
     member _.NextStalledWriteAsync() : Task =
         stalledWrites.Reader.ReadAsync().AsTask()
+
+    /// Total bytes accepted by this fake peer's stdin, including an incomplete frame prefix.
+    member _.TotalBytesWritten = lock gate (fun () -> totalBytesWritten)
 
     override _.CanRead = false
     override _.CanSeek = false
@@ -366,6 +371,90 @@ type JsonRpcSessionTests() =
         match document.RootElement.GetProperty("method").GetString() with
         | null -> ""
         | text -> text
+
+    let queuedOutgoingKindsAfterTerminal (terminate: PeerOutputStream -> unit) : Task<ProcessError> =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+            try
+                peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"workspace/configuration\"}")
+
+                let! received = messages.MoveNextAsync()
+                Assert.That(received, Is.True)
+                let peerRequest = messages.Current
+
+                // This first outgoing frame owns the session send gate but has handed no bytes to the
+                // peer. The other three calls therefore park at the exact gate handoff this regression
+                // needs, rather than racing the router through scheduler timing.
+                peer.Stdin.StallWrites()
+                let held = session.NotifyRawAsync("test/hold-send-gate", null)
+                do! peer.Stdin.NextStalledWriteAsync()
+
+                let request = session.RequestRawAsync("test/queued-request", null)
+                let notification = session.NotifyRawAsync("test/queued-notification", null)
+                let response = session.RespondRawAsync(peerRequest, "null")
+
+                Assert.That(request.IsCompleted, Is.False, "the request must be queued behind the held send gate")
+
+                Assert.That(
+                    notification.IsCompleted,
+                    Is.False,
+                    "the notification must be queued behind the held send gate"
+                )
+
+                Assert.That(response.IsCompleted, Is.False, "the response must be queued behind the held send gate")
+
+                terminate peer.Stdout
+                do! session.RouterTask.WaitAsync(TimeSpan.FromSeconds 5.0)
+
+                let! heldResult = held.WaitAsync(TimeSpan.FromSeconds 5.0)
+                let! requestResult = request.WaitAsync(TimeSpan.FromSeconds 5.0)
+                let! notificationResult = notification.WaitAsync(TimeSpan.FromSeconds 5.0)
+                let! responseResult = response.WaitAsync(TimeSpan.FromSeconds 5.0)
+
+                let errorOf label result =
+                    match result with
+                    | Error error -> error
+                    | Ok _ ->
+                        Assert.Fail $"expected the {label} to report the terminal session error"
+                        Unchecked.defaultof<ProcessError>
+
+                let terminal = errorOf "held send" heldResult
+
+                Assert.That(
+                    errorOf "queued request" requestResult,
+                    Is.EqualTo terminal,
+                    "the queued request must return the same terminal error"
+                )
+
+                Assert.That(
+                    errorOf "queued notification" notificationResult,
+                    Is.EqualTo terminal,
+                    "the queued notification must return the same terminal error"
+                )
+
+                Assert.That(
+                    errorOf "queued response" responseResult,
+                    Is.EqualTo terminal,
+                    "the queued response must return the same terminal error"
+                )
+
+                Assert.That(
+                    peer.Stdin.TotalBytesWritten,
+                    Is.EqualTo 0L,
+                    "no held or queued outgoing frame may reach stdin after the terminal transition"
+                )
+
+                do! messages.DisposeAsync()
+                return terminal
+            finally
+                // Releases the modelled pipe if an assertion fails before the router's terminal signal
+                // cancels the held write; successful runs have already removed this stall.
+                peer.Stdin.ResumeWrites()
+        }
 
     [<Test>]
     member _.``a request is answered by the response carrying the same id``() : Task =
@@ -902,6 +991,30 @@ type JsonRpcSessionTests() =
             // completes, never faults, so it can never surface as an unobserved task exception.
             do! session.RouterTask
             Assert.That(session.RouterTask.IsCompletedSuccessfully, Is.True)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``EOF refuses every outgoing kind queued behind the send gate without writing``() : Task =
+        task {
+            let! terminal = queuedOutgoingKindsAfterTerminal (fun output -> output.Complete())
+
+            match terminal with
+            | ProcessError.Io detail -> Assert.That(detail, Does.Contain "language-server")
+            | other -> Assert.Fail $"expected EOF to remain the session's I/O error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a protocol fault refuses every outgoing kind queued behind the send gate without writing``() : Task =
+        task {
+            let! terminal =
+                queuedOutgoingKindsAfterTerminal (fun output ->
+                    output.Emit(framed "{\"jsonrpc\":\"2.0\",\"greeting\":\"not a message\"}"))
+
+            match terminal with
+            | ProcessError.Parse(program, _) -> Assert.That(program, Is.EqualTo "language-server")
+            | other -> Assert.Fail $"expected the malformed frame to remain the session's parse error, got {other}"
         }
         :> Task
 
