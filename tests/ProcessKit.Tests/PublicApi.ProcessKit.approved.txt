@@ -294,6 +294,7 @@ class ProcessKit.ContainmentCapabilities
 
 class ProcessKit.ContentLengthSession
   member FinishInputAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member FinishInputAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member FramesAsync() : System.Collections.Generic.IAsyncEnumerable<System.Byte[]>
   member SendAsync(System.Byte[]) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member SendAsync(System.Byte[], System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
@@ -413,6 +414,7 @@ class ProcessKit.JsonRpcMessage
 
 class ProcessKit.JsonRpcSession
   member FinishInputAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member FinishInputAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member MessagesAsync() : System.Collections.Generic.IAsyncEnumerable<ProcessKit.JsonRpcMessage>
   member NotifyAsync<P>(System.String, P, System.Text.Json.JsonSerializerOptions, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member NotifyAsync<P>(System.String, P, System.Text.Json.Serialization.Metadata.JsonTypeInfo<P>, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
@@ -1247,6 +1249,7 @@ module ProcessKit.PtyLineEnding+Tags
 
 class ProcessKit.PtySession
   member CloseStdinAsync() : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
+  member CloseStdinAsync(System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>
   member ExpectAsync(System.String, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ExpectMatch, ProcessKit.ProcessError>>
   member ExpectAsync(System.Text.RegularExpressions.Regex, System.TimeSpan, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<ProcessKit.ExpectMatch, ProcessKit.ProcessError>>
   member SendAsync(System.String, System.Threading.CancellationToken) : System.Threading.Tasks.Task<Microsoft.FSharp.Core.FSharpResult<Microsoft.FSharp.Core.Unit, ProcessKit.ProcessError>>

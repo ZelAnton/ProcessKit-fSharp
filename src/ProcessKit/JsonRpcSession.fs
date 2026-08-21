@@ -902,20 +902,33 @@ type JsonRpcSession
         messages.Reader.ReadAllAsync()
 
     /// Close the peer's framed input so it observes EOF — the usual last step of an LSP `shutdown`/`exit`
-    /// sequence. Unsupported when the command did not keep stdin open.
-    member _.FinishInputAsync() : Task<Result<unit, ProcessError>> =
+    /// sequence. Unsupported when the command did not keep stdin open. `cancellationToken` bounds only
+    /// the session gate and framing transport's pre-delivery feeder/gate waits; once EOF delivery starts,
+    /// it is not cancellable.
+    member _.FinishInputAsync(cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
         task {
+            let mutable entered = false
+
             // Through the same gate as every outgoing frame: closing stdin between the header and the
             // payload of a send in flight would truncate that frame, and going around the gate would
             // make this a second contender for the framing layer's own — which would then interrupt a
             // queued send that had written nothing and look, from here, like a torn frame.
-            do! sendGate.WaitAsync()
-
             try
-                return! transport.FinishInputAsync()
+                try
+                    do! sendGate.WaitAsync cancellationToken
+                    entered <- true
+                    return! transport.FinishInputAsync(cancellationToken)
+                with :? OperationCanceledException ->
+                    return Error(ProcessError.Cancelled program)
             finally
-                sendGate.Release() |> ignore
+                if entered then
+                    sendGate.Release() |> ignore
         }
+
+    /// Close the peer's framed input without cancellation. Equivalent to
+    /// `FinishInputAsync(CancellationToken.None)`.
+    member this.FinishInputAsync() : Task<Result<unit, ProcessError>> =
+        this.FinishInputAsync(CancellationToken.None)
 
     // ---- requests -------------------------------------------------------------------------------
 

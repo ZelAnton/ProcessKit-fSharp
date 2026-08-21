@@ -442,6 +442,72 @@ type PtySessionTests() =
                 feeder.TrySetResult() |> ignore
         }
 
+    [<Test>]
+    member _.``PtySession close cancellation returns Cancelled before delivering EOF``() : Task =
+        task {
+            let feeder =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let sourceWritten =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let stdin = new MemoryStream()
+            let sourceBytes = Encoding.UTF8.GetBytes "source bytes"
+
+            let command =
+                Command.create "non-reading-child"
+                |> Command.stdin (Stdin.FromString "source bytes")
+                |> Command.keepStdinOpen
+
+            use running =
+                new RunningProcess(
+                    hostForStdinFeeder command (stdin :> Stream) (fun () ->
+                        stdin.Write(sourceBytes, 0, sourceBytes.Length)
+                        sourceWritten.TrySetResult() |> ignore
+                        feeder.Task.GetAwaiter().GetResult())
+                )
+
+            try
+                let session = PtySession running
+                use cancellation = new CancellationTokenSource()
+                let closing = session.CloseStdinAsync(cancellation.Token)
+
+                let! sourceObserved = Task.WhenAny(sourceWritten.Task :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(sourceObserved, sourceWritten.Task),
+                    Is.True,
+                    "the fake feeder must be blocked before close cancellation is tested"
+                )
+
+                cancellation.Cancel()
+
+                let! closeObserved = Task.WhenAny(closing :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(closeObserved, closing),
+                    Is.True,
+                    "the cancelled close did not return within its bounded wait"
+                )
+
+                match! closing with
+                | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "non-reading-child")
+                | other -> Assert.Fail $"expected close cancellation, got {other}"
+
+                Assert.That(stdin.CanWrite, Is.True, "cancellation must not deliver EOF to interactive stdin")
+                Assert.That(Encoding.UTF8.GetString(stdin.ToArray()), Is.EqualTo "source bytes")
+
+                feeder.TrySetResult() |> ignore
+
+                match! session.CloseStdinAsync() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the uncancelled close should still deliver EOF, got {error}"
+
+                Assert.That(stdin.CanWrite, Is.False, "the no-token overload must retain the close behavior")
+            finally
+                feeder.TrySetResult() |> ignore
+        }
+
     // ----------------------------------------------------------------------------------
     // The per-pattern deadline is the session's own, separate from the run's
     // ----------------------------------------------------------------------------------

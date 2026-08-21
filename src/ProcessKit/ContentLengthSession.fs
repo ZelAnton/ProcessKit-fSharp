@@ -473,11 +473,13 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
     /// Close the child's framed input so it observes EOF. Sending is unsupported when the command did
     /// not keep stdin open; repeated close calls follow `ProcessStdin.FinishAsync`'s idempotent contract.
     /// Like `SendAsync`, this awaits a `Command.Stdin(source)` feeder first — closing the pipe under a
-    /// still-writing feeder would truncate the source.
-    member _.FinishInputAsync() : Task<Result<unit, ProcessError>> =
+    /// still-writing feeder would truncate the source. `cancellationToken` bounds only the feeder and
+    /// send-gate waits before delivery; once stdin is claimed and the gate is held, EOF delivery is not
+    /// cancellable.
+    member _.FinishInputAsync(cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
         task {
             try
-                let! claimed = stdin
+                let! claimed = stdin.WaitAsync cancellationToken
 
                 match claimed with
                 | None ->
@@ -487,7 +489,7 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
                                 "Content-Length input requires a command built with Command.KeepStdinOpen"
                         )
                 | Some pipe ->
-                    do! sendGate.WaitAsync()
+                    do! sendGate.WaitAsync cancellationToken
 
                     try
                         do! pipe.FinishAsync()
@@ -497,4 +499,10 @@ type ContentLengthSession(running: RunningProcess, maxFrameBytes: int) =
             with
             | :? IOException as ex -> return Error(ProcessError.Io ex.Message)
             | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
+            | :? OperationCanceledException -> return Error(ProcessError.Cancelled program)
         }
+
+    /// Close the child's framed input without cancellation. Equivalent to
+    /// `FinishInputAsync(CancellationToken.None)`.
+    member this.FinishInputAsync() : Task<Result<unit, ProcessError>> =
+        this.FinishInputAsync(CancellationToken.None)

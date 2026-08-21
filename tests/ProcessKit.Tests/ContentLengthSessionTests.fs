@@ -119,8 +119,12 @@ type private StallingStdinStream() =
     let writing =
         TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
+    let mutable disposed = 0
+
     /// Completes once a write has parked in this stream.
     member _.Writing = writing.Task
+
+    member _.IsDisposed = Volatile.Read(&disposed) <> 0
 
     override _.CanRead = false
     override _.CanSeek = false
@@ -143,6 +147,12 @@ type private StallingStdinStream() =
     override _.WriteAsync(_buffer: byte[], _offset: int, _count: int, cancellationToken: CancellationToken) : Task =
         writing.TrySetResult() |> ignore
         Task.Delay(Timeout.Infinite, cancellationToken)
+
+    override _.Dispose(disposing) =
+        if disposing then
+            Interlocked.Exchange(&disposed, 1) |> ignore
+
+        base.Dispose(disposing)
 
 [<TestFixture>]
 type ContentLengthSessionTests() =
@@ -220,6 +230,137 @@ type ContentLengthSessionTests() =
         Array.concat
             [ Encoding.ASCII.GetBytes($"Content-Length: {payload.Length}\r\n\r\n")
               payload ]
+
+    [<Test>]
+    member _.``Content-Length close cancellation returns Cancelled before delivering EOF``() : Task =
+        task {
+            let feeder =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let sourceWritten =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let stdout = new MemoryStream()
+            let stdin = new MemoryStream()
+            let sourceBytes = Encoding.UTF8.GetBytes "source bytes"
+
+            let command =
+                (Command.create "language-server").Stdin(Stdin.FromString "source bytes").KeepStdinOpen()
+
+            use running =
+                new RunningProcess(
+                    hostForCommand
+                        command
+                        (stdout :> Stream)
+                        (Some(stdin :> Stream))
+                        (fun () ->
+                            stdin.Write(sourceBytes, 0, sourceBytes.Length)
+                            sourceWritten.TrySetResult() |> ignore
+                            feeder.Task.GetAwaiter().GetResult())
+                        (fun () -> ValueTask())
+                )
+
+            try
+                let session = ContentLengthSession running
+                use cancellation = new CancellationTokenSource()
+                let closing = session.FinishInputAsync(cancellation.Token)
+
+                let! sourceObserved = Task.WhenAny(sourceWritten.Task :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(sourceObserved, sourceWritten.Task),
+                    Is.True,
+                    "the fake feeder must be blocked before close cancellation is tested"
+                )
+
+                cancellation.Cancel()
+
+                let! closeObserved = Task.WhenAny(closing :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(closeObserved, closing),
+                    Is.True,
+                    "the cancelled close did not return within its bounded wait"
+                )
+
+                match! closing with
+                | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
+                | other -> Assert.Fail $"expected close cancellation, got {other}"
+
+                Assert.That(stdin.CanWrite, Is.True, "cancellation must not deliver EOF to framed stdin")
+                Assert.That(Encoding.UTF8.GetString(stdin.ToArray()), Is.EqualTo "source bytes")
+
+                feeder.TrySetResult() |> ignore
+
+                match! session.FinishInputAsync() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the uncancelled close should still deliver EOF, got {error}"
+
+                Assert.That(stdin.CanWrite, Is.False, "the no-token overload must retain the close behavior")
+            finally
+                feeder.TrySetResult() |> ignore
+        }
+
+    [<Test>]
+    member _.``FinishInputAsync cancellation returns before EOF while the send gate is held``() : Task =
+        task {
+            let stdout = new MemoryStream()
+            let stdin = new StallingStdinStream()
+            let command = (Command.create "language-server").KeepStdinOpen()
+
+            use running =
+                new RunningProcess(
+                    hostForCommand command (stdout :> Stream) (Some(stdin :> Stream)) ignore (fun () -> ValueTask())
+                )
+
+            let session = ContentLengthSession running
+            use sendCancellation = new CancellationTokenSource()
+            use closeCancellation = new CancellationTokenSource()
+            let sending = session.SendAsync([| 1uy |], sendCancellation.Token)
+
+            try
+                do! stdin.Writing
+
+                let closing = session.FinishInputAsync(closeCancellation.Token)
+                let! beforeCancel = Task.WhenAny(closing :> Task, Task.Delay 200)
+
+                Assert.That(
+                    obj.ReferenceEquals(beforeCancel, closing),
+                    Is.False,
+                    "the close must wait while the first send owns the send gate"
+                )
+
+                closeCancellation.Cancel()
+
+                let! closeObserved = Task.WhenAny(closing :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(closeObserved, closing),
+                    Is.True,
+                    "the gate-held close did not return within its bounded wait"
+                )
+
+                match! closing with
+                | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
+                | other -> Assert.Fail $"expected gate-held close cancellation, got {other}"
+
+                Assert.That(stdin.IsDisposed, Is.False, "gate cancellation must not deliver EOF to framed stdin")
+
+                sendCancellation.Cancel()
+                let! sendObserved = Task.WhenAny(sending :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(sendObserved, sending),
+                    Is.True,
+                    "the held send did not release within its bounded cleanup wait"
+                )
+
+                match! sending with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"expected the held send to be cancelled during cleanup, got {other}"
+            finally
+                sendCancellation.Cancel()
+        }
 
     [<Test>]
     member _.``fake Content-Length frames round-trip byte-exactly across buffer boundaries``() : Task =
