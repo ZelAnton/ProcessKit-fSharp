@@ -150,10 +150,12 @@ type internal LimitContractBackend(initial: ResourceLimits, shouldFail: Resource
 /// evidence-record half).
 type internal LimitEvidenceEchoBackend(updateLimitsFails: bool) =
     let mutable lastCapped: CappedAxes option = None
+    let mutable updateLimitsCallCount = 0
 
     /// The `CappedAxes` this backend's `LimitEvidence` was last called with, or `None` before the group
     /// this backend is behind has been torn down (`ProcessGroup.hardRelease` is the only caller).
     member _.LastCapped = lastCapped
+    member _.UpdateLimitsCallCount = updateLimitsCallCount
 
     interface IContainmentBackend with
         member _.Mechanism = Mechanism.JobObject
@@ -194,6 +196,8 @@ type internal LimitEvidenceEchoBackend(updateLimitsFails: bool) =
         member _.MemberStats() = Ok []
 
         member _.UpdateLimits(_limits) =
+            updateLimitsCallCount <- updateLimitsCallCount + 1
+
             if updateLimitsFails then
                 Error(ProcessError.ResourceLimit "simulated update failure (T-381 evidence-record contract)")
             else
@@ -1315,6 +1319,37 @@ type LimitsTests() =
                     | other -> Assert.Fail $"expected ResourceLimit updating a process-group group, got {other}"
         }
         :> Task
+
+    [<Test>]
+    member _.``UpdateLimits rejects null before lifecycle state backend and sticky evidence``() =
+        let backend = LimitEvidenceEchoBackend(updateLimitsFails = false)
+        let initialOptions = ProcessGroupOptions()
+
+        let group = ProcessGroup.FromBackend(backend :> IContainmentBackend, initialOptions)
+
+        // `Unchecked.defaultof` supplies the same null reference a C# caller can pass to this public member.
+        let error =
+            Assert.Throws<ArgumentNullException>(
+                Action(fun () -> group.UpdateLimits(Unchecked.defaultof<ResourceLimits>) |> ignore)
+            )
+
+        match error with
+        | null -> Assert.Fail "Assert.Throws did not return an exception"
+        | error -> Assert.That(error.ParamName, Is.EqualTo "limits")
+
+        Assert.That(backend.UpdateLimitsCallCount, Is.Zero, "the backend must not observe a rejected call")
+        Assert.That(group.Options, Is.SameAs initialOptions, "the live options snapshot must not be replaced")
+
+        (group :> IDisposable).Dispose()
+
+        match backend.LastCapped with
+        | Some capped ->
+            Assert.That(
+                (capped.Memory, capped.Processes, capped.Cpu, capped.CpuTimeMax),
+                Is.EqualTo((false, false, false, false)),
+                "a rejected call must not add any axis to sticky limit evidence"
+            )
+        | None -> Assert.Fail "teardown did not capture sticky limit evidence"
 
     [<Test>]
     member _.``UpdateLimits re-applies caps to a live limit-capable group and refreshes the Options snapshot``
