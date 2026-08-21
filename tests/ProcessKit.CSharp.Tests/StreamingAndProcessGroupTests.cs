@@ -20,8 +20,11 @@ public class StreamingAndProcessGroupTests
     [Test]
     public void ProcessGroup_options_overloads_reject_null_at_the_public_boundary()
     {
-        Assert.Throws<ArgumentNullException>(() => ProcessGroup.Create(null!));
-        Assert.Throws<ArgumentNullException>(() => ProcessGroup.Capabilities(null!));
+        var createException = Assert.Throws<ArgumentNullException>(() => ProcessGroup.Create(null!));
+        var capabilitiesException = Assert.Throws<ArgumentNullException>(() => ProcessGroup.Capabilities(null!));
+
+        Assert.That(createException!.ParamName, Is.EqualTo("options"));
+        Assert.That(capabilitiesException!.ParamName, Is.EqualTo("options"));
     }
 
     [Test]
