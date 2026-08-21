@@ -3046,6 +3046,39 @@ module internal Windows =
     let private packCoord (cols: int) (rows: int) : uint32 =
         (uint32 (uint16 rows) <<< 16) ||| uint32 (uint16 cols)
 
+    [<Literal>]
+    let private FACILITY_WIN32 = 7u
+
+    /// Convert the HRESULT returned by a ConPTY API from the value itself. `FACILITY_WIN32`
+    /// carries the original Win32 code in its low word; every other facility keeps the complete
+    /// HRESULT because treating it as a thread-local last-error code would fabricate a diagnosis.
+    let private conptyHresultDiagnostic (hresult: int) : string =
+        let bits = uint32 hresult
+        let hresultHex = bits.ToString("X8")
+        let facility = (bits >>> 16) &&& 0x1fffu
+
+        if facility = FACILITY_WIN32 then
+            let code = int (bits &&& 0xffffu)
+            let systemMessage = Win32Exception(code).Message
+            $"Win32 error {code} (HRESULT 0x{hresultHex}): {systemMessage}"
+        else
+            $"HRESULT 0x{hresultHex}"
+
+    let private createPseudoConsoleFailure (program: string) (hresult: int) : ProcessError =
+        ProcessError.Spawn(program, $"CreatePseudoConsole failed ({conptyHresultDiagnostic hresult})")
+
+    let private resizePseudoConsoleFailure (hresult: int) : ProcessError =
+        ProcessError.Io $"ResizePseudoConsole failed ({conptyHresultDiagnostic hresult})"
+
+    // Deterministic seams for the conversion and the two typed call-site adapters. Production calls the
+    // same private functions below; tests do not need to provoke a real ConPTY failure on this host.
+    let conptyHresultDiagnosticForTests (hresult: int) = conptyHresultDiagnostic hresult
+
+    let createPseudoConsoleFailureForTests (program: string) (hresult: int) =
+        createPseudoConsoleFailure program hresult
+
+    let resizePseudoConsoleFailureForTests (hresult: int) = resizePseudoConsoleFailure hresult
+
     [<DllImport("kernel32.dll", SetLastError = true)>]
     extern int private CreatePseudoConsole(
         uint32 size,
@@ -3575,9 +3608,7 @@ module internal Windows =
         if hr = 0 then
             Ok()
         else
-            // A double-quoted format inside an interpolation hole is FS3373 (KB K-026) — bind first.
-            let hrHex = hr.ToString("X8")
-            Error(ProcessError.Io $"ResizePseudoConsole failed (HRESULT 0x{hrHex})")
+            Error(resizePseudoConsoleFailure hr)
 
     /// Spawn `command` attached to a Windows pseudoconsole (ConPTY) — see the ConPTY section comment above.
     /// The STARTUPINFOEX attribute list carries ONLY the pseudoconsole; Job membership (kill-on-dispose
@@ -3655,8 +3686,7 @@ module internal Windows =
 
                 if hr <> 0 then
                     disposeCreatedPipes ()
-                    let hrHex = hr.ToString("X8")
-                    Error(ProcessError.Spawn(command.Program, $"CreatePseudoConsole failed (HRESULT 0x{hrHex})"))
+                    Error(createPseudoConsoleFailure command.Program hr)
                 else
                     pendingPseudoConsole <- hPC
                     // ConPTY duplicated the child-side ends into the sidecar; drop our copies so only the parent
