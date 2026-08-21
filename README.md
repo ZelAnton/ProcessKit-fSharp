@@ -925,6 +925,11 @@ that leader to ProcessKit's directed CTRL+BREAK API.
 > deadlock. The non-interactive `Stdin.From*` sources are written on a background task and never
 > deadlock.
 
+For an expect-style `PtySession`, construction claims the interactive writer without waiting for a
+`Stdin(source)` feeder to finish. `SendAsync`, `SendLineAsync`, and `CloseStdinAsync` wait for that
+feeder before writing or closing, so a slow source or a child that is not currently reading stdin
+cannot block session construction or let two writers use the pipe at once.
+
 *Deeper: [Streaming & interactive I/O](docs/streaming.md).*
 
 ### Additional POSIX file-descriptor channels
