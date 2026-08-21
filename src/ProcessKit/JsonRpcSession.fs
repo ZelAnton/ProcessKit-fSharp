@@ -209,7 +209,13 @@ type private DropCounter() =
 [<Sealed>]
 type JsonRpcSession
     internal
-    (running: RunningProcess, maxFrameBytes: int, messageBacklog: int, beforePendingCompletion: Action<int64> | null) =
+    (
+        running: RunningProcess,
+        maxFrameBytes: int,
+        messageBacklog: int,
+        beforePendingCompletion: Action<int64> | null,
+        beforeFirstByteAuthorization: Action | null
+    ) =
     do ArgumentNullException.ThrowIfNull(running, nameof running)
     do ArgumentOutOfRangeException.ThrowIfLessThan(messageBacklog, 1, nameof messageBacklog)
 
@@ -237,6 +243,7 @@ type JsonRpcSession
     let gate = obj ()
     let pending = Dictionary<int64, PendingRequest>()
     let beforePendingCompletion = Option.ofObj beforePendingCompletion
+    let beforeFirstByteAuthorization = Option.ofObj beforeFirstByteAuthorization
     let dropped = DropCounter()
     let mutable nextId = 0L
     let mutable ended: ProcessError option = None
@@ -580,15 +587,15 @@ type JsonRpcSession
 
     /// A session over `running` with a custom maximum frame size, using the default 1024-message
     /// inbound backlog.
-    new(running: RunningProcess, maxFrameBytes: int) = JsonRpcSession(running, maxFrameBytes, 1024, null)
+    new(running: RunningProcess, maxFrameBytes: int) = JsonRpcSession(running, maxFrameBytes, 1024, null, null)
 
     /// A session over `running` with custom frame and decoded-message backlog limits.
     new(running: RunningProcess, maxFrameBytes: int, messageBacklog: int) =
-        JsonRpcSession(running, maxFrameBytes, messageBacklog, null)
+        JsonRpcSession(running, maxFrameBytes, messageBacklog, null, null)
 
     /// A session over `running` using the framing layer's default 16 MiB maximum frame size and a
     /// 1024-message inbound backlog.
-    new(running: RunningProcess) = JsonRpcSession(running, 16 * 1024 * 1024, 1024, null)
+    new(running: RunningProcess) = JsonRpcSession(running, 16 * 1024 * 1024, 1024, null, null)
 
     // ---- message construction -------------------------------------------------------------------
 
@@ -634,33 +641,32 @@ type JsonRpcSession
                 | None -> return Error(classifyInterrupt (ProcessError.Cancelled program), FramedSendStage.BeforeWrite)
             else
                 try
-                    // Claim the right to begin the transport send under the same state lock as
-                    // `endSession`. If the router won, no transport call is made. If this send won, the
-                    // linked terminal token remains in the framing layer's own final pre-write check while
-                    // it waits for the interactive stdin or its inner gate.
-                    let started =
+                    // The framing layer invokes this at its final pre-write boundary, after claiming stdin
+                    // and its own gate. Starting the first WriteAsync while this session state lock is held
+                    // makes authorization atomic with `endSession`: either terminal state was published and
+                    // no write starts, or the write starts before that publication can occur.
+                    let authorizeFirstWrite startWriting =
+                        beforeFirstByteAuthorization |> Option.iter (fun callback -> callback.Invoke())
+
                         lock gate (fun () ->
                             match ended with
                             | Some error -> Error error
                             | None when cancellationToken.IsCancellationRequested ->
                                 Error(classifyInterrupt (ProcessError.Cancelled program))
-                            | None -> Ok(transport.SendStagedAsync(payload, linked.Token)))
+                            | None -> Ok(startWriting ()))
 
-                    match started with
-                    | Error error -> return Error(error, FramedSendStage.BeforeWrite)
-                    | Ok send ->
-                        match! send with
-                        | Ok() ->
-                            match currentFault () with
-                            | Some error -> return Error(error, FramedSendStage.Writing)
-                            | None -> return Ok()
-                        | Error(error, stage) ->
-                            match currentFault () with
-                            | Some terminalError -> return Error(terminalError, stage)
-                            | None ->
-                                let reported = classifyInterrupt error
-                                endTornSend stage reported
-                                return Error(reported, stage)
+                    match! transport.SendStagedAsync(payload, linked.Token, authorizeFirstWrite) with
+                    | Ok() ->
+                        match currentFault () with
+                        | Some error -> return Error(error, FramedSendStage.Writing)
+                        | None -> return Ok()
+                    | Error(error, stage) ->
+                        match currentFault () with
+                        | Some terminalError -> return Error(terminalError, stage)
+                        | None ->
+                            let reported = classifyInterrupt error
+                            endTornSend stage reported
+                            return Error(reported, stage)
                 finally
                     sendGate.Release() |> ignore
         }

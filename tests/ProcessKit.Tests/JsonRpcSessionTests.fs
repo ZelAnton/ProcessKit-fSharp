@@ -456,6 +456,110 @@ type JsonRpcSessionTests() =
                 peer.Stdin.ResumeWrites()
         }
 
+    let outgoingKindAtFirstByteAuthorizationAfterTerminal
+        (outgoingKind: string)
+        (terminate: PeerOutputStream -> unit)
+        : Task<ProcessError> =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+
+            let authorizationReached =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use releaseAuthorization = new ManualResetEventSlim(false)
+
+            // Runs at the framing layer's final boundary, after stdin and its inner send gate are owned but
+            // before the session state lock authorizes the first WriteAsync. Blocking outside that lock lets
+            // the router publish a terminal result in exactly the window R-01 identified.
+            let beforeFirstByteAuthorization =
+                Action(fun () ->
+                    authorizationReached.TrySetResult() |> ignore
+                    releaseAuthorization.Wait())
+
+            let session =
+                JsonRpcSession(running, 16 * 1024 * 1024, 1024, null, beforeFirstByteAuthorization)
+
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+            let mutable peerRequest: JsonRpcMessage option = None
+
+            if outgoingKind = "response" then
+                peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"workspace/configuration\"}")
+                let! received = messages.MoveNextAsync()
+                Assert.That(received, Is.True)
+                peerRequest <- Some messages.Current
+
+            let startTarget () : Task<Result<unit, ProcessError>> =
+                match outgoingKind with
+                | "request" ->
+                    task {
+                        match! session.RequestRawAsync("test/authorization-request", null) with
+                        | Ok _ -> return Ok()
+                        | Error error -> return Error error
+                    }
+                | "notification" -> session.NotifyRawAsync("test/authorization-notification", null)
+                | "response" ->
+                    match peerRequest with
+                    | Some request -> session.RespondRawAsync(request, "null")
+                    | None -> Task.FromException<Result<unit, ProcessError>>(InvalidOperationException())
+                | other ->
+                    Task.FromException<Result<unit, ProcessError>>(
+                        ArgumentOutOfRangeException(nameof outgoingKind, other, "unknown outgoing kind")
+                    )
+
+            let targetCompletion =
+                TaskCompletionSource<Result<unit, ProcessError>>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            Task.Run(
+                Action(fun () ->
+                    try
+                        targetCompletion.TrySetResult(startTarget().GetAwaiter().GetResult()) |> ignore
+                    with ex ->
+                        targetCompletion.TrySetException ex |> ignore)
+            )
+            |> ignore
+
+            try
+                do! authorizationReached.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+                terminate peer.Stdout
+                do! session.RouterTask.WaitAsync(TimeSpan.FromSeconds 5.0)
+
+                // Observe the published terminal state while the target is still paused immediately before
+                // authorization. This request never enters pending or reaches either send gate.
+                let! observed =
+                    session.RequestRawAsync("test/observe-terminal", null).WaitAsync(TimeSpan.FromSeconds 5.0)
+
+                let terminal =
+                    match observed with
+                    | Error error -> error
+                    | Ok _ ->
+                        Assert.Fail "expected the terminal-state observer to fail before authorization resumes"
+                        Unchecked.defaultof<ProcessError>
+
+                releaseAuthorization.Set()
+                let! target = targetCompletion.Task.WaitAsync(TimeSpan.FromSeconds 5.0)
+
+                match target with
+                | Error error ->
+                    Assert.That(
+                        error,
+                        Is.EqualTo terminal,
+                        $"the paused {outgoingKind} must return the already-observed terminal error"
+                    )
+                | Ok() -> Assert.Fail $"the paused {outgoingKind} must not report a successful send"
+
+                Assert.That(
+                    peer.Stdin.TotalBytesWritten,
+                    Is.EqualTo 0L,
+                    $"the paused {outgoingKind} must not write after terminal publication"
+                )
+
+                do! messages.DisposeAsync()
+                return terminal
+            finally
+                releaseAuthorization.Set()
+        }
+
     [<Test>]
     member _.``a request is answered by the response carrying the same id``() : Task =
         task {
@@ -600,7 +704,7 @@ type JsonRpcSessionTests() =
             use running = peer.Running
 
             let session =
-                JsonRpcSession(running, 16 * 1024 * 1024, 1024, beforePendingCompletion)
+                JsonRpcSession(running, 16 * 1024 * 1024, 1024, beforePendingCompletion, null)
 
             let call =
                 session.RequestRawAsync("race/answer-before-deadline", null, TimeSpan.FromMilliseconds 200.0)
@@ -662,7 +766,7 @@ type JsonRpcSessionTests() =
             use running = peer.Running
 
             let session =
-                JsonRpcSession(running, 16 * 1024 * 1024, 1024, beforePendingCompletion)
+                JsonRpcSession(running, 16 * 1024 * 1024, 1024, beforePendingCompletion, null)
 
             let call =
                 session.RequestRawAsync(
@@ -1015,6 +1119,33 @@ type JsonRpcSessionTests() =
             match terminal with
             | ProcessError.Parse(program, _) -> Assert.That(program, Is.EqualTo "language-server")
             | other -> Assert.Fail $"expected the malformed frame to remain the session's parse error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``EOF cannot cross the final first-byte authorization for any outgoing kind``() : Task =
+        task {
+            for outgoingKind in [| "request"; "notification"; "response" |] do
+                let! terminal =
+                    outgoingKindAtFirstByteAuthorizationAfterTerminal outgoingKind (fun output -> output.Complete())
+
+                match terminal with
+                | ProcessError.Io detail -> Assert.That(detail, Does.Contain "language-server")
+                | other -> Assert.Fail $"expected EOF to remain the session's I/O error, got {other}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a protocol fault cannot cross the final first-byte authorization for any outgoing kind``() : Task =
+        task {
+            for outgoingKind in [| "request"; "notification"; "response" |] do
+                let! terminal =
+                    outgoingKindAtFirstByteAuthorizationAfterTerminal outgoingKind (fun output ->
+                        output.Emit(framed "{\"jsonrpc\":\"2.0\",\"greeting\":\"not a message\"}"))
+
+                match terminal with
+                | ProcessError.Parse(program, _) -> Assert.That(program, Is.EqualTo "language-server")
+                | other -> Assert.Fail $"expected the malformed frame to remain the session's parse error, got {other}"
         }
         :> Task
 
