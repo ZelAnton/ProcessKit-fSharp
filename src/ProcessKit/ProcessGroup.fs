@@ -123,6 +123,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// at all (e.g. the cgroup was torn down underneath the spawn), it is killed and reaped and the
     /// spawn fails with `ProcessError.ResourceLimit` — never left running unconstrained.
     static member Create(options: ProcessGroupOptions) : Result<ProcessGroup, ProcessError> =
+        ArgumentNullException.ThrowIfNull(options, nameof options)
         let limits = options.Limits
 
         let withBackend (backend: IContainmentBackend) = Ok(new ProcessGroup(backend, options))
@@ -192,7 +193,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// the real calls do. It is a point-in-time report and deliberately not cached — see
     /// `ContainmentCapabilities` for what that does and does not promise.
     static member Capabilities(options: ProcessGroupOptions) : ContainmentCapabilities =
-        ArgumentNullException.ThrowIfNull options
+        ArgumentNullException.ThrowIfNull(options, nameof options)
         CapabilityProbe.current options
 
     /// Test-only seam: wrap an arbitrary containment backend so the lifecycle guard (spawn / control /

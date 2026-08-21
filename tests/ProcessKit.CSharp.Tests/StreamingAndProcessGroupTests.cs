@@ -18,6 +18,16 @@ public class StreamingAndProcessGroupTests
     private static string Lingering() => Shell.IsWindows ? "ping 127.0.0.1 -n 5 >NUL" : "sleep 4";
 
     [Test]
+    public void ProcessGroup_options_overloads_reject_null_at_the_public_boundary()
+    {
+        var createException = Assert.Throws<ArgumentNullException>(() => ProcessGroup.Create(null!));
+        var capabilitiesException = Assert.Throws<ArgumentNullException>(() => ProcessGroup.Capabilities(null!));
+
+        Assert.That(createException!.ParamName, Is.EqualTo("options"));
+        Assert.That(capabilitiesException!.ParamName, Is.EqualTo("options"));
+    }
+
+    [Test]
     public async Task await_using_a_RunningProcess_waits_for_a_line_then_reaps_the_rest_on_dispose()
     {
         var command = Shell.Run(LingeringEcho("ready"));
