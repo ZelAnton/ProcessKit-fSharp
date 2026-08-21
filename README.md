@@ -928,7 +928,14 @@ that leader to ProcessKit's directed CTRL+BREAK API.
 For an expect-style `PtySession`, construction claims the interactive writer without waiting for a
 `Stdin(source)` feeder to finish. `SendAsync`, `SendLineAsync`, and `CloseStdinAsync` wait for that
 feeder before writing or closing, so a slow source or a child that is not currently reading stdin
-cannot block session construction or let two writers use the pipe at once.
+cannot block session construction or let two writers use the pipe at once. The close verbs on all
+interactive sessions — `PtySession.CloseStdinAsync(cancellationToken)`,
+`ContentLengthSession.FinishInputAsync(cancellationToken)`, and
+`JsonRpcSession.FinishInputAsync(cancellationToken)` — return
+`Error(ProcessError.Cancelled program)` when cancellation fires while waiting for the feeder or
+send gate; no EOF is delivered in that case. Once the writer/gate has been claimed and EOF delivery
+starts, it is not cancellable. The no-token overloads remain equivalent to passing
+`CancellationToken.None`.
 
 *Deeper: [Streaming & interactive I/O](docs/streaming.md).*
 

@@ -482,6 +482,14 @@ type PtySessionTests() =
 
                 cancellation.Cancel()
 
+                let! closeObserved = Task.WhenAny(closing :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(closeObserved, closing),
+                    Is.True,
+                    "the cancelled close did not return within its bounded wait"
+                )
+
                 match! closing with
                 | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "non-reading-child")
                 | other -> Assert.Fail $"expected close cancellation, got {other}"

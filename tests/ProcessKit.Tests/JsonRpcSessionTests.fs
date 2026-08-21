@@ -1034,6 +1034,14 @@ type JsonRpcSessionTests() =
 
                 cancellation.Cancel()
 
+                let! closeObserved = Task.WhenAny(closing :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(closeObserved, closing),
+                    Is.True,
+                    "the cancelled close did not return within its bounded wait"
+                )
+
                 match! closing with
                 | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
                 | other -> Assert.Fail $"expected close cancellation, got {other}"
@@ -1050,6 +1058,64 @@ type JsonRpcSessionTests() =
                 Assert.That(peer.Stdin.IsDisposed, Is.True, "the no-token overload must retain the close behavior")
             finally
                 feeding.TrySetResult() |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``FinishInputAsync cancellation returns before EOF while the JSON-RPC send gate is held``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            peer.Stdin.StallWrites()
+            use sendCancellation = new CancellationTokenSource()
+            use closeCancellation = new CancellationTokenSource()
+            let sending = session.NotifyRawAsync("held", null, sendCancellation.Token)
+
+            try
+                do! peer.Stdin.NextStalledWriteAsync()
+
+                let closing = session.FinishInputAsync(closeCancellation.Token)
+                let! beforeCancel = Task.WhenAny(closing :> Task, Task.Delay 200)
+
+                Assert.That(
+                    obj.ReferenceEquals(beforeCancel, closing),
+                    Is.False,
+                    "the close must wait while the first JSON-RPC send owns the send gate"
+                )
+
+                closeCancellation.Cancel()
+
+                let! closeObserved = Task.WhenAny(closing :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(closeObserved, closing),
+                    Is.True,
+                    "the gate-held close did not return within its bounded wait"
+                )
+
+                match! closing with
+                | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
+                | other -> Assert.Fail $"expected gate-held close cancellation, got {other}"
+
+                Assert.That(peer.Stdin.IsDisposed, Is.False, "gate cancellation must not deliver EOF to JSON-RPC stdin")
+                Assert.That(peer.Stdin.TotalBytesWritten, Is.EqualTo 0L)
+
+                sendCancellation.Cancel()
+                let! sendObserved = Task.WhenAny(sending :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(sendObserved, sending),
+                    Is.True,
+                    "the held JSON-RPC send did not release within its bounded cleanup wait"
+                )
+
+                match! sending with
+                | Error(ProcessError.Cancelled _) -> ()
+                | other -> Assert.Fail $"expected the held JSON-RPC send to be cancelled during cleanup, got {other}"
+            finally
+                sendCancellation.Cancel()
+                peer.Stdin.ResumeWrites()
         }
         :> Task
 

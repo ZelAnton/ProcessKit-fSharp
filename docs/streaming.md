@@ -955,7 +955,14 @@ and `TakeStdin()` afterwards returns `None` for the same one-owner reason.
 
 On a `Stdin(source)` + `KeepStdinOpen` run the end of input never truncates the source: whoever
 ends it — you or the verb — waits for the background feeder to finish delivering the whole
-source first, exactly as `TakeStdin()` itself does.
+source first, exactly as `TakeStdin()` itself does. The interactive session close verbs expose
+that pre-delivery wait through an optional token: `PtySession.CloseStdinAsync(cancellationToken)`,
+`ContentLengthSession.FinishInputAsync(cancellationToken)`, and
+`JsonRpcSession.FinishInputAsync(cancellationToken)` return
+`Error(ProcessError.Cancelled program)` if cancellation wins while waiting for the feeder or a
+session send gate. They do not deliver EOF in that case. After the writer and any session gate have
+been claimed and `FinishAsync` begins, EOF delivery is not cancellable; the overload without a token
+is the same operation with `CancellationToken.None`.
 
 **Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS buffer;
 once it fills, the child blocks *writing* stdout until something reads it. If you
@@ -1105,7 +1112,11 @@ interleave; after cancelling a send, abandon the session because the child may h
 prefix — the exception being an interruption that lands while the call is still queued behind another
 send or waiting for a `Stdin(source)` feeder, which cannot have written a byte (`JsonRpcSession`, layered
 on this type, tells the two apart so a cancelled call does not end its conversation).
-`FinishInputAsync` closes framed stdin and lets the child observe EOF.
+`FinishInputAsync(cancellationToken)` closes framed stdin and lets the child observe EOF. If the token
+fires while the feeder or this session's send gate is still pending, it returns
+`Error(ProcessError.Cancelled program)` and writes no EOF. Once the gate is held and
+`ProcessStdin.FinishAsync` begins, the EOF delivery is not cancellable. The parameterless overload
+passes `CancellationToken.None`.
 
 Payloads remain raw for byte accuracy and NativeAOT-friendly caller control. For typed JSON, pass
 each frame to `JsonSerializer.Deserialize(frame, MyJsonContext.Default.Message)` (or the matching
@@ -1286,9 +1297,12 @@ request is never silently discarded — overflow at that point faults the conver
 above.
 
 This session owns the handle exactly as `ContentLengthSession` does — it creates that session
-itself, so the frames are never exposed for a second reader — and `FinishInputAsync` closes the
-peer's stdin for the usual `shutdown`/`exit` handshake. Dispose the `RunningProcess` (or its owning
-`ProcessGroup`) to reap the tree.
+itself, so the frames are never exposed for a second reader — and
+`FinishInputAsync(cancellationToken)` closes the peer's stdin for the usual `shutdown`/`exit`
+handshake. Cancellation while waiting for the JSON-RPC send gate or the transport's feeder/gate
+returns `Error(ProcessError.Cancelled program)` before EOF delivery, so the peer sees no EOF. Once
+delivery starts it is not cancellable, and the parameterless overload passes `CancellationToken.None`.
+Dispose the `RunningProcess` (or its owning `ProcessGroup`) to reap the tree.
 
 ## Readiness probes
 
