@@ -301,7 +301,9 @@ type ProcessError =
     | Parse of Program: string * Detail: string
 
     /// The retry predicate threw while classifying a failed attempt. `Original` is the typed failure
-    /// from that attempt; this error is terminal and is never itself eligible for another retry.
+    /// from that attempt; this error is terminal and is never itself eligible for another retry. A C#
+    /// caller can pass `null` to the generated factory; in that case `Message` reports the original as
+    /// unavailable and recursive accessors return `None` rather than throwing.
     | RetryPredicate of Program: string * Original: ProcessError * Detail: string
 
     /// A JSON-RPC peer (`JsonRpcSession`) answered a request with an `error` object instead of a
@@ -376,6 +378,15 @@ type ProcessError =
     /// The requested operation is unsupported on this platform or in this configuration.
     | Unsupported of Operation: string
 
+    /// C# can pass `null` to the generated `NewRetryPredicate` factory despite the F# field's
+    /// non-nullable type. Keep that invalid runtime value behind one fail-safe boundary so rendering
+    /// and recursive accessors cannot drift into separate null-handling rules.
+    static let retryOriginal (original: ProcessError) : ProcessError option =
+        if obj.ReferenceEquals(original, null) then
+            None
+        else
+            Some original
+
     /// The side channel `ProcessResult.FailureError` uses to attach `StdoutBytes` to a freshly
     /// constructed `Exit`/`Signalled`/`Timeout` instance, keyed by object identity.
     ///
@@ -445,7 +456,12 @@ type ProcessError =
         | ProcessError.RetryPredicate(program, original, detail) ->
             // The nested original is previewed as a whole, so nesting cannot walk around the bound: the
             // inner message is already bounded in its own right, and this caps it again as one fragment.
-            $"retry predicate for '{MessageText.fragment program}' threw: {MessageText.fragment detail}; original attempt: {MessageText.fragment original.Message}"
+            let originalMessage =
+                match retryOriginal original with
+                | Some error -> MessageText.fragment error.Message
+                | None -> "unavailable"
+
+            $"retry predicate for '{MessageText.fragment program}' threw: {MessageText.fragment detail}; original attempt: {originalMessage}"
         | ProcessError.JsonRpc(program, methodName, code, detail, _) ->
             let head =
                 $"'{MessageText.fragment program}' answered '{MessageText.fragment methodName}' with JSON-RPC error {code}"
@@ -545,7 +561,8 @@ type ProcessError =
         | ProcessError.Exit(_, _, stdout, _)
         | ProcessError.Signalled(_, _, stdout, _)
         | ProcessError.Timeout(_, _, stdout, _) -> Some stdout
-        | ProcessError.RetryPredicate(_, original, _) -> original.Stdout
+        | ProcessError.RetryPredicate(_, original, _) ->
+            retryOriginal original |> Option.bind (fun error -> error.Stdout)
         | _ -> None
 
     /// The exact pre-decode stdout bytes when the error carries them — the checking verb was built over
@@ -567,7 +584,8 @@ type ProcessError =
             match stdoutBytesTable.TryGetValue this with
             | true, bytes -> Some bytes
             | false, _ -> None
-        | ProcessError.RetryPredicate(_, original, _) -> original.StdoutBytes
+        | ProcessError.RetryPredicate(_, original, _) ->
+            retryOriginal original |> Option.bind (fun error -> error.StdoutBytes)
         | _ -> None
 
     /// The captured stderr when the error carries it (`Exit` / `Signalled` / `Timeout`, or the original
@@ -577,7 +595,8 @@ type ProcessError =
         | ProcessError.Exit(_, _, _, stderr)
         | ProcessError.Signalled(_, _, _, stderr)
         | ProcessError.Timeout(_, _, _, stderr) -> Some stderr
-        | ProcessError.RetryPredicate(_, original, _) -> original.Stderr
+        | ProcessError.RetryPredicate(_, original, _) ->
+            retryOriginal original |> Option.bind (fun error -> error.Stderr)
         | _ -> None
 
     /// The captured stdout and stderr joined (stdout, then stderr on a new line when both are non-empty)
@@ -588,7 +607,8 @@ type ProcessError =
         | ProcessError.Exit(_, _, stdout, stderr)
         | ProcessError.Signalled(_, _, stdout, stderr)
         | ProcessError.Timeout(_, _, stdout, stderr) -> Some(ProcessError.CombineStreams(stdout, stderr))
-        | ProcessError.RetryPredicate(_, original, _) -> original.Combined
+        | ProcessError.RetryPredicate(_, original, _) ->
+            retryOriginal original |> Option.bind (fun error -> error.Combined)
         | _ -> None
 
     /// The exit code when the error is an `Exit`, or when its `RetryPredicate` original is an `Exit`;
@@ -596,7 +616,7 @@ type ProcessError =
     member this.Code: int option =
         match this with
         | ProcessError.Exit(_, code, _, _) -> Some code
-        | ProcessError.RetryPredicate(_, original, _) -> original.Code
+        | ProcessError.RetryPredicate(_, original, _) -> retryOriginal original |> Option.bind (fun error -> error.Code)
         | _ -> None
 
     /// The terminating signal number when the error is a `Signalled` with a known number, or when its
@@ -604,7 +624,8 @@ type ProcessError =
     member this.Signal: int option =
         match this with
         | ProcessError.Signalled(_, signal, _, _) -> signal
-        | ProcessError.RetryPredicate(_, original, _) -> original.Signal
+        | ProcessError.RetryPredicate(_, original, _) ->
+            retryOriginal original |> Option.bind (fun error -> error.Signal)
         | _ -> None
 
     /// The shared combined-output join: both streams non-empty → `stdout` + newline + `stderr`; else the
