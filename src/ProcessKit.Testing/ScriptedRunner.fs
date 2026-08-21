@@ -113,13 +113,16 @@ type ScriptedRunner private (rules: ((Command -> bool) * Reply) list, fallback: 
 
     interface IProcessRunner with
         member _.CaptureStringAsync(command, cancellationToken) =
+            Seam.validate command
             record command RunnerVerb.CaptureString
             seam.CaptureStringAsync(command, cancellationToken)
 
         member _.SpawnAsync(command, cancellationToken) =
+            Seam.validate command
             record command RunnerVerb.Spawn
             seam.SpawnAsync(command, cancellationToken)
 
         member _.CaptureBytesAsync(command, cancellationToken) =
+            Seam.validate command
             record command RunnerVerb.CaptureBytes
             seam.CaptureBytesAsync(command, cancellationToken)

@@ -15,6 +15,26 @@ namespace ProcessKit.CSharp.Tests;
 [TestFixture]
 public class TestDoublesTests
 {
+    private static void AssertNullCommandRejected(IProcessRunner runner, Func<int> sideEffectCount)
+    {
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        Action[] calls =
+        [
+            () => runner.CaptureStringAsync(null!, cancelled.Token),
+            () => runner.CaptureBytesAsync(null!, cancelled.Token),
+            () => runner.SpawnAsync(null!, cancelled.Token),
+        ];
+
+        foreach (var call in calls)
+        {
+            var exception = Assert.Throws<ArgumentNullException>(() => call());
+            Assert.That(exception!.ParamName, Is.EqualTo("command"));
+            Assert.That(sideEffectCount(), Is.Zero);
+        }
+    }
+
     /// A small typed wrapper, generic over the runner it is given - the seam every C# consumer is
     /// meant to depend on (`IProcessRunner`), mirroring `docs/testing.md`'s `Git` example.
     private static Task<Microsoft.FSharp.Core.FSharpResult<string, ProcessError>> Head(
@@ -93,5 +113,29 @@ public class TestDoublesTests
         var ex = Assert.Throws<ArgumentNullException>(() => new ScriptedRunner().On(null!, Reply.Ok("")));
 
         Assert.That(ex!.ParamName, Is.EqualTo("tokens"));
+    }
+
+    [Test]
+    public void ScriptedRunner_primitives_reject_null_without_recording_an_invocation()
+    {
+        var runner = new ScriptedRunner();
+
+        AssertNullCommandRejected(runner, () => runner.Received.Count);
+    }
+
+    [Test]
+    public void DryRunRunner_primitives_reject_null_without_recording_history()
+    {
+        var runner = new DryRunRunner();
+
+        AssertNullCommandRejected(runner, () => runner.History.Count);
+    }
+
+    [Test]
+    public void FaultInjectingRunner_primitives_reject_null_without_consuming_an_injection()
+    {
+        var runner = new FaultInjectingRunner(new ScriptedRunner(), 3, FaultInjection.Delegate());
+
+        AssertNullCommandRejected(runner, () => runner.InvocationCount);
     }
 }
