@@ -104,6 +104,36 @@ type DependencyInjectionTests() =
         :> Task
 
     [<Test>]
+    member _.``AddProcessKit rejects null services``() =
+        let services: IServiceCollection = Unchecked.defaultof<IServiceCollection>
+
+        let thrown =
+            match
+                Assert.Throws<ArgumentNullException>(
+                    Action(fun () -> ServiceCollectionExtensions.AddProcessKit services |> ignore)
+                )
+            with
+            | null -> failwith "Expected AddProcessKit to reject null services."
+            | exceptionThrown -> exceptionThrown
+
+        Assert.That(thrown.ParamName, Is.EqualTo "services")
+
+    [<Test>]
+    member _.``AddProcessKitGroup rejects null services``() =
+        let services: IServiceCollection = Unchecked.defaultof<IServiceCollection>
+
+        let thrown =
+            match
+                Assert.Throws<ArgumentNullException>(
+                    Action(fun () -> ServiceCollectionExtensions.AddProcessKitGroup services |> ignore)
+                )
+            with
+            | null -> failwith "Expected AddProcessKitGroup to reject null services."
+            | exceptionThrown -> exceptionThrown
+
+        Assert.That(thrown.ParamName, Is.EqualTo "services")
+
+    [<Test>]
     member _.``the resolved runner is logger-aware when a logger factory is registered``() : Task =
         task {
             let captured = DiCapturingLogger()
