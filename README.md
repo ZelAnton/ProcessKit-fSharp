@@ -870,7 +870,10 @@ waits, and disposal release the parked writer before waiting for the process out
 For conversational language-server, build-server, or MCP-style children, use the
 [JSON-RPC 2.0 session layer](docs/streaming.md#json-rpc-sessions-lsp--bsp--mcp). It rejects every
 incoming frame whose `jsonrpc` member is missing, non-string, or not exactly `"2.0"` with a typed
-`ProcessError.Parse` before request, notification, or response routing.
+`ProcessError.Parse` before request, notification, or response routing. Its decoded-message backlog
+may drop old notifications, counted by `DroppedMessages`; evicting a peer request ends the session
+with `ProcessError.OutputTooLarge`, whose totals are zero because this backlog does not count total
+messages or bytes.
 
 ### Interactive stdin — write requests, read responses
 
