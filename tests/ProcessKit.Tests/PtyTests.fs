@@ -1,6 +1,7 @@
 namespace ProcessKit.Tests
 
 open System
+open System.ComponentModel
 open System.Collections.Generic
 open System.IO
 open System.Runtime.InteropServices
@@ -145,6 +146,52 @@ type PtyTests() =
         (Command.create "cmd").Pty(100, 40) |> ignore
         (Command.create "cmd").Pty({ Cols = 120; Rows = 30; Echo = false }) |> ignore
         (Command.create "cmd" |> Command.pty) |> ignore
+
+    [<Test>]
+    member _.``ConPTY HRESULT diagnostics decode Win32 facility without consulting last error``() =
+        let accessDeniedHresult = int 0x80070005u
+        let originalLastError = Marshal.GetLastPInvokeError()
+
+        try
+            Marshal.SetLastPInvokeError 2
+            let first = Native.Windows.conptyHresultDiagnosticForTests accessDeniedHresult
+            Marshal.SetLastPInvokeError 87
+            let second = Native.Windows.conptyHresultDiagnosticForTests accessDeniedHresult
+            let systemMessage = Win32Exception(5).Message
+            let expected = $"Win32 error 5 (HRESULT 0x80070005): {systemMessage}"
+
+            Assert.That(first, Is.EqualTo expected)
+            Assert.That(second, Is.EqualTo expected, "the HRESULT, not thread-local last error, owns the code")
+
+            Assert.That(
+                Native.Windows.conptyHresultDiagnosticForTests (int 0x80004005u),
+                Is.EqualTo "HRESULT 0x80004005",
+                "a non-Win32 facility must retain the complete HRESULT without a fabricated Win32 code"
+            )
+        finally
+            Marshal.SetLastPInvokeError originalLastError
+
+    [<Test>]
+    member _.``ConPTY create and resize failures share HRESULT conversion but keep typed cases``() =
+        let accessDeniedHresult = int 0x80070005u
+
+        let accessDeniedDiagnostic =
+            Native.Windows.conptyHresultDiagnosticForTests accessDeniedHresult
+
+        let cases =
+            [ accessDeniedHresult, accessDeniedDiagnostic
+              int 0x80004005u, "HRESULT 0x80004005" ]
+
+        for hresult, diagnostic in cases do
+            match Native.Windows.createPseudoConsoleFailureForTests "child.exe" hresult with
+            | ProcessError.Spawn(program, detail) ->
+                Assert.That(program, Is.EqualTo "child.exe")
+                Assert.That(detail, Is.EqualTo $"CreatePseudoConsole failed ({diagnostic})")
+            | other -> Assert.Fail $"CreatePseudoConsole failure must remain ProcessError.Spawn, got {other}"
+
+            match Native.Windows.resizePseudoConsoleFailureForTests hresult with
+            | ProcessError.Io detail -> Assert.That(detail, Is.EqualTo $"ResizePseudoConsole failed ({diagnostic})")
+            | other -> Assert.Fail $"ResizePseudoConsole failure must remain ProcessError.Io, got {other}"
 
     [<Test>]
     member _.``PtyStream rejects invalid buffer ranges before native I/O``() =
