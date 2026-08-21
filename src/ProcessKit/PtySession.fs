@@ -363,7 +363,8 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     /// Close the child's stdin, so it sees end-of-file — how a conversation that feeds input ends for a
     /// child that reads until EOF. Idempotent; returns the same typed `Unsupported` as the send verbs
     /// when the run has no interactive stdin. A `Command.Stdin` source is awaited before closing so its
-    /// bytes cannot be truncated by the interactive close.
+    /// bytes cannot be truncated by the interactive close. `cancellationToken` bounds only that
+    /// pre-delivery wait; once stdin is claimed, end-of-input delivery is not cancellable.
     ///
     /// On a **PTY** there is no stdin pipe to close — input goes into the same terminal the conversation's
     /// output comes from — so the end of input is delivered as that terminal's own end-of-input gesture
@@ -378,10 +379,10 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     /// A genuine failure to deliver it is a typed `Io` — never a silently dropped close that would leave the
     /// child waiting — while a child that has already closed its terminal is reported as the `Ok` it is:
     /// there is nothing left to tell it.
-    member _.CloseStdinAsync() : Task<Result<unit, ProcessError>> =
+    member _.CloseStdinAsync(cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
         task {
             try
-                let! claimed = stdin
+                let! claimed = stdin.WaitAsync cancellationToken
 
                 match claimed with
                 | None ->
@@ -399,7 +400,12 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
                 // honest typed failure the send verbs report, never a close that silently did nothing.
                 return Error(ProcessError.Io ex.Message)
             | :? ObjectDisposedException as ex -> return Error(ProcessError.Io ex.Message)
+            | :? OperationCanceledException -> return Error(ProcessError.Cancelled program)
         }
+
+    /// Close the child's stdin without cancellation. Equivalent to `CloseStdinAsync(CancellationToken.None)`.
+    member this.CloseStdinAsync() : Task<Result<unit, ProcessError>> =
+        this.CloseStdinAsync(CancellationToken.None)
 
     /// The output received but not yet consumed by a pattern — what the next `ExpectAsync` will match
     /// against. Reading it consumes nothing; it is for diagnosing a pattern that did not arrive

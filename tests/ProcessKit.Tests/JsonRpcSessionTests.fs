@@ -101,6 +101,7 @@ type private PeerInputStream() =
     let buffered = ResizeArray<byte>()
     let gate = obj ()
     let mutable totalBytesWritten = 0L
+    let mutable disposed = 0
 
     // `None` while the peer drains its stdin; a pending completion while it does not, which every write
     // waits on — the way a real write blocks once the OS pipe buffer fills behind a peer that stopped
@@ -195,6 +196,8 @@ type private PeerInputStream() =
     /// Total bytes accepted by this fake peer's stdin, including an incomplete frame prefix.
     member _.TotalBytesWritten = lock gate (fun () -> totalBytesWritten)
 
+    member _.IsDisposed = Volatile.Read(&disposed) <> 0
+
     override _.CanRead = false
     override _.CanSeek = false
     override _.CanWrite = true
@@ -221,6 +224,12 @@ type private PeerInputStream() =
 
     override _.WriteAsync(buffer: ReadOnlyMemory<byte>, cancellationToken: CancellationToken) : ValueTask =
         ValueTask(writeAsync (buffer.ToArray()) cancellationToken)
+
+    override this.Dispose(disposing) =
+        if disposing then
+            Interlocked.Exchange(&disposed, 1) |> ignore
+
+        base.Dispose(disposing)
 
 /// A manually-fired timer provider for request deadline tests. The timer callback runs on the caller's
 /// thread, so a test can fire the deadline from the router's pending-claim hook without sleeping.
@@ -991,6 +1000,55 @@ type JsonRpcSessionTests() =
                 assertRaw "null" answer
             finally
                 // Never leave the modelled feeder parked on a pool thread, whatever an assertion decided.
+                feeding.TrySetResult() |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``FinishInputAsync cancellation returns Cancelled before delivering EOF``() : Task =
+        task {
+            let feeding =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let feederEntered =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let peer =
+                peerHandleFeeding (fun () ->
+                    feederEntered.TrySetResult() |> ignore
+                    feeding.Task.GetAwaiter().GetResult())
+
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            use cancellation = new CancellationTokenSource()
+
+            try
+                let closing = session.FinishInputAsync(cancellation.Token)
+                let! entered = Task.WhenAny(feederEntered.Task :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(entered, feederEntered.Task),
+                    Is.True,
+                    "the fake feeder must be blocked before close cancellation is tested"
+                )
+
+                cancellation.Cancel()
+
+                match! closing with
+                | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
+                | other -> Assert.Fail $"expected close cancellation, got {other}"
+
+                Assert.That(peer.Stdin.IsDisposed, Is.False, "cancellation must not deliver EOF to framed stdin")
+                Assert.That(peer.Stdin.TotalBytesWritten, Is.EqualTo 0L)
+
+                feeding.TrySetResult() |> ignore
+
+                match! session.FinishInputAsync() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the uncancelled close should still deliver EOF, got {error}"
+
+                Assert.That(peer.Stdin.IsDisposed, Is.True, "the no-token overload must retain the close behavior")
+            finally
                 feeding.TrySetResult() |> ignore
         }
         :> Task

@@ -222,6 +222,68 @@ type ContentLengthSessionTests() =
               payload ]
 
     [<Test>]
+    member _.``Content-Length close cancellation returns Cancelled before delivering EOF``() : Task =
+        task {
+            let feeder =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let sourceWritten =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let stdout = new MemoryStream()
+            let stdin = new MemoryStream()
+            let sourceBytes = Encoding.UTF8.GetBytes "source bytes"
+
+            let command =
+                (Command.create "language-server").Stdin(Stdin.FromString "source bytes").KeepStdinOpen()
+
+            use running =
+                new RunningProcess(
+                    hostForCommand
+                        command
+                        (stdout :> Stream)
+                        (Some(stdin :> Stream))
+                        (fun () ->
+                            stdin.Write(sourceBytes, 0, sourceBytes.Length)
+                            sourceWritten.TrySetResult() |> ignore
+                            feeder.Task.GetAwaiter().GetResult())
+                        (fun () -> ValueTask())
+                )
+
+            try
+                let session = ContentLengthSession running
+                use cancellation = new CancellationTokenSource()
+                let closing = session.FinishInputAsync(cancellation.Token)
+
+                let! sourceObserved = Task.WhenAny(sourceWritten.Task :> Task, Task.Delay 2000)
+
+                Assert.That(
+                    obj.ReferenceEquals(sourceObserved, sourceWritten.Task),
+                    Is.True,
+                    "the fake feeder must be blocked before close cancellation is tested"
+                )
+
+                cancellation.Cancel()
+
+                match! closing with
+                | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "language-server")
+                | other -> Assert.Fail $"expected close cancellation, got {other}"
+
+                Assert.That(stdin.CanWrite, Is.True, "cancellation must not deliver EOF to framed stdin")
+                Assert.That(Encoding.UTF8.GetString(stdin.ToArray()), Is.EqualTo "source bytes")
+
+                feeder.TrySetResult() |> ignore
+
+                match! session.FinishInputAsync() with
+                | Ok() -> ()
+                | Error error -> Assert.Fail $"the uncancelled close should still deliver EOF, got {error}"
+
+                Assert.That(stdin.CanWrite, Is.False, "the no-token overload must retain the close behavior")
+            finally
+                feeder.TrySetResult() |> ignore
+        }
+
+    [<Test>]
     member _.``fake Content-Length frames round-trip byte-exactly across buffer boundaries``() : Task =
         task {
             let small = [| 0uy; 255uy; 1uy; 2uy |]
