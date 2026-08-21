@@ -811,7 +811,7 @@ module internal CgroupMemberStats =
             Ok(sampled |> List.filter (fun stats -> currentPids.Contains stats.Pid))
 
 /// Linux cgroup v2 backend (the `limits` mechanism). Membership lives in `cgroup.procs`; the tree is
-/// reaped with `cgroup.kill` and the directory removed.
+/// reaped with `cgroup.kill`, followed by a bounded attempt to remove the directory.
 type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
     let children = TrackedChildren<int>()
     let mutable currentLimits = initialLimits
@@ -1228,10 +1228,11 @@ type internal CgroupBackend(cgroupPath: string, initialLimits: ResourceLimits) =
             Native.Cgroup.limitEvidence cgroupPath capped
 
         member _.HardRelease() =
-            // Final disposal must remain bounded and best-effort: it removes the cgroup even when the
-            // reusable kill reported an error — an unverified thaw of the legacy freezer, or a sweep
-            // that left the cgroup populated (including a kernel without pidfd, which kills nothing
-            // rather than downgrading to a racy raw kill).
+            // Final disposal must remain bounded and best-effort: it proceeds with the drain and reclaim
+            // attempt even when the reusable kill reported an error — an unverified thaw after either
+            // atomic cgroup.kill or the legacy sweep, or a sweep that left the cgroup populated
+            // (including a kernel without pidfd, which kills nothing rather than downgrading to a racy
+            // raw kill). An unreclaimable cgroup is recorded below rather than reported as removed.
             Native.Cgroup.killCgroup cgroupPath |> ignore
 
             // cgroup.kill SIGKILLs everything in the cgroup but does not reap our own children, and a

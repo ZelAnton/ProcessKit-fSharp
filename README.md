@@ -361,12 +361,14 @@ CTRL+BREAK/WM_CLOSE paths and other signals return `ProcessError.Unsupported`. S
 container exists — `cgroup.freeze` on Linux, `SIGSTOP`/`SIGCONT` on macOS/BSD and the
 process-group fallback, per-thread suspension on Windows.
 
-`ProcessGroup.KillAll()` is reusable: on Linux kernels without `cgroup.kill`, it reports
-`ProcessError.Io` if the fallback cannot verify that `cgroup.freeze` returned to `0`, or if a member could
-not be signalled and the group is still populated afterwards; an already-unfrozen or
-removed freezer remains a best-effort success, and final disposal still removes the cgroup. That fallback
-pins each member and reconfirms its cgroup membership before delivering SIGKILL, so a recycled pid is
-skipped rather than killed.
+After `ProcessGroup.KillAll()` returns `Ok`, the group is reusable. On Linux cgroup v2, both atomic
+`cgroup.kill` and the legacy per-member fallback explicitly thaw and verify `cgroup.freeze=0`; an
+unverified thaw returns `ProcessError.Io`, while an already-unfrozen or removed freezer remains a
+best-effort success. On kernels without `cgroup.kill`, the fallback can additionally return
+`ProcessError.Io` when a member could not be signalled and the group is still populated afterwards. That
+fallback pins each member and reconfirms its cgroup membership before delivering SIGKILL, so a recycled
+pid is skipped rather than killed. An error makes no reuse guarantee; final disposal still runs its
+bounded best-effort drain and cgroup-reclaim attempt.
 
 *Deeper: [Process groups → signals, suspend/resume](docs/process-groups.md#signals-and-suspendresume).*
 

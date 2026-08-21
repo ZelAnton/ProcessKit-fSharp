@@ -1766,6 +1766,94 @@ type LimitsTests() =
         :> Task
 
     [<Test>]
+    member _.``a synthetic reusable cgroup spawns again after suspended KillAll and Signal Kill``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "the cgroup SpawnInto launcher is Linux-only"
+            else
+                let directory =
+                    Path.Combine(Path.GetTempPath(), $"processkit-reusable-cgroup-{Guid.NewGuid():N}")
+
+                Directory.CreateDirectory directory |> ignore
+                File.WriteAllText(Path.Combine(directory, "cgroup.procs"), "")
+                File.WriteAllText(Path.Combine(directory, "cgroup.freeze"), "0")
+
+                let originalHook = Native.Cgroup.killCgroupWriteTestHook
+                let mutable cleaningUp = false
+
+                Native.Cgroup.killCgroupWriteTestHook <-
+                    Some(fun file content ->
+                        if
+                            cleaningUp
+                            && file.EndsWith("cgroup.freeze", StringComparison.Ordinal)
+                            && content = "0"
+                        then
+                            Directory.Delete(directory, true)
+                            raise (DirectoryNotFoundException "the synthetic cgroup was removed during final cleanup"))
+
+                try
+                    let backend = CgroupBackend directory
+                    let nativeBackend = backend :> IContainmentBackend
+                    let group = ProcessGroup.FromBackend(backend, ProcessGroupOptions())
+
+                    try
+                        let command =
+                            Command.create "/bin/sh"
+                            |> Command.args [ "-c"; "exit 0" ]
+                            |> Command.stdout StdioMode.Null
+                            |> Command.stderr StdioMode.Null
+
+                        let runCycle operation kill =
+                            task {
+                                match group.Suspend() with
+                                | Error error -> Assert.Fail $"{operation}: suspend failed: {error}"
+                                | Ok() -> ()
+
+                                Assert.That(
+                                    File.ReadAllText(Path.Combine(directory, "cgroup.freeze")).Trim(),
+                                    Is.EqualTo "1",
+                                    $"{operation}: Suspend must leave the synthetic freezer armed"
+                                )
+
+                                match kill () with
+                                | Error error -> Assert.Fail $"{operation}: hard kill failed: {error}"
+                                | Ok() -> ()
+
+                                Assert.That(
+                                    File.ReadAllText(Path.Combine(directory, "cgroup.freeze")).Trim(),
+                                    Is.EqualTo "0",
+                                    $"{operation}: hard kill must explicitly thaw the reusable cgroup"
+                                )
+
+                                match group.SpawnInto command with
+                                | Error error -> Assert.Fail $"{operation}: the thawed group refused SpawnInto: {error}"
+                                | Ok spawned ->
+                                    try
+                                        let! outcome = nativeBackend.Wait spawned.Handle
+
+                                        Assert.That(
+                                            outcome,
+                                            Is.EqualTo(Outcome.Exited 0),
+                                            $"{operation}: spawned child outcome"
+                                        )
+                                    finally
+                                        nativeBackend.Release spawned
+                            }
+
+                        do! runCycle "KillAll" (fun () -> group.KillAll())
+                        do! runCycle "Signal Kill" (fun () -> group.Signal Signal.Kill)
+                    finally
+                        cleaningUp <- true
+                        (group :> IDisposable).Dispose()
+                finally
+                    Native.Cgroup.killCgroupWriteTestHook <- originalHook
+
+                    if Directory.Exists directory then
+                        Directory.Delete(directory, true)
+        }
+        :> Task
+
+    [<Test>]
     member _.``cgroup peak process count grows with concurrency and survives member exit``() : Task =
         task {
             if isWindows || isMacOs then
