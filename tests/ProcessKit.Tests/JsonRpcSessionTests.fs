@@ -1705,7 +1705,7 @@ type JsonRpcSessionTests() =
         :> Task
 
     [<Test>]
-    member _.``evicting a peer request faults a mixed inbound backlog instead of losing it silently``() : Task =
+    member _.``evicting a peer request after notification drops reports no fabricated totals``() : Task =
         task {
             let peer = peerHandle ()
             use running = peer.Running
@@ -1716,22 +1716,28 @@ type JsonRpcSessionTests() =
 
             peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/1\"}")
 
-            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"workspace/configuration\"}")
-
             peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/2\"}")
             peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/3\"}")
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/4\"}")
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"workspace/configuration\"}")
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/5\"}")
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"method\":\"note/6\"}")
 
             // The pending local request is completed by endSession, so this is a deterministic fence
             // for the overflow without a delay or a response frame the faulted router could not read.
             match! call with
             | Error(ProcessError.OutputTooLarge(program, None, None, totalMessages, totalBytes)) ->
                 Assert.That(program, Is.EqualTo "language-server")
-                Assert.That(totalMessages, Is.EqualTo 3)
+                Assert.That(totalMessages, Is.EqualTo 0)
                 Assert.That(totalBytes, Is.EqualTo 0)
             | other -> Assert.Fail $"expected a typed decoded-backlog overflow, got {other}"
 
-            let droppedMessage = "only the admissibly lossy notification is counted as dropped"
-            Assert.That(session.DroppedMessages, Is.EqualTo 1L, droppedMessage)
+            let droppedMessage =
+                "only notifications are counted as dropped; the evicted request is not"
+
+            Assert.That(session.DroppedMessages, Is.EqualTo 4L, droppedMessage)
 
             match! session.RequestRawAsync("shutdown", null) with
             | Error(ProcessError.OutputTooLarge _) -> ()
@@ -1739,7 +1745,7 @@ type JsonRpcSessionTests() =
 
             let messages = session.MessagesAsync().GetAsyncEnumerator()
 
-            for expected in [ "note/2"; "note/3" ] do
+            for expected in [ "note/5"; "note/6" ] do
                 let! received = messages.MoveNextAsync()
                 Assert.That(received, Is.True)
                 Assert.That(messages.Current.Method, Is.EqualTo expected)
@@ -1751,7 +1757,7 @@ type JsonRpcSessionTests() =
             | null -> Assert.Fail "expected the decoded-message stream to fault after draining retained notifications"
             | error ->
                 match error.Error with
-                | ProcessError.OutputTooLarge(_, None, None, 3, 0) -> ()
+                | ProcessError.OutputTooLarge(_, None, None, 0, 0) -> ()
                 | other -> Assert.Fail $"expected the same OutputTooLarge terminal error, got {other}"
 
             do! messages.DisposeAsync()

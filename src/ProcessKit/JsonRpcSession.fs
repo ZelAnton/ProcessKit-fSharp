@@ -198,7 +198,9 @@ type private DropCounter() =
 /// **Two backlogs, two knobs.** `messageBacklog` (the third constructor argument, 1024 by default)
 /// bounds the DECODED incoming messages waiting for `MessagesAsync`. Old notifications may be dropped
 /// and are counted in `DroppedMessages`; a peer request is never silently dropped — if it would be
-/// evicted, the conversation ends with `ProcessError.OutputTooLarge`. `Command.StreamBuffer` bounds the
+/// evicted, the conversation ends with `ProcessError.OutputTooLarge`. The decoded-message backlog does
+/// not count a total message or byte volume, so that error carries zero totals (the `ProcessError`
+/// convention for an unreported metric). `Command.StreamBuffer` bounds the
 /// raw frame backlog underneath it, through the `ContentLengthSession` this session owns, and only its
 /// two LOSSLESS full modes apply there: `Backpressure` paces the peer against the router, and `Error`
 /// ends the conversation with `ProcessError.OutputTooLarge` at the cap. The two DROP modes are refused
@@ -271,13 +273,9 @@ type JsonRpcSession
         )
 
     let messageBacklogOverflow () =
-        let totalMessages =
-            if messageBacklog = Int32.MaxValue then
-                Int32.MaxValue
-            else
-                messageBacklog + 1
-
-        ProcessError.OutputTooLarge(program, None, None, totalMessages, 0)
+        // This backlog counts dropped notifications, but not total messages or bytes. Zero is the
+        // ProcessError convention for a metric this producer did not measure.
+        ProcessError.OutputTooLarge(program, None, None, 0, 0)
 
     let parseFailure (detail: string) = ProcessError.Parse(program, detail)
 
