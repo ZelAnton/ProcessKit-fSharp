@@ -237,11 +237,22 @@ executable that `ResolveProgram()` reports; a miss returns its identical
 `ProcessError.NotFound` / `Searched` before `posix_spawnp` runs. ProcessKit also resolves
 an inherited absent or empty process `PATH`, because libc may otherwise apply a default
 system path or search the current directory while `ResolveProgram()` intentionally
-treats that PATH as empty. Unlike Windows, POSIX adds no application/current/system
-directories around `PATH`: the shared resolver checks `PreferLocal`, then the effective
-`PATH`. Only an untouched, non-empty inherited child `PATH` keeps libc's native
-bare-name search; path-form programs, `CurrentDir`, and `Arg0` retain their existing
-behavior ([Platform support → Caveats](platform-support.md#caveats)).
+treats that PATH as empty.
+
+Within a **non-empty** POSIX `PATH`, each empty component means the effective working
+directory at that component's exact position: `:tools` checks the working directory
+before `tools`, `tools:` checks it afterwards, and `tools::other` checks it between the
+two named entries. Non-empty relative entries are anchored to the same directory. For
+`Command.ResolveProgram()` and the corresponding launch, that directory is the command's
+`CurrentDir` when set, otherwise the process's current directory; `Exec.which` uses the
+process's current directory because it resolves the process `PATH`. A wholly empty or
+absent `PATH` still contains no entries and does not imply a current-directory search.
+
+Unlike Windows, POSIX adds no application/current/system directories around `PATH`: the
+shared resolver checks `PreferLocal`, then the effective `PATH`. Only an untouched,
+non-empty inherited child `PATH` keeps libc's native bare-name search; path-form programs,
+`CurrentDir`, and `Arg0` retain their existing behavior
+([Platform support → Caveats](platform-support.md#caveats)).
 
 ### Preferring a project-local tool (`PreferLocal`)
 
