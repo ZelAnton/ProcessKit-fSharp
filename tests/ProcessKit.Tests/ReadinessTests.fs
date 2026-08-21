@@ -676,7 +676,14 @@ type ReadinessTests() =
             let listener, uri, _requestCount = startHttpListener (fun _ -> 200)
 
             try
-                match! runner.StartAsync(lingering (), CancellationToken.None) with
+                // Keep the child alive beyond the readiness budget even when a loaded CI runner delays the probe.
+                let longLived =
+                    if isWindows then
+                        shell "ping 127.0.0.1 -n 31 >NUL"
+                    else
+                        shell "sleep 30"
+
+                match! runner.StartAsync(longLived, CancellationToken.None) with
                 | Error error -> Assert.Fail $"{error}"
                 | Ok running ->
                     use running = running

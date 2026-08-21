@@ -2243,9 +2243,11 @@ type PosixChildPathLaunchTests() =
                 let toolName = "processkit-inherited-empty-path"
 
                 try
-                    let currentTool = writeTool currentDir toolName "CURRENT-DIRECTORY"
+                    writeTool currentDir toolName "CURRENT-DIRECTORY" |> ignore
                     writeTool laterDir toolName "LATER-DIRECTORY" |> ignore
                     Directory.SetCurrentDirectory currentDir
+                    // macOS canonicalizes /var to /private/var here; compare with the cwd spelling the resolver sees.
+                    let expectedCurrentTool = Path.Combine(Directory.GetCurrentDirectory(), toolName)
 
                     for label, path in
                         [ "leading", string Path.PathSeparator + laterDir
@@ -2257,7 +2259,7 @@ type PosixChildPathLaunchTests() =
                         match Exec.which toolName with
                         | Error error ->
                             Assert.Fail $"{label}: Exec.which must resolve the empty component, got {error}"
-                        | Ok resolved -> Assert.That(resolved, Is.EqualTo currentTool, label)
+                        | Ok resolved -> Assert.That(resolved, Is.EqualTo expectedCurrentTool, label)
 
                         let command = Command.create toolName |> Command.timeout (TimeSpan.FromSeconds 30.0)
 
@@ -2265,7 +2267,7 @@ type PosixChildPathLaunchTests() =
                         | Error error ->
                             Assert.Fail
                                 $"{label}: Command.ResolveProgram must resolve the current-directory tool, got {error}"
-                        | Ok resolved -> Assert.That(resolved, Is.EqualTo currentTool, label)
+                        | Ok resolved -> Assert.That(resolved, Is.EqualTo expectedCurrentTool, label)
 
                         match! command.OutputStringAsync() with
                         | Error error ->
