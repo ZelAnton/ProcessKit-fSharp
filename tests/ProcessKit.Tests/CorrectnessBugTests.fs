@@ -2879,7 +2879,6 @@ type CorrectnessBugTests() =
                         Wait = fun () -> waitTcs.Task }
 
                 let running = new RunningProcess(host)
-                let adoptedBefore = PostKillReap.adoptedWaitCount ()
                 let stopwatch = Stopwatch.StartNew()
 
                 running.Kill()
@@ -2894,7 +2893,7 @@ type CorrectnessBugTests() =
                 Assert.That(stopwatch.Elapsed, Is.LessThan(TimeSpan.FromSeconds 5.0))
 
                 Assert.That(
-                    PostKillReap.adoptedWaitCount () - adoptedBefore,
+                    PostKillReap.adoptedWaitCountFor waitTcs.Task,
                     Is.EqualTo 1,
                     "the native wait must be adopted exactly once, never abandoned and never duplicated"
                 )
@@ -2910,12 +2909,13 @@ type CorrectnessBugTests() =
             task {
                 // The ordinary path: the kill lands, the child is reaped at once, and the REAL outcome is
                 // reported — no budget is paid, and no ownership changes hands.
+                let waitTask = Task.FromResult(Outcome.Signalled(Some 9))
+
                 let host =
                     { baseHost (Command.create "prompt-child").Config with
-                        Wait = fun () -> Task.FromResult(Outcome.Signalled(Some 9)) }
+                        Wait = fun () -> waitTask }
 
                 let running = new RunningProcess(host)
-                let adoptedBefore = PostKillReap.adoptedWaitCount ()
 
                 running.Kill()
                 let! outcome = running.WaitAsync()
@@ -2927,7 +2927,7 @@ type CorrectnessBugTests() =
                 )
 
                 Assert.That(
-                    PostKillReap.adoptedWaitCount () - adoptedBefore,
+                    PostKillReap.adoptedWaitCountFor waitTask,
                     Is.Zero,
                     "a synchronously reaped child must not hand ownership to the ledger"
                 )
@@ -2955,7 +2955,6 @@ type CorrectnessBugTests() =
                         Wait = fun () -> waitTcs.Task }
 
                 let running = new RunningProcess(host)
-                let adoptedBefore = PostKillReap.adoptedWaitCount ()
 
                 running.Kill()
                 do! Task.Delay 400 // strictly longer than this fixture's 250ms budget
@@ -2972,7 +2971,7 @@ type CorrectnessBugTests() =
                 )
 
                 Assert.That(
-                    PostKillReap.adoptedWaitCount () - adoptedBefore,
+                    PostKillReap.adoptedWaitCountFor waitTcs.Task,
                     Is.Zero,
                     "nothing was handed over: the wait concluded inside its own window"
                 )
