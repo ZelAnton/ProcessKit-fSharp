@@ -106,7 +106,7 @@ type ServiceCollectionExtensions =
     /// registration is left untouched.
     [<Extension>]
     static member AddProcessKit(services: IServiceCollection) : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
+        ArgumentNullException.ThrowIfNull(services, nameof services)
         services.AddOptions() |> ignore
 
         services.TryAddSingleton<IProcessRunner>(fun provider ->
@@ -120,7 +120,7 @@ type ServiceCollectionExtensions =
     static member AddProcessKit
         (services: IServiceCollection, configure: Action<ProcessKitOptions>)
         : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
+        ArgumentNullException.ThrowIfNull(services, nameof services)
         ArgumentNullException.ThrowIfNull configure
         services.Configure configure |> ignore
         ServiceCollectionExtensions.AddProcessKit services
@@ -134,7 +134,7 @@ type ServiceCollectionExtensions =
     [<RequiresUnreferencedCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a trimmed app.">]
     [<RequiresDynamicCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a NativeAOT app.">]
     static member AddProcessKit(services: IServiceCollection, configuration: IConfiguration) : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
+        ArgumentNullException.ThrowIfNull(services, nameof services)
         ArgumentNullException.ThrowIfNull configuration
         services.Configure<ProcessKitOptions> configuration |> ignore
         ServiceCollectionExtensions.AddProcessKit services
@@ -158,7 +158,7 @@ type ServiceCollectionExtensions =
     static member AddProcessKitClient
         (services: IServiceCollection, name: string, program: string, configure: Func<CliClient, CliClient>)
         : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
+        ArgumentNullException.ThrowIfNull(services, nameof services)
         ArgumentNullException.ThrowIfNull name
         ArgumentNullException.ThrowIfNull program
         ArgumentNullException.ThrowIfNull configure
@@ -197,7 +197,7 @@ type ServiceCollectionExtensions =
     /// `AddProcessKit` when you want a shared group; both use `TryAdd`, so the first wins.
     [<Extension>]
     static member AddProcessKitGroup(services: IServiceCollection) : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
+        ArgumentNullException.ThrowIfNull(services, nameof services)
         services.AddOptions() |> ignore
 
         services.TryAddSingleton<ProcessGroup>(fun _provider ->
@@ -216,7 +216,7 @@ type ServiceCollectionExtensions =
     static member AddProcessKitGroup
         (services: IServiceCollection, configure: Action<ProcessKitOptions>)
         : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
+        ArgumentNullException.ThrowIfNull(services, nameof services)
         ArgumentNullException.ThrowIfNull configure
         services.Configure configure |> ignore
         ServiceCollectionExtensions.AddProcessKitGroup services
