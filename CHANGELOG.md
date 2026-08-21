@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `PtySession` no longer blocks construction while a `Stdin(source)` feeder is delayed by a child that is not reading; `SendAsync`, `SendLineAsync`, and `CloseStdinAsync` now await the feeder before using or closing the interactive pipe.
+- FreeBSD process-reaper signal delivery now reports a successful `PROC_REAP_KILL` that reached only part of a subtree, including the first member that refused the signal, instead of treating it as complete success.
 - `ProcessGroup.UpdateLimits(null)` now throws `ArgumentNullException` with `ParamName = "limits"` before lifecycle, sticky-evidence, or backend state is touched, instead of failing inside limit evidence with `NullReferenceException`.
 - `JsonRpcSession` now refuses requests, notifications, and peer responses that reach the send gate after the session has ended, returning the same terminal error without writing a frame or leaving a request pending.
 - POSIX executable lookup now preserves leading, middle, and trailing empty components in a non-empty `PATH` as the effective current directory at their exact search position, so `Exec.which` matches inherited native `PATH` selection and `Command.ResolveProgram` matches command-specific launches; an absent or wholly empty `PATH` still has no implicit current-directory search.

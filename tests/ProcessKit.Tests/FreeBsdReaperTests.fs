@@ -109,7 +109,28 @@ type ReaperAbiTests() =
         // struct procctl_reaper_kill: int rk_sig; u_int rk_flags; pid_t rk_subtree; u_int rk_killed;
         // pid_t rk_fpid; u_int rk_pad0[15]  ->  5 * 4 + 60 = 80, with rk_fpid at 16.
         Assert.That(Native.FreeBsd.ReaperKillSize, Is.EqualTo 80)
+        Assert.That(Native.FreeBsd.ReaperKillKilledOffset, Is.EqualTo 12)
         Assert.That(Native.FreeBsd.ReaperKillFirstFailingPidOffset, Is.EqualTo 16)
+
+    [<Test>]
+    member _.``a successful PROC_REAP_KILL with rk_fpid identifies a partial delivery``() =
+        match Native.FreeBsd.classifySuccessfulKill 3 404 with
+        | Native.FreeBsd.SubtreeDelivery.PartialDeliveryFailed(killed, firstFailingPid) ->
+            Assert.That(killed, Is.EqualTo 3)
+            Assert.That(firstFailingPid, Is.EqualTo 404)
+        | outcome -> Assert.Fail $"expected a partial delivery, got {outcome}"
+
+        Assert.That(
+            Native.FreeBsd.classifySuccessfulKill 3 -1,
+            Is.EqualTo Native.FreeBsd.SubtreeDelivery.Delivered,
+            "rk_fpid = -1 is FreeBSD's full-delivery sentinel"
+        )
+
+        Assert.That(
+            Native.FreeBsd.classifySuccessfulKill 0 404,
+            Is.EqualTo Native.FreeBsd.SubtreeDelivery.Delivered,
+            "without a positive rk_killed count there is no partial-delivery answer"
+        )
 
     [<Test>]
     member _.``a GETPIDS buffer decodes at the kernel's offsets and its prefix ends at the first unfilled slot``() =
@@ -368,6 +389,32 @@ type FreeBsdReaperTreeTests() =
             Is.True,
             "EINVAL is a malformed REQUEST and is wrong whatever the target's state"
         )
+
+        Assert.That(outcome.AnyDelivered, Is.True)
+
+    [<Test>]
+    member _.``a partial subtree delivery is retained by the sweep while other roots still receive the signal``() =
+        let fake = FakeReaper()
+
+        fake.Reply <-
+            fun root _ ->
+                if root = 202 then
+                    Native.FreeBsd.SubtreeDelivery.PartialDeliveryFailed(2, 404)
+                else
+                    Native.FreeBsd.SubtreeDelivery.Delivered
+
+        let roots: Native.FreeBsd.Root list =
+            [ { Pid = 101; Seq = 0UL }; { Pid = 202; Seq = 1UL }; { Pid = 303; Seq = 2UL } ]
+
+        let outcome = Native.FreeBsd.deliverToRoots fake.Ops 15 roots
+
+        CollectionAssert.AreEqual([| (101, 15); (202, 15); (303, 15) |], fake.Deliveries)
+
+        match outcome.Failure with
+        | Some(Native.FreeBsd.DeliveryFailure.PartialFailure(killed, firstFailingPid)) ->
+            Assert.That(killed, Is.EqualTo 2)
+            Assert.That(firstFailingPid, Is.EqualTo 404)
+        | failure -> Assert.Fail $"expected the partial failure to survive the sweep, got {failure}"
 
         Assert.That(outcome.AnyDelivered, Is.True)
 
@@ -675,6 +722,49 @@ type FreeBsdReaperBackendTests() =
         )
 
     [<Test>]
+    member _.``a partial per-run signal is a typed delivery error``() =
+        let fake = FakeReaper()
+        fake.Tree <- Ok(ReaperFacts.listing [ ReaperFacts.live 101 101; ReaperFacts.live 202 101 ])
+        fake.Reply <- fun _ _ -> Native.FreeBsd.SubtreeDelivery.PartialDeliveryFailed(1, 202)
+        let backend = contained (backendWith fake [ 101 ])
+
+        let spawned: Native.Common.Spawned =
+            { Handle = nativeint 101
+              Stdout = None
+              Stderr = None
+              Stdin = None
+              ExtraFds = []
+              WindowsCtrlGroup = false
+              PtyControl = None }
+
+        match backend.SignalChild(spawned, Signal.Term) with
+        | Ok() -> Assert.Fail "a successful but partial PROC_REAP_KILL must not look like Ok"
+        | Error error ->
+            Assert.That(error.Message, Does.Contain "partial delivery")
+            Assert.That(error.Message, Does.Contain "202")
+
+    [<Test>]
+    member _.``partial whole-tree delivery is surfaced by every result-returning control verb``() =
+        let operations: (string * (IContainmentBackend -> Result<unit, ProcessError>)) list =
+            [ "Signal", fun backend -> backend.Signal Signal.Term
+              "Suspend", fun backend -> backend.Suspend()
+              "Resume", fun backend -> backend.Resume()
+              "KillTree", fun backend -> backend.KillTree()
+              "Signal.Kill", fun backend -> backend.Signal Signal.Kill ]
+
+        for name, operation in operations do
+            let fake = FakeReaper()
+            fake.Tree <- Ok(ReaperFacts.listing [ ReaperFacts.live 101 101 ])
+            fake.Reply <- fun _ _ -> Native.FreeBsd.SubtreeDelivery.PartialDeliveryFailed(1, 202)
+            let backend = contained (backendWith fake [ 101 ])
+
+            match operation backend with
+            | Ok() -> Assert.Fail "partial response hid a failure"
+            | Error error ->
+                Assert.That(error.Message, Does.Contain "partial delivery", name)
+                Assert.That(error.Message, Does.Contain "202", name)
+
+    [<Test>]
     member _.``a per-run signal that only a corpse refused stays a best-effort success``() =
         let fake = FakeReaper()
         // EPERM naming a member the tree reports as a zombie: the harmless "already dead" case, which
@@ -816,10 +906,10 @@ type FreeBsdReaperBackendTests() =
         }
 
     [<Test>]
-    member _.``a soft phase reports Failed only when NOTHING received the signal``() : Task =
+    member _.``a syscall-level soft failure reports Failed only when nothing received the signal``() : Task =
         task {
-            // One subtree refuses (a live member's EPERM), the other receives it. `Failed` is documented as
-            // "the delivery failed for EVERY target", so a partly-delivered sweep must not report it.
+            // One subtree returns a syscall-level refusal (a live member's EPERM), the other receives it.
+            // This mechanism keeps the established "failed for every target" reading for that errno path.
             let fake = FakeReaper()
 
             fake.Tree <- Ok(ReaperFacts.listing [ ReaperFacts.live 101 101; ReaperFacts.live 202 202 ])
@@ -835,4 +925,31 @@ type FreeBsdReaperBackendTests() =
             let! outcome = backend.GracefulKillTree Signal.Term TimeSpan.Zero
 
             Assert.That(outcome.Soft, Is.EqualTo SoftDelivery.Sent)
+        }
+
+    [<Test>]
+    member _.``a soft phase reports a kernel partial delivery as Failed``() : Task =
+        task {
+            let fake = FakeReaper()
+
+            fake.Tree <-
+                Ok(ReaperFacts.listing [ ReaperFacts.live 101 101; ReaperFacts.live 202 202; ReaperFacts.live 303 303 ])
+
+            fake.Reply <-
+                fun root _ ->
+                    if root = 101 then
+                        Native.FreeBsd.SubtreeDelivery.DeliveryFailed(22, "invalid argument", 101)
+                    elif root = 202 then
+                        Native.FreeBsd.SubtreeDelivery.PartialDeliveryFailed(1, 404)
+                    else
+                        Native.FreeBsd.SubtreeDelivery.Delivered
+
+            let backend = contained (backendWith fake [ 101; 202; 303 ])
+            let! outcome = backend.GracefulKillTree Signal.Term TimeSpan.Zero
+
+            Assert.That(
+                outcome.Soft,
+                Is.EqualTo SoftDelivery.Failed,
+                "rk_fpid must survive an earlier syscall failure and a later successful root"
+            )
         }

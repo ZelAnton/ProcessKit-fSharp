@@ -1983,6 +1983,12 @@ type internal ProcessReaperBackend
     let membershipError (message: string) =
         ProcessError.Io $"could not read the process reaper's descendant tree (procctl(PROC_REAP_GETPIDS)): {message}"
 
+    let describeDeliveryFailure (failure: Native.FreeBsd.DeliveryFailure) =
+        match failure with
+        | Native.FreeBsd.DeliveryFailure.SyscallFailure(errno, message, _) -> $"{message} (errno {errno})"
+        | Native.FreeBsd.DeliveryFailure.PartialFailure(killed, firstFailingPid) ->
+            $"partial delivery: {killed} member(s) received the signal, but the first failing member was {firstFailingPid}"
+
     // Deliver `signalNum` to every root this group owns, bracketed by the pruning that makes a stale root
     // safe: the root set is refreshed against the kernel immediately BEFORE the sweep and the targets are
     // taken from it AFTERWARDS, and a root the kernel answers `ESRCH` for during the sweep is released
@@ -2008,10 +2014,13 @@ type internal ProcessReaperBackend
 
         outcome
 
-    let deliverResult (signalNum: int) (describe: int -> string -> string) : Result<unit, ProcessError> =
+    let deliverResult
+        (signalNum: int)
+        (describe: Native.FreeBsd.DeliveryFailure -> string)
+        : Result<unit, ProcessError> =
         match (deliver signalNum).Failure with
         | None -> Ok()
-        | Some(errno, message) -> Error(ProcessError.Io(describe errno message))
+        | Some failure -> Error(ProcessError.Io(describe failure))
 
     // The whole-tree hard kill, shared by `KillTree` and `Signal(Signal.Kill)`. BOTH layers sweep,
     // deliberately: the reaper kill is the one that reaches the whole tree, while the process-group sweep
@@ -2021,8 +2030,8 @@ type internal ProcessReaperBackend
     // `Signal(Int/Term)`, whose signal a child can observe, never does this.
     let killWholeTree () : Result<unit, ProcessError> =
         let reaper =
-            deliverResult (Native.Posix.signalNumber Signal.Kill) (fun errno message ->
-                $"failed to SIGKILL the process reaper's tree (procctl(PROC_REAP_KILL)): {message} (errno {errno})")
+            deliverResult (Native.Posix.signalNumber Signal.Kill) (fun failure ->
+                $"failed to SIGKILL the process reaper's tree (procctl(PROC_REAP_KILL)): {describeDeliveryFailure failure}")
 
         let posix = contained.KillTree()
 
@@ -2122,16 +2131,17 @@ type internal ProcessReaperBackend
                     // own graceful path. The reaper already covers every process `killpg` would reach, plus
                     // the escapees, each exactly once.
                     //
-                    // `SoftDelivery.Failed` means the delivery failed for EVERY target, so it fires only
-                    // when there was an honest failure AND nothing was delivered to anyone. A vacuous sweep
-                    // (every subtree already drained, including an empty group) has neither, so it is
-                    // `Sent` — the same rule the POSIX backend applies.
+                    // A syscall-level failure keeps the existing "every target" rule: it is `Failed` only
+                    // when nothing was delivered. A FreeBSD `rk_fpid` partial response is different: the
+                    // kernel explicitly says that one member refused after others were reached, so it is
+                    // always `Failed`. A vacuous sweep (every subtree already drained, including an empty
+                    // group) has neither, so it is `Sent` — the same rule the POSIX backend applies.
                     let outcome = deliver signalNum
 
-                    if outcome.Failure.IsSome && not outcome.AnyDelivered then
-                        SoftDelivery.Failed
-                    else
-                        SoftDelivery.Sent)
+                    match outcome.Failure with
+                    | Some(Native.FreeBsd.DeliveryFailure.PartialFailure _) -> SoftDelivery.Failed
+                    | Some _ when not outcome.AnyDelivered -> SoftDelivery.Failed
+                    | _ -> SoftDelivery.Sent)
                 (fun () ->
                     // Probe-only: this is the drain check, so it must not prune the tracked root set. An
                     // unreadable listing NEVER guesses "drained" (that would end the grace early and hand
@@ -2156,10 +2166,11 @@ type internal ProcessReaperBackend
                 grace
 
         member _.SoftStopScope() =
-            // `PROC_REAP_KILL` reaches every process in every subtree this group owns, unconditionally and
-            // on every live membership — so this needs no native read at all. It is the STRONGEST form of
-            // `WholeTree` available on any unix: unlike the POSIX process group, whose one documented
-            // escapee is a child that `setsid`s away, nothing here escapes the tree.
+            // `PROC_REAP_KILL` addresses every process in every subtree this group owns on every live
+            // membership — so this needs no native read at all. `WholeTree` describes that target scope,
+            // not delivery: a member can refuse the later call and the result-returning signal verb reports
+            // that partial outcome. Unlike the POSIX process group, whose one documented escapee is a child
+            // that `setsid`s away, nothing here escapes the reaper's target tree.
             SoftStopScope.WholeTree
 
         member _.SignalChild(spawned, signal) =
@@ -2179,14 +2190,24 @@ type internal ProcessReaperBackend
                     | Native.FreeBsd.SubtreeDelivery.SubtreeGone -> Ok()
                     | Native.FreeBsd.SubtreeDelivery.DeliveryFailed(errno, message, firstFailingPid) ->
                         if Native.FreeBsd.isHonestFailure ops errno firstFailingPid then
+                            let failure =
+                                Native.FreeBsd.DeliveryFailure.SyscallFailure(errno, message, firstFailingPid)
+
                             Error(
                                 ProcessError.Io
-                                    $"failed to deliver signal {signalNum} to this run's subtree (procctl(PROC_REAP_KILL)): {message} (errno {errno})"
+                                    $"failed to deliver signal {signalNum} to this run's subtree (procctl(PROC_REAP_KILL)): {describeDeliveryFailure failure}"
                             )
                         else
                             // An `EPERM` against a target that is not a positively live member is the
                             // "already dead" case every unix backend here keeps as a best-effort success.
                             Ok()
+                    | Native.FreeBsd.SubtreeDelivery.PartialDeliveryFailed(killed, firstFailingPid) ->
+                        let failure = Native.FreeBsd.DeliveryFailure.PartialFailure(killed, firstFailingPid)
+
+                        Error(
+                            ProcessError.Io
+                                $"failed to deliver signal {signalNum} to this run's subtree (procctl(PROC_REAP_KILL)): {describeDeliveryFailure failure}"
+                        )
 
         member _.Members() =
             // The WHOLE TREE, not just the tracked group leaders: every live descendant of every child this
@@ -2211,16 +2232,16 @@ type internal ProcessReaperBackend
                 match signal with
                 | Signal.Kill -> killWholeTree ()
                 | _ ->
-                    deliverResult signalNum (fun errno message ->
-                        $"failed to deliver signal {signalNum} to the process reaper's tree (procctl(PROC_REAP_KILL)): {message} (errno {errno})")
+                    deliverResult signalNum (fun failure ->
+                        $"failed to deliver signal {signalNum} to the process reaper's tree (procctl(PROC_REAP_KILL)): {describeDeliveryFailure failure}")
 
         member _.Suspend() =
-            deliverResult Native.Posix.suspendSignalNumber (fun errno message ->
-                $"failed to suspend the process reaper's tree (procctl(PROC_REAP_KILL)): {message} (errno {errno})")
+            deliverResult Native.Posix.suspendSignalNumber (fun failure ->
+                $"failed to suspend the process reaper's tree (procctl(PROC_REAP_KILL)): {describeDeliveryFailure failure}")
 
         member _.Resume() =
-            deliverResult Native.Posix.resumeSignalNumber (fun errno message ->
-                $"failed to resume the process reaper's tree (procctl(PROC_REAP_KILL)): {message} (errno {errno})")
+            deliverResult Native.Posix.resumeSignalNumber (fun failure ->
+                $"failed to resume the process reaper's tree (procctl(PROC_REAP_KILL)): {describeDeliveryFailure failure}")
 
         member _.Stats() =
             // The active count is the WHOLE tree — the exact process count a cgroup or a Job Object would

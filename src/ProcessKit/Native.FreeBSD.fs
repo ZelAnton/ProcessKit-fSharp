@@ -145,6 +145,9 @@ module internal FreeBsd =
     let internal ReaperKillSize = 80
 
     [<Literal>]
+    let internal ReaperKillKilledOffset = 12
+
+    [<Literal>]
     let internal ReaperKillFirstFailingPidOffset = 16
 
     // errno values FreeBSD reports back from these commands. `ESRCH`/`EPERM`/`EINVAL` share their
@@ -221,6 +224,17 @@ module internal FreeBsd =
         /// The listing of a process the kernel says has no descendants at all — complete by construction.
         static member Empty = { Entries = []; Truncated = false }
 
+    /// A failure that `PROC_REAP_KILL` reported after the request was issued.
+    [<RequireQualifiedAccess; NoComparison; NoEquality>]
+    type DeliveryFailure =
+
+        /// The syscall returned an errno without delivering the signal.
+        | SyscallFailure of Errno: int * Message: string * FirstFailingPid: int
+
+        /// The syscall returned success after delivering to some, but not all, members. FreeBSD reports
+        /// this through `rk_killed > 0` together with the first member it could not reach in `rk_fpid`.
+        | PartialFailure of Killed: int * FirstFailingPid: int
+
     /// The outcome of one `PROC_REAP_KILL` aimed at a single subtree.
     [<RequireQualifiedAccess; NoComparison; NoEquality>]
     type SubtreeDelivery =
@@ -232,9 +246,14 @@ module internal FreeBsd =
         /// one positive kernel answer that releases a root (see `pruneRoots`).
         | SubtreeGone
 
-        /// Any other errno. `FirstFailingPid` is the kernel's `rk_fpid`, copied back **even on error**,
-        /// which is what lets the `EPERM` classification name the offending member instead of guessing.
+        /// The syscall returned an errno. `FirstFailingPid` is the kernel's `rk_fpid`, copied back **even
+        /// on error**, which is what lets the `EPERM` classification name the offending member instead of
+        /// guessing.
         | DeliveryFailed of Errno: int * Message: string * FirstFailingPid: int
+
+        /// The syscall returned success after reaching only part of the subtree. `Killed` is the kernel's
+        /// `rk_killed`, while `FirstFailingPid` is its `rk_fpid`.
+        | PartialDeliveryFailed of Killed: int * FirstFailingPid: int
 
     /// One subtree root a group owns: the pid of a child it started, plus the order in which it was
     /// recorded. The sequence number is what lets `pruneRoots` tell a root a concurrent spawn recorded
@@ -367,25 +386,27 @@ module internal FreeBsd =
     [<NoComparison>]
     type SweepOutcome =
         {
-            /// The first honest failure `(errno, message)`, or `None` when the sweep succeeded. Every root
-            /// is still visited before this is returned, so one failing subtree never leaves another
-            /// unsignalled.
-            Failure: (int * string) option
+            /// A partial failure when any subtree reported one; otherwise the first honest syscall-level
+            /// failure, or `None` when the sweep succeeded. Partial failure takes precedence because it
+            /// changes graceful reporting even when another root received the signal. Every root is still
+            /// visited before this is returned, so one failing subtree never leaves another unsignalled.
+            Failure: DeliveryFailure option
 
             /// The roots the kernel answered `ESRCH` for during the sweep: their subtrees drained between
             /// the pre-sweep prune and the delivery, so they are released now rather than at the next read.
             Drained: Root list
 
             /// Whether at least one root's subtree genuinely received the signal — what tells a vacuous
-            /// sweep (everything already gone) from one where delivery failed for every live target, which
-            /// the graceful report's `SoftDelivery.Failed` is defined in terms of.
+            /// sweep (everything already gone) from one where delivery failed for every live target. A
+            /// `PartialDeliveryFailed` also sets this because the kernel confirms that some members were
+            /// reached even though the graceful report must surface the refusal.
             AnyDelivered: bool
         }
 
-    /// Deliver `signalNum` to every root's subtree — the whole tree, each process exactly once, `setsid`
-    /// escapees included. Never short-circuits: a failing subtree must not leave the rest unsignalled.
+    /// Attempt `signalNum` for every root's subtree — the whole target scope, `setsid` escapees included.
+    /// Never short-circuits: a failing subtree must not prevent attempts for the remaining roots.
     let deliverToRoots (ops: ReaperOps) (signalNum: int) (roots: Root list) : SweepOutcome =
-        let mutable failure: (int * string) option = None
+        let mutable failure: DeliveryFailure option = None
         let mutable anyDelivered = false
         let drained = ResizeArray<Root>()
 
@@ -395,7 +416,13 @@ module internal FreeBsd =
             | SubtreeDelivery.SubtreeGone -> drained.Add root
             | SubtreeDelivery.DeliveryFailed(errno, message, firstFailingPid) ->
                 if failure.IsNone && isHonestFailure ops errno firstFailingPid then
-                    failure <- Some(errno, message)
+                    failure <- Some(DeliveryFailure.SyscallFailure(errno, message, firstFailingPid))
+            | SubtreeDelivery.PartialDeliveryFailed(killed, firstFailingPid) ->
+                match failure with
+                | Some(DeliveryFailure.PartialFailure _) -> ()
+                | _ -> failure <- Some(DeliveryFailure.PartialFailure(killed, firstFailingPid))
+
+                anyDelivered <- true
 
         { Failure = failure
           Drained = List.ofSeq drained
@@ -557,6 +584,15 @@ module internal FreeBsd =
     let private errnoText (errno: int) =
         System.ComponentModel.Win32Exception(errno).Message
 
+    /// Decode the fields a successful `PROC_REAP_KILL` writes back into its request buffer. A zero return
+    /// code is not enough to claim full delivery: FreeBSD uses `rk_fpid = -1` to mean every member was
+    /// reached, and otherwise reports a partial refusal alongside the positive `rk_killed` count.
+    let classifySuccessfulKill (killed: int) (firstFailingPid: int) : SubtreeDelivery =
+        if killed > 0 && firstFailingPid <> -1 then
+            SubtreeDelivery.PartialDeliveryFailed(killed, firstFailingPid)
+        else
+            SubtreeDelivery.Delivered
+
     /// Read `PROC_REAP_STATUS`, returning `(flags, descendantCount, reaperPid)`.
     let private reapStatus () : Result<int * int * int, string> =
         let buffer = allocZeroed ReaperStatusSize
@@ -627,8 +663,9 @@ module internal FreeBsd =
         else
             listUsing (fun () -> reapStatus () |> Result.map (fun (_, count, _) -> count)) fillDescendants
 
-    /// Deliver `signalNum` to the subtree rooted at `root` in one call (`PROC_REAP_KILL` +
-    /// `REAPER_KILL_SUBTREE`) — the delivery that reaches a `setsid` escapee `killpg` cannot.
+    /// Request `signalNum` for the subtree rooted at `root` in one call (`PROC_REAP_KILL` +
+    /// `REAPER_KILL_SUBTREE`) — addressing the `setsid` escapee that `killpg` cannot target. The returned
+    /// result preserves partial delivery or refusal.
     let signalSubtree (root: int) (signalNum: int) : SubtreeDelivery =
         if not isFreeBsd then
             SubtreeDelivery.DeliveryFailed(
@@ -645,7 +682,10 @@ module internal FreeBsd =
                 Marshal.WriteInt32(request, 8, root)
 
                 match procctlSelf PROC_REAP_KILL request with
-                | Ok() -> SubtreeDelivery.Delivered
+                | Ok() ->
+                    classifySuccessfulKill
+                        (Marshal.ReadInt32(request, ReaperKillKilledOffset))
+                        (Marshal.ReadInt32(request, ReaperKillFirstFailingPidOffset))
                 | Error errno when errno = ESRCH -> SubtreeDelivery.SubtreeGone
                 | Error errno ->
                     // `rk_fpid` is copied back even on error, so the EPERM classification can name the
