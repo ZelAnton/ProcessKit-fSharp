@@ -33,6 +33,26 @@ public class ProcessErrorAccessorTests
     }
 
     [Test]
+    public void RetryPredicate_with_a_null_Original_has_a_safe_render_and_absent_recursive_accessors()
+    {
+        ProcessError error = ProcessError.NewRetryPredicate("git", null!, "predicate failed");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(error.IsRetryPredicate, Is.True);
+            Assert.That(error.Message,
+                Is.EqualTo("retry predicate for 'git' threw: predicate failed; original attempt: unavailable"));
+            Assert.That(error.ToString(), Is.EqualTo(error.Message));
+            Assert.That(error.Stdout, Is.Null);
+            Assert.That(error.StdoutBytes, Is.Null);
+            Assert.That(error.Stderr, Is.Null);
+            Assert.That(error.Combined, Is.Null);
+            Assert.That(error.Code, Is.Null);
+            Assert.That(error.Signal, Is.Null);
+        });
+    }
+
+    [Test]
     public void StdoutBytes_carries_exact_pre_decode_bytes_for_a_bytes_based_Exit()
     {
         // Invalid UTF-8 (a lone continuation byte) is the whole point: the exact bytes must survive on

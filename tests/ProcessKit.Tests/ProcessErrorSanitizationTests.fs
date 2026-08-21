@@ -337,6 +337,29 @@ type ProcessErrorSanitizationTests() =
         assertDisplaySafe "nested RetryPredicate" (nest 12).Message
 
     [<Test>]
+    member _.``RetryPredicate with a missing Original renders safely and exposes no recursive values``() =
+        let missingOriginal = Unchecked.defaultof<ProcessError>
+        let error = ProcessError.RetryPredicate(hostile, missingOriginal, hugeStream)
+        let message = error.Message
+
+        Assert.That(message, Does.EndWith "original attempt: unavailable")
+        Assert.That(message.Length, Is.LessThan 1200, "the fallback render must stay bounded")
+        Assert.That(error.ToString(), Is.EqualTo message)
+        assertDisplaySafe "RetryPredicate/missing Original" message
+
+        Assert.That(error.Stdout, Is.EqualTo(None: string option))
+        Assert.That(error.StdoutBytes, Is.EqualTo(None: byte[] option))
+        Assert.That(error.Stderr, Is.EqualTo(None: string option))
+        Assert.That(error.Combined, Is.EqualTo(None: string option))
+        Assert.That(error.Code, Is.EqualTo(None: int option))
+        Assert.That(error.Signal, Is.EqualTo(None: int option))
+
+        match error with
+        | ProcessError.RetryPredicate(_, original, _) ->
+            Assert.That(obj.ReferenceEquals(original, null), Is.True, "the public case shape remains unchanged")
+        | other -> Assert.Fail $"expected a RetryPredicate, got {other}"
+
+    [<Test>]
     member _.``the structured fields keep the caller's bytes untouched``() =
         let original = ProcessError.Exit(hostile, 42, hugeStream, hostile)
 
@@ -359,8 +382,17 @@ type ProcessErrorSanitizationTests() =
         let wrapped = ProcessError.RetryPredicate("tool", original, hostile)
         Assert.That(wrapped.Stdout, Is.EqualTo(Some hugeStream))
         Assert.That(wrapped.Stderr, Is.EqualTo(Some hostile))
+        Assert.That(wrapped.Combined, Is.EqualTo(Some(hugeStream + "\n" + hostile)))
         Assert.That(wrapped.Code, Is.EqualTo(Some 42))
+        Assert.That(wrapped.Signal, Is.EqualTo(None: int option))
         Assert.That(wrapped.StdoutBytes, Is.EqualTo(None: byte[] option))
+        Assert.That(wrapped.Message, Does.Contain "exited with code 42")
+
+        let wrappedSignal =
+            ProcessError.RetryPredicate("tool", ProcessError.Signalled("tool", Some 15, "out", "err"), "detail")
+
+        Assert.That(wrappedSignal.Code, Is.EqualTo(None: int option))
+        Assert.That(wrappedSignal.Signal, Is.EqualTo(Some 15))
 
         match wrapped with
         | ProcessError.RetryPredicate(_, inner, detail) ->
