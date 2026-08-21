@@ -994,6 +994,8 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// explicit signal that the container's state is uncertain, so a consumer must not treat the snapshot
     /// as authoritative there — never a silent divergence.
     member this.UpdateLimits(limits: ResourceLimits) : Result<unit, ProcessError> =
+        ArgumentNullException.ThrowIfNull(limits, nameof limits)
+
         this.WhenLive(fun () ->
             // Record every axis THIS request names on the sticky evidence record BEFORE attempting the
             // apply, whether it then succeeds or fails (see `LimitEvidence()`'s own doc comment): neither
