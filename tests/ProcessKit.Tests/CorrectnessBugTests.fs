@@ -1801,6 +1801,108 @@ type CorrectnessBugTests() =
         assertIo "Resume" (backend.Resume())
 
     [<Test>]
+    member _.``atomic cgroup kill thaws and verifies the reusable group before succeeding``() =
+        let writes = ResizeArray<string * string>()
+
+        let writeHook (file: string) (content: string) =
+            let control =
+                if file.EndsWith("cgroup.kill", StringComparison.Ordinal) then
+                    "cgroup.kill"
+                elif file.EndsWith("cgroup.freeze", StringComparison.Ordinal) then
+                    "cgroup.freeze"
+                else
+                    file
+
+            writes.Add(control, content)
+
+        withSyntheticCgroup (Some "1\n") writeHook (fun dir ->
+            match Native.Cgroup.killCgroup dir with
+            | Error detail -> Assert.Fail $"expected atomic kill followed by thaw, got {detail}"
+            | Ok() -> ()
+
+            Assert.That(writes.Count, Is.EqualTo 2, "atomic kill and thaw must perform exactly two control writes")
+            Assert.That(fst writes[0], Is.EqualTo "cgroup.kill")
+            Assert.That(snd writes[0], Is.EqualTo "1")
+            Assert.That(fst writes[1], Is.EqualTo "cgroup.freeze")
+            Assert.That(snd writes[1], Is.EqualTo "0", "a successful atomic kill must be followed by an explicit thaw")
+
+            Assert.That(File.ReadAllText(Path.Combine(dir, "cgroup.freeze")).Trim(), Is.EqualTo "0"))
+
+    [<Test>]
+    member _.``atomic cgroup thaw failure reaches Signal Kill and KillAll, then a later KillAll can recover``() =
+        let mutable allowThaw = false
+
+        let writeHook (file: string) (content: string) =
+            if
+                file.EndsWith("cgroup.freeze", StringComparison.Ordinal)
+                && content = "0"
+                && not allowThaw
+            then
+                raise (UnauthorizedAccessException "thaw remains refused")
+
+        withSyntheticCgroup (Some "1\n") writeHook (fun dir ->
+            let backend: IContainmentBackend = CgroupBackend dir
+
+            let assertKillFailure operation result =
+                match result with
+                | Error(ProcessError.Io message) ->
+                    Assert.That(message, Does.Contain "freeze", $"{operation} must identify the thaw failure")
+                | Error other -> Assert.Fail $"expected ProcessError.Io from {operation}, got {other}"
+                | Ok() -> Assert.Fail $"{operation} falsely reported success for a frozen reusable cgroup"
+
+            assertKillFailure "backend KillTree" (backend.KillTree())
+            Assert.That(File.ReadAllText(Path.Combine(dir, "cgroup.freeze")).Trim(), Is.EqualTo "1")
+
+            let group = ProcessGroup.FromBackend(CgroupBackend dir, ProcessGroupOptions())
+
+            try
+                assertKillFailure "ProcessGroup.Signal Kill" (group.Signal Signal.Kill)
+                assertKillFailure "ProcessGroup.KillAll" (group.KillAll())
+
+                allowThaw <- true
+
+                match group.KillAll() with
+                | Error error -> Assert.Fail $"expected a later KillAll to recover, got {error}"
+                | Ok() -> ()
+
+                Assert.That(File.ReadAllText(Path.Combine(dir, "cgroup.freeze")).Trim(), Is.EqualTo "0")
+            finally
+                (group :> IDisposable).Dispose())
+
+    [<Test>]
+    member _.``HardRelease accepts a cgroup removed during atomic post-kill thaw and remains idempotent``() =
+        let writeHook (file: string) (content: string) =
+            if file.EndsWith("cgroup.freeze", StringComparison.Ordinal) && content = "0" then
+                Directory.Delete(Path.GetFullPath(Path.Combine(file, "..")), true)
+                raise (DirectoryNotFoundException "the killed cgroup was removed before thaw verification")
+
+        withSyntheticCgroup (Some "1\n") writeHook (fun dir ->
+            let backend = CgroupBackend dir
+            let teardown = backend :> IContainmentBackend
+
+            teardown.HardRelease()
+
+            Assert.That(Directory.Exists dir, Is.False, "the synthetic group must disappear after atomic kill")
+
+            Assert.That(
+                backend.RetainedCgroupDetail,
+                Is.EqualTo None,
+                "a removed cgroup is not a retained cleanup failure"
+            )
+
+            Assert.That(backend.DirectoryReclaims, Is.EqualTo 1)
+
+            teardown.HardRelease()
+
+            Assert.That(
+                backend.RetainedCgroupDetail,
+                Is.EqualTo None,
+                "repeat cleanup must keep the removed-group success"
+            )
+
+            Assert.That(backend.DirectoryReclaims, Is.EqualTo 1, "repeat cleanup must not reclaim the path twice"))
+
+    [<Test>]
     member _.``legacy cgroup kill retries a refused first thaw and verifies the resulting state``() =
         let mutable thawAttempts = 0
 

@@ -766,7 +766,7 @@ module internal Cgroup =
     [<Literal>]
     let private ThawRetryDelayMilliseconds = 2
 
-    /// Test-only seam for the legacy kill fallback's cgroup file writes. Production leaves it unset;
+    /// Test-only seam for the cgroup kill path's control-file writes. Production leaves it unset;
     /// fault-injection tests use it to model a kernel/delegation write refusal without depending on
     /// the test runner's effective uid or a real delegated cgroup hierarchy.
     let mutable internal killCgroupWriteTestHook: (string -> string -> unit) option =
@@ -776,7 +776,7 @@ module internal Cgroup =
         killCgroupWriteTestHook |> Option.iter (fun hook -> hook file content)
         File.WriteAllText(file, content)
 
-    /// Thaw the legacy fallback's reusable cgroup and verify the kernel-visible state. A successful
+    /// Thaw a hard-killed reusable cgroup and verify the kernel-visible state. A successful
     /// write is not enough: cgroup.freeze is asynchronous, and a refused write can leave a previously
     /// frozen cgroup unchanged. A missing freezer means the cgroup was removed or the filesystem no
     /// longer exposes the control, so there is no reusable frozen group left to protect. Any other
@@ -819,6 +819,8 @@ module internal Cgroup =
     /// Hard-kill the whole subtree via `cgroup.kill` (kernel >= 5.14) — the atomic, race-free whole-subtree
     /// SIGKILL that also catches a process forked after any membership snapshot. On older kernels (< 5.14,
     /// no `cgroup.kill`) fall back to freezing the tree and running a bounded per-member SIGKILL sweep.
+    /// Both paths explicitly thaw and verify the reusable cgroup before reporting success: `cgroup.kill`
+    /// terminates members inside a frozen cgroup but does not reset `cgroup.freeze` itself.
     ///
     /// That fallback sweep is **identity-safe against pid recycling**: every SIGKILL goes through the same
     /// pin -> reconfirm-membership -> send choke `signalCgroup` uses (`deliverIdentitySafe`), never a raw
@@ -904,7 +906,7 @@ module internal Cgroup =
                 Error $"the identity-safe SIGKILL sweep left the cgroup populated: {message} (errno {errno})"
             | _ -> thawed
         else
-            Ok()
+            thawCgroupAfterKill cgroupPath
 
     /// `killCgroupUsing` wired to the production pidfd primitives.
     let killCgroup (cgroupPath: string) : Result<unit, string> =
