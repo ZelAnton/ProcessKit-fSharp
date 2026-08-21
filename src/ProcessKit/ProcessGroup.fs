@@ -844,19 +844,20 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
             this.WhenLive(fun () -> backend.AdoptByPid pid)
 
     /// Immediately hard-kill every process currently in the group (the honest name for the tree kill —
-    /// no graceful signal). Idempotent; the group stays usable for further spawns. Returns `Result` for
-    /// parity with the other tree-control verbs.
+    /// no graceful signal). Idempotent; after an `Ok` return the group stays usable for further spawns.
+    /// Returns `Result` for parity with the other tree-control verbs.
     ///
-    /// Linux cgroup v2's legacy fallback — a kernel without `cgroup.kill` (< 5.14) — reports
-    /// `ProcessError.Io` in two independent cases. **Thaw**: it cannot verify that the reusable cgroup
-    /// was thawed (`cgroup.freeze` still reports frozen, or cannot be read); an already-unfrozen or
-    /// removed freezer stays a best-effort success. **Delivery**: a member could not be signalled AND
-    /// the cgroup is still populated — or its membership unreadable — once the sweep ends; a cgroup that
-    /// did drain is not reported as a kill failure, because the drain check is the authority on whether
-    /// the tree died. That second case includes a kernel without pidfd (< 5.3), where the identity-safe
-    /// sweep kills nothing at all rather than downgrading to a raw `kill(pid, ...)` that a recycled pid
-    /// could land on an unrelated process. Final disposal remains best-effort — it removes the cgroup
-    /// regardless of either error.
+    /// On Linux cgroup v2, both the atomic `cgroup.kill` path and its legacy per-member fallback explicitly
+    /// thaw and verify the reusable cgroup before returning `Ok`. A freezer that still reports frozen or
+    /// cannot be read returns `ProcessError.Io`; an already-unfrozen or removed freezer remains a
+    /// best-effort success. On a kernel without `cgroup.kill` (< 5.14), the legacy fallback can additionally
+    /// report `ProcessError.Io` when a member could not be signalled AND the cgroup is still populated — or
+    /// its membership unreadable — once the sweep ends. A cgroup that did drain is not reported as a kill
+    /// failure, because the drain check is the authority on whether the tree died. That delivery case
+    /// includes a kernel without pidfd (< 5.3), where the identity-safe sweep kills nothing at all rather
+    /// than downgrading to a raw `kill(pid, ...)` that a recycled pid could land on an unrelated process.
+    /// An error makes no reuse guarantee; final disposal still runs its bounded best-effort drain and
+    /// reclaim attempt, recording a cgroup it could not remove.
     ///
     /// **Windows** reports `ProcessError.Io` when `TerminateJobObject` is REFUSED and the Job still holds
     /// live members (or its accounting cannot be read at all, which is never read as "drained"). A refusal
@@ -934,6 +935,9 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// member — never a silent downgrade to a kill. Delivery is not compliance even on success — a child
     /// may install its own handler or a window may prompt/veto the close. Every other Windows signal
     /// returns `ProcessError.Unsupported`.
+    ///
+    /// On Linux cgroup v2, `Signal.Kill` uses the same reusable hard-kill path as `KillAll`, including its
+    /// verified post-kill thaw and the same `ProcessError.Io` failure terms.
     member this.Signal(signal: Signal) : Result<unit, ProcessError> =
         this.WhenLive(fun () -> backend.Signal signal)
 

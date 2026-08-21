@@ -446,7 +446,7 @@ There are three ways out, from blunt to graceful:
 | Verb | What happens | When to use it |
 |---|---|---|
 | dispose (`use` / `Dispose()` / `DisposeAsync()`) | Immediate **hard kill** of the whole tree, then releases the container | The safety net — always on, even on an exception or early return |
-| `group.KillAll()` | The same hard kill, but the group **stays usable** for further spawns; idempotent | Explicit teardown mid-flight when you want to keep the group |
+| `group.KillAll()` | The same hard kill; after `Ok`, the group **stays usable** for further spawns; idempotent | Explicit teardown mid-flight when you want to keep the group |
 | `group.ShutdownAsync()` / `group.ShutdownAsync(grace)` | **Graceful**: on Unix the configured `Options.StopSignal` → wait the grace window → `SIGKILL` survivors; on Windows the default uses best-effort `WM_CLOSE` → wait → atomic Job kill. Releases the group | A clean service stop |
 | `group.ShutdownReportAsync()` / `group.ShutdownReportAsync(grace)` | The exact same teardown as `ShutdownAsync`, additionally returning a `ShutdownReport` of what it actually observed | A clean service stop where the caller wants to know what actually happened, not just that it finished |
 
@@ -650,11 +650,18 @@ close). The call returns `ProcessError.Unsupported` **only** when the group has
 soft-signal at all — never a silent downgrade to the hard Job kill. A child with no
 window is simply a `WM_CLOSE` no-op, not a regression.
 
-`Signal.Kill` always takes the same atomic whole-tree kill path as
-`KillAll`, so it can't miss a process forked mid-broadcast; other signals are
-a best-effort per-member broadcast against a tree that may be forking at that
-instant. An already-exited member is skipped, and an empty group accepts any
-deliverable signal trivially. On Windows, an undeliverable signal fails fast:
+`Signal.Kill` takes the same hard-kill path, with the same return contract, as
+`KillAll`; other signals are a best-effort per-member broadcast against a tree
+that may be forking at that instant. On Linux cgroup v2, both hard-kill entry
+points explicitly thaw and verify the reusable cgroup after either atomic
+`cgroup.kill` or the legacy per-member fallback. A freezer that still reports
+frozen or cannot be read returns `ProcessError.Io`; an already-unfrozen or
+removed freezer is a best-effort success. Only the legacy fallback can also
+return `ProcessError.Io` for a member-delivery failure that leaves the cgroup
+populated or unreadable. After an error, reuse is not guaranteed; final disposal
+still runs its bounded best-effort drain and reclaim attempt. An already-exited
+member is skipped, and an empty group accepts any deliverable signal trivially.
+On Windows, an undeliverable signal fails fast:
 
 **F#**
 
