@@ -2390,12 +2390,15 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
     interface IProcessRunner with
         member this.CaptureStringAsync(command, cancellationToken) =
+            ArgumentNullException.ThrowIfNull(command, nameof command)
             this.Capture(command, cancellationToken)
 
         member this.CaptureBytesAsync(command, cancellationToken) =
+            ArgumentNullException.ThrowIfNull(command, nameof command)
             this.CaptureBytes(command, cancellationToken)
 
         member this.SpawnAsync(command, cancellationToken) =
+            ArgumentNullException.ThrowIfNull(command, nameof command)
             Task.FromResult(this.Spawn(command, cancellationToken))
 
     interface IDisposable with

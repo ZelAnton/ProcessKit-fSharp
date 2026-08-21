@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using NUnit.Framework;
@@ -137,5 +138,47 @@ public class TestDoublesTests
         var runner = new FaultInjectingRunner(new ScriptedRunner(), 3, FaultInjection.Delegate());
 
         AssertNullCommandRejected(runner, () => runner.InvocationCount);
+    }
+
+    [Test]
+    public void RecordReplayRunner_record_primitives_reject_null_without_delegating_or_writing()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"processkit-null-{Guid.NewGuid():N}.json");
+        var inner = new ScriptedRunner();
+
+        using (var runner = RecordReplayRunner.Record(path, inner))
+        {
+            AssertNullCommandRejected(runner, () => inner.Received.Count);
+        }
+
+        Assert.That(File.Exists(path), Is.False);
+    }
+
+    [Test]
+    public async Task RecordReplayRunner_replay_primitives_reject_null_without_consuming_the_entry()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"processkit-null-{Guid.NewGuid():N}.json");
+        var command = new Command("probe");
+
+        try
+        {
+            using (var recorder = RecordReplayRunner.Record(path, new ScriptedRunner().Fallback(Reply.Ok("ready"))))
+            {
+                var recorded = await ((IProcessRunner)recorder).CaptureStringAsync(command, CancellationToken.None);
+                Assert.That(recorded.IsOk, Is.True);
+                Assert.That(recorder.Save().IsOk, Is.True);
+            }
+
+            using var replayer = RecordReplayRunner.Replay(path).GetValueOrThrow();
+            AssertNullCommandRejected(replayer, () => 0);
+
+            var replayed = await ((IProcessRunner)replayer).CaptureStringAsync(command, CancellationToken.None);
+            Assert.That(replayed.IsOk, Is.True);
+            Assert.That(replayed.ResultValue.Stdout, Is.EqualTo("ready"));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 }
