@@ -6,6 +6,7 @@ open System.Diagnostics
 open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
+open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
 open NUnit.Framework
@@ -129,6 +130,33 @@ type DependencyInjectionTests() =
                 )
             with
             | null -> failwith "Expected AddProcessKitGroup to reject null services."
+            | exceptionThrown -> exceptionThrown
+
+        Assert.That(thrown.ParamName, Is.EqualTo "services")
+
+    [<Test>]
+    member _.``AddProcessKitGroup configuration overload rejects null services``() =
+        let services: IServiceCollection = Unchecked.defaultof<IServiceCollection>
+
+        let configuration: IConfiguration =
+            { new IConfiguration with
+                member _.Item
+                    with get _ = null
+                    and set _ _ = ()
+
+                member _.GetChildren() = Seq.empty
+                member _.GetReloadToken() = Unchecked.defaultof<_>
+                member _.GetSection _ = Unchecked.defaultof<_> }
+
+        let thrown =
+            match
+                Assert.Throws<ArgumentNullException>(
+                    Action(fun () ->
+                        ServiceCollectionExtensions.AddProcessKitGroup(services, configuration)
+                        |> ignore)
+                )
+            with
+            | null -> failwith "Expected the AddProcessKitGroup configuration overload to reject null services."
             | exceptionThrown -> exceptionThrown
 
         Assert.That(thrown.ParamName, Is.EqualTo "services")
