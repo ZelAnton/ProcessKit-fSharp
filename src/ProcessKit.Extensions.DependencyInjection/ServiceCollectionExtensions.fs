@@ -230,7 +230,7 @@ type ServiceCollectionExtensions =
     [<RequiresUnreferencedCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a trimmed app.">]
     [<RequiresDynamicCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a NativeAOT app.">]
     static member AddProcessKitGroup(services: IServiceCollection, configuration: IConfiguration) : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
+        ArgumentNullException.ThrowIfNull(services, nameof services)
         ArgumentNullException.ThrowIfNull configuration
         services.Configure<ProcessKitOptions> configuration |> ignore
         ServiceCollectionExtensions.AddProcessKitGroup services
