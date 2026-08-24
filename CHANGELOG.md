@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [2.12.0] - 2026-08-24
+
+### Added
 - `Command.CancelGrace(grace)` / `Command.CancelSignal(signal)` (mirrors: `Command.cancelGrace` / `Command.cancelSignal`) make a **cancellation** graceful: when the token that cancels a run fires, its tree is sent the chosen soft signal (default `Signal.Term`), given up to `grace` to leave on its own, and only then hard-killed — the cancellation twin of `TimeoutGrace`/`StopSignal`, for the "one shared token, cancelled on Ctrl-C" shutdown where every child would otherwise be killed outright. Opt-in and off by default: without it a cancellation still hard-kills at once, unchanged. The outcome never changes either way — a cancelled run still reports `ProcessError.Cancelled`, whether the child left on the soft signal or was killed after the grace. It is independent of `Timeout`/`TimeoutGrace`/`StopSignal` (neither pair gap-fills the other, and it needs no deadline of its own) and applies to every cancellation path a run has: the completion verbs through any runner, a run through a shared `ProcessGroup`, a supervised incarnation, and a whole chain cancelled via `Pipeline.CancelOn` (set it on stage 0, which owns the pipeline-wide control configuration; a later stage is rejected with `ArgumentException`). Windows keeps the documented best-effort soft phase (`WM_CLOSE` / opt-in CTRL+BREAK) before the Job kill and refuses a non-default `CancelSignal` at spawn with `ProcessError.Unsupported`, exactly as `StopSignal` does; `LaunchDetached` refuses `CancelGrace` for the same reason it refuses `TimeoutGrace`. See `docs/timeouts-and-cancellation.md`.
 - `Supervisor.Events(capacity)` opts a supervision session in to a live lifecycle **event stream**: `SupervisionSession.EventsAsync()` returns an `IAsyncEnumerable<SupervisionEvent>` reporting every incarnation start and outcome, launch-failure class, scheduled restart (with its `RestartCause`), storm pause, health-check verdict, give-up decision, and the terminal reason, on identical terms for a real runner and a capture-only test double. Read `SupervisionEvent.Kind` (a version-safe enum) or its stable `Name` identifier (`incarnation_started`, `restart_scheduled`, …); events carry lifecycle facts only — never argv, environment values, captured output, or an error message, only its coarse `FailureKind`. Off by default and purely additive: the `OnRestart`/`OnStormPause` callbacks, `Status`, and every supervision decision are unchanged, and a supervisor without the opt-in allocates nothing. The buffer is bounded and never applies backpressure to supervision — a consumer that falls behind makes the *oldest* unread events drop, each gap reported in band as a `SupervisionEventKind.EventsDropped` event with the exact count and totalled by `SupervisionSession.DroppedEventCount`. See `docs/supervision.md`.
 - `ReportJson` — an opt-in, AOT-safe `System.Text.Json` serializer for `Outcome`, `ProcessResult<string>`/`ProcessResult<byte[]>`, `ProcessGroupStats`, `RunProfile`, and `MemberInfo` as self-describing JSONL report lines: a stable `"kind"` machine identifier per shape (never a raw enum ordinal), an explicit `null` for every metric the platform or run could not report, and no captured stdout/stderr/argv/environment value on the wire. Reach it through the `ToReportJson()` extension methods or `ReportJson`'s hand-built `JsonTypeInfo<'T>` properties; see `docs/jsonl-reports.md` for the schema, versioning policy, and C#/F# consumer examples.
@@ -688,7 +699,8 @@ new library that shares the name and problem domain, not an in-place upgrade of 
 - POSIX: the SIGCHLD dispatch callback no longer blocks on a `Thread.Sleep` spin while resolving a reap race against a concurrent `reapLeader` (group teardown) — the same bounded grace period now runs on the thread pool instead of the shared signal-dispatch thread, so it can no longer delay reaping every other pending child. A race that genuinely can't be resolved within the grace period now reports `Outcome.Unobserved` rather than a fabricated clean exit; the far more common case — the concurrent reap actually landing the real status — is unaffected.
 - Linux cgroup v2: a child that cannot be migrated into the cgroup (the write to `cgroup.procs` fails) is now killed and reaped, and the spawn fails with `ProcessError.ResourceLimit`, instead of being silently left to run in the parent cgroup entirely outside the requested resource limits. The `Mechanism.CgroupV2` / `ProcessGroup.Create` docs now also state the spawn→migrate window honestly: the limits apply to the child and every descendant it forks *after* migration, while a grandchild forked in the brief window before the migration write completes stays in the parent cgroup — still reaped by kill-on-drop teardown, but outside the resource limits.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.11.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.12.0...HEAD
+[2.12.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.11.0...v2.12.0
 [2.11.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.10.0...v2.11.0
 [2.10.0]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.9.1...v2.10.0
 [2.9.1]: https://github.com/ZelAnton/ProcessKit-fSharp/compare/v2.9.0...v2.9.1
