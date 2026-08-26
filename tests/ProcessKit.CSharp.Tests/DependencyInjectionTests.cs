@@ -23,6 +23,12 @@ namespace ProcessKit.CSharp.Tests;
 [TestFixture]
 public class DependencyInjectionTests
 {
+    private static void AssertNullParameter(string expected, Action call)
+    {
+        var exception = Assert.Throws<ArgumentNullException>(call);
+        Assert.That(exception!.ParamName, Is.EqualTo(expected));
+    }
+
     private sealed class SingleValueConfiguration(string key, string? value) : IConfiguration
     {
         private readonly IConfigurationSection section = new SingleValueConfigurationSection(key, value);
@@ -155,6 +161,37 @@ public class DependencyInjectionTests
             () => provider.GetRequiredKeyedService<CliClient>("git"));
 
         Assert.That(exception!.ParamName, Is.EqualTo("configure"));
+    }
+
+    [Test]
+    public void DI_extension_null_guards_preserve_their_public_parameter_names()
+    {
+        var services = new ServiceCollection();
+
+        AssertNullParameter(
+            "services",
+            () => ServiceCollectionExtensions.AddProcessKit(null!));
+        AssertNullParameter(
+            "configure",
+            () => services.AddProcessKit((Action<ProcessKitOptions>)null!));
+        AssertNullParameter(
+            "configuration",
+            () => services.AddProcessKit((IConfiguration)null!));
+        AssertNullParameter(
+            "name",
+            () => services.AddProcessKitClient(null!, "tool", client => client));
+        AssertNullParameter(
+            "program",
+            () => services.AddProcessKitClient("tool", null!, client => client));
+        AssertNullParameter(
+            "configure",
+            () => services.AddProcessKitClient("tool", "tool", (Func<CliClient, CliClient>)null!));
+        AssertNullParameter(
+            "configure",
+            () => services.AddProcessKitGroup((Action<ProcessKitOptions>)null!));
+        AssertNullParameter(
+            "configuration",
+            () => services.AddProcessKitGroup((IConfiguration)null!));
     }
 
     [Test]

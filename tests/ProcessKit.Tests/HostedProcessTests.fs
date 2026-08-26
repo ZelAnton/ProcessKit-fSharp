@@ -370,6 +370,92 @@ type HostedProcessTests() =
     let startRegisteredService name command configure =
         startRegisteredServiceWithRunner name command configure None
 
+    let assertNullParameter (caseName: string) (expected: string) (call: unit -> unit) =
+        let thrown =
+            match Assert.Throws<ArgumentNullException>(Action call) with
+            | null -> failwith $"Expected {caseName} to reject a null {expected}."
+            | exceptionThrown -> exceptionThrown
+
+        Assert.That(thrown.ParamName, Is.EqualTo expected, caseName)
+
+    [<Test>]
+    member _.``Hosting extension null guards preserve their public parameter names``() =
+        let services = ServiceCollection() :> IServiceCollection
+        let command = Command.create "worker"
+        let configureSupervisor = Func<Supervisor, Supervisor>(id)
+
+        let calls: (string * string * (unit -> unit)) list =
+            [ "AddProcessKitHostedProcess services",
+              "services",
+              (fun () ->
+                  HostedServiceCollectionExtensions.AddProcessKitHostedProcess(
+                      Unchecked.defaultof<IServiceCollection>,
+                      "worker",
+                      command,
+                      configureSupervisor
+                  )
+                  |> ignore)
+              "AddProcessKitHostedProcess name",
+              "name",
+              (fun () ->
+                  HostedServiceCollectionExtensions.AddProcessKitHostedProcess(
+                      services,
+                      Unchecked.defaultof<string>,
+                      command,
+                      configureSupervisor
+                  )
+                  |> ignore)
+              "AddProcessKitHostedProcess command",
+              "command",
+              (fun () ->
+                  HostedServiceCollectionExtensions.AddProcessKitHostedProcess(
+                      services,
+                      "worker",
+                      Unchecked.defaultof<Command>,
+                      configureSupervisor
+                  )
+                  |> ignore)
+              "AddProcessKitHostedProcess configureSupervisor",
+              "configureSupervisor",
+              (fun () ->
+                  HostedServiceCollectionExtensions.AddProcessKitHostedProcess(
+                      services,
+                      "worker",
+                      command,
+                      Unchecked.defaultof<Func<Supervisor, Supervisor>>
+                  )
+                  |> ignore)
+              "ConfigureProcessKitHostedProcess services",
+              "services",
+              (fun () ->
+                  HostedServiceCollectionExtensions.ConfigureProcessKitHostedProcess(
+                      Unchecked.defaultof<IServiceCollection>,
+                      "worker",
+                      Action<HostedProcessOptions>(ignore)
+                  )
+                  |> ignore)
+              "ConfigureProcessKitHostedProcess name",
+              "name",
+              (fun () ->
+                  HostedServiceCollectionExtensions.ConfigureProcessKitHostedProcess(
+                      services,
+                      Unchecked.defaultof<string>,
+                      Action<HostedProcessOptions>(ignore)
+                  )
+                  |> ignore)
+              "ConfigureProcessKitHostedProcess configure",
+              "configure",
+              (fun () ->
+                  HostedServiceCollectionExtensions.ConfigureProcessKitHostedProcess(
+                      services,
+                      "worker",
+                      Unchecked.defaultof<Action<HostedProcessOptions>>
+                  )
+                  |> ignore) ]
+
+        for caseName, expected, call in calls do
+            assertNullParameter caseName expected call
+
     [<Test>]
     member _.``StartAsync launches supervisor without waiting for the child to exit``() : Task =
         task {

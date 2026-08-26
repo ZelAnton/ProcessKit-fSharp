@@ -62,6 +62,32 @@ type HostedProcessHealthCheckTests() =
         let healthCheck = provider.GetRequiredKeyedService<HostedProcessHealthCheck> name
         provider, hosted, service, healthCheck :> IHealthCheck
 
+    let assertNullParameter (caseName: string) (expected: string) (call: unit -> unit) =
+        let thrown =
+            match Assert.Throws<ArgumentNullException>(Action call) with
+            | null -> failwith $"Expected {caseName} to reject a null {expected}."
+            | exceptionThrown -> exceptionThrown
+
+        Assert.That(thrown.ParamName, Is.EqualTo expected, caseName)
+
+    [<Test>]
+    member _.``Hosted-process health-check extension preserves its public null parameter names``() =
+        let services = ServiceCollection() :> IServiceCollection
+
+        assertNullParameter "services" "services" (fun () ->
+            HostedServiceCollectionExtensions.AddProcessKitHostedProcessHealthCheck(
+                Unchecked.defaultof<IServiceCollection>,
+                "worker"
+            )
+            |> ignore)
+
+        assertNullParameter "name" "name" (fun () ->
+            HostedServiceCollectionExtensions.AddProcessKitHostedProcessHealthCheck(
+                services,
+                Unchecked.defaultof<string>
+            )
+            |> ignore)
+
     [<Test>]
     member _.``AddProcessKitHostedProcessHealthCheck registers a keyed IHealthCheck resolvable by the same name``() =
         let services = ServiceCollection()
