@@ -40,10 +40,13 @@ type DelegatingProcessRunner(inner: IProcessRunner) =
 
     interface IProcessRunner with
         member this.CaptureStringAsync(command, cancellationToken) =
+            ArgumentNullException.ThrowIfNull(command, nameof command)
             this.CaptureStringAsync(command, cancellationToken)
 
         member this.CaptureBytesAsync(command, cancellationToken) =
+            ArgumentNullException.ThrowIfNull(command, nameof command)
             this.CaptureBytesAsync(command, cancellationToken)
 
         member this.SpawnAsync(command, cancellationToken) =
+            ArgumentNullException.ThrowIfNull(command, nameof command)
             this.SpawnAsync(command, cancellationToken)

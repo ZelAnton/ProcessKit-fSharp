@@ -9,14 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Fixed the `AddProcessKitGroup` configuration overload to report `services` as the null argument.
+- Runners registered by `AddProcessKit` and `AddProcessKitGroup` now reject a null command synchronously with `ArgumentNullException` naming `command` before applying defaults, logging, cancellation, or invoking the underlying runner.
 
 ### Added
 -
 
 ### Changed
--
-
-### Fixed
 -
 
 ## [2.12.0] - 2026-08-24
