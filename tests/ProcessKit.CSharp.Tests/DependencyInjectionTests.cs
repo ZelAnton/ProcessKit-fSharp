@@ -122,17 +122,39 @@ public class DependencyInjectionTests
     public async Task AddProcessKitClient_registers_a_keyed_CliClient_backed_by_the_container_runner()
     {
         var services = new ServiceCollection();
-        services.AddSingleton<IProcessRunner>(new ScriptedRunner().On(["git", "status"], Reply.Ok("clean\n")));
+        var scripted = new ScriptedRunner().On(["git", "status"], Reply.Ok("clean\n"));
+        services.AddSingleton<IProcessRunner>(scripted);
         services.AddProcessKit();
-        services.AddProcessKitClient("git", "git");
+        services.AddProcessKitClient(
+            "git",
+            "git",
+            client => client.WithDefaults(command => command.CurrentDir("/repo")));
 
         await using var provider = services.BuildServiceProvider();
         var git = provider.GetRequiredKeyedService<CliClient>("git");
+
+        Assert.That(git.Command(["status"]).Program, Is.EqualTo("git"));
+        Assert.That(git.Command(["status"]).WorkingDirectory!.Value, Is.EqualTo("/repo"));
+        Assert.That(git.Runner, Is.SameAs(scripted));
 
         var result = await git.RunAsync(["status"]);
 
         Assert.That(result.IsOk, Is.True);
         Assert.That(result.ResultValue, Is.EqualTo("clean"));
+    }
+
+    [Test]
+    public void AddProcessKitClient_rejects_a_null_configure_result_when_the_keyed_client_is_resolved()
+    {
+        var services = new ServiceCollection();
+        services.AddProcessKitClient("git", "git", _ => null!);
+
+        using var provider = services.BuildServiceProvider();
+
+        var exception = Assert.Throws<ArgumentNullException>(
+            () => provider.GetRequiredKeyedService<CliClient>("git"));
+
+        Assert.That(exception!.ParamName, Is.EqualTo("configure"));
     }
 
     [Test]
