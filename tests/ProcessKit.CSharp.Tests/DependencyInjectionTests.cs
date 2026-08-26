@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Primitives;
 using NUnit.Framework;
@@ -80,6 +81,41 @@ public class DependencyInjectionTests
 
         Assert.That(result.IsOk, Is.True);
         Assert.That(result.ResultValue, Is.EqualTo("hermetic"));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void DI_resolved_runner_rejects_null_commands_synchronously(bool groupBacked)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<Microsoft.Extensions.Logging.ILoggerFactory>(NullLoggerFactory.Instance);
+
+        if (groupBacked)
+        {
+            services.AddProcessKitGroup(options => options.DefaultTimeout = TimeSpan.FromSeconds(30));
+        }
+        else
+        {
+            services.AddProcessKit(options => options.DefaultTimeout = TimeSpan.FromSeconds(30));
+        }
+
+        using var provider = services.BuildServiceProvider();
+        var runner = provider.GetRequiredService<IProcessRunner>();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Func<Task>[] calls =
+        [
+            () => runner.CaptureStringAsync(null!, cancellation.Token),
+            () => runner.CaptureBytesAsync(null!, cancellation.Token),
+            () => runner.SpawnAsync(null!, cancellation.Token),
+        ];
+
+        foreach (var call in calls)
+        {
+            var exception = Assert.Throws<ArgumentNullException>(() => _ = call());
+            Assert.That(exception!.ParamName, Is.EqualTo("command"));
+        }
     }
 
     [Test]

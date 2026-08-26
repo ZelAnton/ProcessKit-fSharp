@@ -17,19 +17,23 @@ open ProcessKit.Extensions.DependencyInjection
 /// defaults a decorating runner applied.
 type private DiCapturingRunner() =
     member val Last: Command option = None with get, set
+    member val Calls = 0 with get, private set
 
     interface IProcessRunner with
         member this.CaptureStringAsync(command, _cancellationToken) =
+            this.Calls <- this.Calls + 1
             this.Last <- Some command
 
             Task.FromResult(
                 Ok(ProcessResult<string>(command.Program, "", "", Outcome.Exited 0, TimeSpan.Zero, false, [ 0 ]))
             )
 
-        member _.CaptureBytesAsync(_command, _cancellationToken) =
+        member this.CaptureBytesAsync(_command, _cancellationToken) =
+            this.Calls <- this.Calls + 1
             Task.FromResult(Error(ProcessError.Unsupported "n/a"))
 
-        member _.SpawnAsync(_command, _cancellationToken) =
+        member this.SpawnAsync(_command, _cancellationToken) =
+            this.Calls <- this.Calls + 1
             Task.FromResult(Error(ProcessError.Unsupported "n/a"))
 
 type private DiCapturingLogger() =
@@ -69,6 +73,24 @@ type DependencyInjectionTests() =
         else
             shell "sleep 20"
 
+    let assertNullCommandRejected (runner: IProcessRunner) =
+        let command: Command = Unchecked.defaultof<Command>
+        use cancellation = new CancellationTokenSource()
+        cancellation.Cancel()
+
+        let calls =
+            [ "CaptureStringAsync", (fun () -> runner.CaptureStringAsync(command, cancellation.Token) |> ignore)
+              "CaptureBytesAsync", (fun () -> runner.CaptureBytesAsync(command, cancellation.Token) |> ignore)
+              "SpawnAsync", (fun () -> runner.SpawnAsync(command, cancellation.Token) |> ignore) ]
+
+        for verb, call in calls do
+            let thrown =
+                match Assert.Throws<ArgumentNullException>(Action call) with
+                | null -> failwith $"Expected {verb} to reject a null command."
+                | exceptionThrown -> exceptionThrown
+
+            Assert.That(thrown.ParamName, Is.EqualTo "command", verb)
+
     /// Poll until `pid` is no longer a live process (reaped/exited), or the deadline elapses.
     let waitProcessGone (pid: int) (deadlineMs: int) : Task<bool> =
         task {
@@ -101,6 +123,63 @@ type DependencyInjectionTests() =
             match! Runner.run runner CancellationToken.None (shell "echo injected") with
             | Ok output -> Assert.That(output, Does.Contain "injected")
             | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``DI registrations reject null commands before decorators or cancellation``() =
+        for groupBacked in [ false; true ] do
+            for loggerAware in [ false; true ] do
+                let services = ServiceCollection()
+
+                if loggerAware then
+                    services.AddSingleton<ILoggerFactory>(new FakeLoggerFactory(DiCapturingLogger()))
+                    |> ignore
+
+                if groupBacked then
+                    services.AddProcessKitGroup(fun options ->
+                        options.DefaultTimeout <- Nullable(TimeSpan.FromSeconds 30.0))
+                    |> ignore
+                else
+                    services.AddProcessKit(fun options -> options.DefaultTimeout <- Nullable(TimeSpan.FromSeconds 30.0))
+                    |> ignore
+
+                use provider = services.BuildServiceProvider()
+                let runner = provider.GetRequiredService<IProcessRunner>()
+                assertNullCommandRejected runner
+
+    [<Test>]
+    member _.``the DI decorator chain rejects null commands without touching its inner runner``() : Task =
+        task {
+            let inner = DiCapturingRunner()
+            let services = ServiceCollection()
+
+            services
+                .AddOptions<ProcessKitOptions>()
+                .Configure(fun options -> options.DefaultTimeout <- Nullable(TimeSpan.FromSeconds 30.0))
+            |> ignore
+
+            services.AddSingleton<ILoggerFactory>(new FakeLoggerFactory(DiCapturingLogger()))
+            |> ignore
+
+            services.AddSingleton<IProcessRunner>(fun provider ->
+                DiInternals.buildRunner provider (inner :> IProcessRunner))
+            |> ignore
+
+            use provider = services.BuildServiceProvider()
+            let runner = provider.GetRequiredService<IProcessRunner>()
+
+            assertNullCommandRejected runner
+            Assert.That(inner.Calls, Is.Zero)
+            Assert.That(inner.Last, Is.EqualTo None)
+
+            match! runner.CaptureStringAsync(Command.create "tool", CancellationToken.None) with
+            | Error error -> Assert.Fail $"expected a successful inner call, got {error}"
+            | Ok _ -> ()
+
+            Assert.That(inner.Calls, Is.EqualTo 1)
+            Assert.That(inner.Last.Value.Config.Timeout, Is.EqualTo(Some(TimeSpan.FromSeconds 30.0)))
+            Assert.That(inner.Last.Value.Config.Logger.IsSome, Is.True)
         }
         :> Task
 

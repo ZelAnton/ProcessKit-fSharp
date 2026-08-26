@@ -1074,7 +1074,10 @@ and OpenTelemetry-ready **metrics** (`Meter` `ProcessKitDiagnostics.MeterName`).
 environment are never logged, traced, or tagged** — only the program name and non-secret facts. The
 separate `ProcessKit.Extensions.DependencyInjection` package registers an `IProcessRunner` for
 `Microsoft.Extensions.DependencyInjection` consumers with `AddProcessKit()` (logger-aware when the
-container has an `ILoggerFactory`).
+container has an `ILoggerFactory`). The runners registered by `AddProcessKit()` and
+`AddProcessKitGroup()` reject a null `Command` synchronously with `ArgumentNullException`
+(`ParamName = "command"`) before applying defaults or logging and before delegating to their
+underlying runner.
 
 *Deeper: [Observability](docs/observability.md).*
 
