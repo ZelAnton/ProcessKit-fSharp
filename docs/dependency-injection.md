@@ -57,7 +57,9 @@ services.AddProcessKitClient("git", "git",
 Register a keyed `CliClient` per external tool, so an app injects "the git client" or "the ffmpeg client"
 by role. Each client runs through the container's registered `IProcessRunner` (so it is logger-aware and
 honours a shared group or a test runner), and `configure` applies shared defaults via the `CliClient`
-builder.
+builder. The callback runs when the keyed client is resolved and must return a non-null `CliClient`; a
+null result is rejected with `ArgumentNullException` naming `configure` instead of being reported as a
+missing keyed registration.
 
 ```csharp
 services.AddProcessKit();

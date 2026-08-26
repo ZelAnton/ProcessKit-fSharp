@@ -1077,7 +1077,8 @@ separate `ProcessKit.Extensions.DependencyInjection` package registers an `IProc
 container has an `ILoggerFactory`). The runners registered by `AddProcessKit()` and
 `AddProcessKitGroup()` reject a null `Command` synchronously with `ArgumentNullException`
 (`ParamName = "command"`) before applying defaults or logging and before delegating to their
-underlying runner.
+underlying runner. A keyed `AddProcessKitClient(..., configure)` callback must likewise return a
+non-null `CliClient`; resolution rejects a null result with `ArgumentNullException` naming `configure`.
 
 *Deeper: [Observability](docs/observability.md).*
 

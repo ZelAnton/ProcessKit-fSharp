@@ -143,7 +143,9 @@ type ServiceCollectionExtensions =
     /// (`[FromKeyedServices("git")] CliClient git`). The client runs through the container's registered
     /// `IProcessRunner` when present (so it is logger-aware and honours a shared group / test runner),
     /// otherwise a default `JobRunner`. `configure` applies shared defaults via the `CliClient` builder
-    /// (`WithDefaults` — timeout, working directory, environment, encoding, ok-codes, …).
+    /// (`WithDefaults` — timeout, working directory, environment, encoding, ok-codes, …). It runs when
+    /// the keyed client is resolved and must return a non-null `CliClient`; a null result throws
+    /// `ArgumentNullException` naming `configure`.
     ///
     /// The `name` must be unique across `AddProcessKitClient` calls on this `IServiceCollection`.
     /// Registering a second client under a name already in use throws `InvalidOperationException`
@@ -177,7 +179,9 @@ type ServiceCollectionExtensions =
                     | null -> JobRunner() :> IProcessRunner
                     | existing -> existing
 
-                configure.Invoke(CliClient(program).WithRunner runner))
+                let client = configure.Invoke(CliClient(program).WithRunner runner)
+                ArgumentNullException.ThrowIfNull(client, nameof configure)
+                client)
         )
 
         services

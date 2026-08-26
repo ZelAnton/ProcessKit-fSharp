@@ -376,15 +376,24 @@ type DependencyInjectionTests() =
 
             let services = ServiceCollection()
             services.AddSingleton<IProcessRunner>(scripted) |> ignore
-            services.AddProcessKitClient("git", "git") |> ignore
+
+            services.AddProcessKitClient(
+                "git",
+                "git",
+                fun client -> client.WithDefaults(fun command -> command.CurrentDir "/repo")
+            )
+            |> ignore
+
             services.AddProcessKitClient("ffmpeg", "ffmpeg") |> ignore
             use provider = services.BuildServiceProvider()
 
             let git = provider.GetRequiredKeyedService<CliClient> "git"
             let ffmpeg = provider.GetRequiredKeyedService<CliClient> "ffmpeg"
 
-            // Distinct programs.
+            // The configured client preserves its program, defaults, and container runner.
             Assert.That(git.Command([ "status" ]).Program, Is.EqualTo "git")
+            Assert.That(git.Command([ "status" ]).WorkingDirectory, Is.EqualTo(Some "/repo"))
+            Assert.That(git.Runner, Is.SameAs scripted)
             Assert.That(ffmpeg.Command([ "-version" ]).Program, Is.EqualTo "ffmpeg")
 
             // The git client routes through the injected scripted runner (hermetic).
@@ -393,6 +402,26 @@ type DependencyInjectionTests() =
             | Error error -> Assert.Fail $"{error}"
         }
         :> Task
+
+    [<Test>]
+    member _.``A client configure callback returning null is rejected when the keyed client is resolved``() =
+        let services = ServiceCollection()
+
+        services.AddProcessKitClient("git", "git", fun _ -> Unchecked.defaultof<CliClient>)
+        |> ignore
+
+        use provider = services.BuildServiceProvider()
+
+        let thrown =
+            match
+                Assert.Throws<ArgumentNullException>(
+                    Action(fun () -> provider.GetRequiredKeyedService<CliClient> "git" |> ignore)
+                )
+            with
+            | null -> failwith "Expected a null configured client to be rejected."
+            | exceptionThrown -> exceptionThrown
+
+        Assert.That(thrown.ParamName, Is.EqualTo "configure")
 
     [<Test>]
     member _.``A duplicate client name is rejected instead of silently dropping the second program``() =
