@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Public core and Testing null checks now report the rejected signature parameter in `ArgumentNullException.ParamName` while preserving validation order.
 - DI and Hosting registration extensions now preserve each null argument's public parameter name in `ArgumentNullException.ParamName`.
 - Fixed the `AddProcessKitGroup` configuration overload to report `services` as the null argument.
 - Runners registered by `AddProcessKit` and `AddProcessKitGroup` now reject a null command synchronously with `ArgumentNullException` naming `command` before applying defaults, logging, cancellation, or invoking the underlying runner.

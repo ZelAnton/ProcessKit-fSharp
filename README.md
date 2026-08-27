@@ -251,6 +251,10 @@ record-replay `RecordReplayRunner`, referenced only from test projects) and the
 | Observability — logging, tracing & metrics ([guide](docs/observability.md)) | `Command.Logger`, `ProcessKitDiagnostics` (`ActivitySource` / `Meter`) |
 | Dependency-injection wiring | `ProcessKit.Extensions.DependencyInjection` (separate package) |
 
+Public core and `ProcessKit.Testing` APIs that reject a required reference argument with
+`ArgumentNullException` report the signature name in `ParamName`. Multi-argument entry points keep
+their existing validation order, so the first invalid argument remains deterministic for C# callers.
+
 On Windows, `Command.WindowsRawArg` is an explicit escape hatch for trusted fixed fragments required
 by non-MSVCRT parsers. Ordinary arguments are still quoted first; raw fragments are appended verbatim,
 are rejected on POSIX and for automatically wrapped `.cmd`/`.bat` targets, and must never contain

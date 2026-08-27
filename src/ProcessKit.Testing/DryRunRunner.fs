@@ -67,7 +67,7 @@ type DryRunRunner() =
     /// `IoPriority.ToString()`, so the render carries the same stable identifiers the builders accept, in
     /// the order they were configured, and no argv or environment value.
     static member Render(command: Command) : string =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
 
         let ordinary = command.Config.Args |> Seq.map quoteIfNeeded |> List.ofSeq
         let raw = command.Config.WindowsRawArgs |> List.ofSeq

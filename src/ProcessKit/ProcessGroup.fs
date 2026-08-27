@@ -692,7 +692,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// returns a non-transient `ProcessError.Unsupported` before touching the closed/removed native
     /// container, never a use-after-teardown.
     member this.Adopt(externalProcess: Process) : Result<unit, ProcessError> =
-        ArgumentNullException.ThrowIfNull externalProcess
+        ArgumentNullException.ThrowIfNull(externalProcess, nameof externalProcess)
 
         // Read the pid + liveness OFF the lifecycle lock (they touch the caller's Process, not our
         // container). Both throw for a Process with no associated OS process (never started / already

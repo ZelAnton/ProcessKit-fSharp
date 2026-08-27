@@ -11,7 +11,7 @@ open System.Threading.Tasks
 [<AbstractClass>]
 type DelegatingProcessRunner(inner: IProcessRunner) =
 
-    do ArgumentNullException.ThrowIfNull inner
+    do ArgumentNullException.ThrowIfNull(inner, nameof inner)
 
     /// The wrapped runner.
     member _.Inner = inner

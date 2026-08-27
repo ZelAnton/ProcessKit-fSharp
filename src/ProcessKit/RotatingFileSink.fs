@@ -123,7 +123,7 @@ type RotatingFileSink(path: string, maxBytes: int64, maxFiles: int) =
         :> Task
 
     override _.Write(buffer: byte[], offset: int, count: int) =
-        ArgumentNullException.ThrowIfNull buffer
+        ArgumentNullException.ThrowIfNull(buffer, nameof buffer)
         ArgumentOutOfRangeException.ThrowIfNegative offset
         ArgumentOutOfRangeException.ThrowIfNegative count
 

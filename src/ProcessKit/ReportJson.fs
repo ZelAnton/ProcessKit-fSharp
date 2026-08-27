@@ -338,43 +338,43 @@ type ReportJsonExtensions =
     /// This outcome as one JSONL report line (`ReportJson.OutcomeTypeInfo`).
     [<Extension>]
     static member ToReportJson(outcome: Outcome) : string =
-        ArgumentNullException.ThrowIfNull outcome
+        ArgumentNullException.ThrowIfNull(outcome, nameof outcome)
         JsonSerializer.Serialize(outcome, ReportJson.OutcomeTypeInfo)
 
     /// This result as one JSONL report line (`ReportJson.ProcessResultStringTypeInfo`) — never the
     /// captured stdout/stderr.
     [<Extension>]
     static member ToReportJson(result: ProcessResult<string>) : string =
-        ArgumentNullException.ThrowIfNull result
+        ArgumentNullException.ThrowIfNull(result, nameof result)
         JsonSerializer.Serialize(result, ReportJson.ProcessResultStringTypeInfo)
 
     /// This result as one JSONL report line (`ReportJson.ProcessResultBytesTypeInfo`) — never the
     /// captured stdout/stderr.
     [<Extension>]
     static member ToReportJson(result: ProcessResult<byte[]>) : string =
-        ArgumentNullException.ThrowIfNull result
+        ArgumentNullException.ThrowIfNull(result, nameof result)
         JsonSerializer.Serialize(result, ReportJson.ProcessResultBytesTypeInfo)
 
     /// This snapshot as one JSONL report line (`ReportJson.ProcessGroupStatsTypeInfo`).
     [<Extension>]
     static member ToReportJson(stats: ProcessGroupStats) : string =
-        ArgumentNullException.ThrowIfNull stats
+        ArgumentNullException.ThrowIfNull(stats, nameof stats)
         JsonSerializer.Serialize(stats, ReportJson.ProcessGroupStatsTypeInfo)
 
     /// This profile as one JSONL report line (`ReportJson.RunProfileTypeInfo`).
     [<Extension>]
     static member ToReportJson(profile: RunProfile) : string =
-        ArgumentNullException.ThrowIfNull profile
+        ArgumentNullException.ThrowIfNull(profile, nameof profile)
         JsonSerializer.Serialize(profile, ReportJson.RunProfileTypeInfo)
 
     /// This member snapshot as one JSONL report line (`ReportJson.MemberInfoTypeInfo`).
     [<Extension>]
     static member ToReportJson(memberInfo: MemberInfo) : string =
-        ArgumentNullException.ThrowIfNull memberInfo
+        ArgumentNullException.ThrowIfNull(memberInfo, nameof memberInfo)
         JsonSerializer.Serialize(memberInfo, ReportJson.MemberInfoTypeInfo)
 
     /// This resource-limit evidence as one JSONL report line (`ReportJson.LimitEvidenceTypeInfo`).
     [<Extension>]
     static member ToReportJson(evidence: LimitEvidence) : string =
-        ArgumentNullException.ThrowIfNull evidence
+        ArgumentNullException.ThrowIfNull(evidence, nameof evidence)
         JsonSerializer.Serialize(evidence, ReportJson.LimitEvidenceTypeInfo)

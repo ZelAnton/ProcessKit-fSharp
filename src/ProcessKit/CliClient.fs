@@ -31,13 +31,13 @@ type CliClient internal (config: CliClientConfig) =
 
     /// A client for `program`, run through the default `JobRunner`.
     new(program: string) =
-        ArgumentNullException.ThrowIfNull program
+        ArgumentNullException.ThrowIfNull(program, nameof program)
         CliClient(CliClientConfig.create program)
 
     /// Run every command this client builds through `runner` instead of the default `JobRunner`
     /// (e.g. a shared `ProcessGroup`).
     member _.WithRunner(runner: IProcessRunner) =
-        ArgumentNullException.ThrowIfNull runner
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
         CliClient({ config with Runner = runner })
 
     /// Configure the shared defaults by transforming the template `Command` with the full builder,
@@ -46,7 +46,7 @@ type CliClient internal (config: CliClientConfig) =
     /// client at a different program and drop the accumulated defaults). One-shot stdin sources
     /// (`FromStream`/`FromLines`/`FromAsyncLines`) are rejected: attach those to an individual command.
     member _.WithDefaults(configure: Func<Command, Command>) =
-        ArgumentNullException.ThrowIfNull configure
+        ArgumentNullException.ThrowIfNull(configure, nameof configure)
 
         let template = configure.Invoke config.Template
         ArgumentNullException.ThrowIfNull(template, nameof configure)
@@ -74,7 +74,7 @@ type CliClient internal (config: CliClientConfig) =
 
     /// Build a configured `Command` for `args` (the template's shared defaults applied).
     member _.Command(args: seq<string>) : Command =
-        ArgumentNullException.ThrowIfNull args
+        ArgumentNullException.ThrowIfNull(args, nameof args)
         config.Template.Args args
 
     // All verbs route through `config.Runner` (not the default `JobRunner`), so a `CliClient` built
@@ -121,7 +121,7 @@ type CliClient internal (config: CliClientConfig) =
     member this.ParseAsync
         (args: seq<string>, parser: Func<string, 'T>, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull parser
+        ArgumentNullException.ThrowIfNull(parser, nameof parser)
         Runner.parse config.Runner cancellationToken parser.Invoke (this.Command args)
 
     /// Like `ParseAsync`, but with the standard .NET try-parse shape: pass a BCL parser like
@@ -131,7 +131,7 @@ type CliClient internal (config: CliClientConfig) =
     member this.TryParseAsync
         (args: seq<string>, parser: TryParser<'T>, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull parser
+        ArgumentNullException.ThrowIfNull(parser, nameof parser)
         Runner.tryParse config.Runner cancellationToken (TryParser.toResult parser) (this.Command args)
 
     /// Build the command for `args`, require a zero/accepted exit, and deserialize the trimmed stdout
@@ -160,14 +160,14 @@ type CliClient internal (config: CliClientConfig) =
     member this.OutputJsonAsync<'T>
         (args: seq<string>, typeInfo: JsonTypeInfo<'T>, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull typeInfo
+        ArgumentNullException.ThrowIfNull(typeInfo, nameof typeInfo)
         Runner.outputJsonTyped<'T> config.Runner cancellationToken typeInfo (this.Command args)
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
     member this.FirstLineAsync
         (args: seq<string>, predicate: Func<string, bool>, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull predicate
+        ArgumentNullException.ThrowIfNull(predicate, nameof predicate)
         Runner.firstLine config.Runner cancellationToken predicate.Invoke (this.Command args)
 
     /// Preflight-check that this client's program can be resolved to a real executable on this host,

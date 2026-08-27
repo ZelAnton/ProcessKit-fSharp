@@ -433,7 +433,7 @@ module Exec =
     /// `CliClient.ResolveProgram` instead; both share this same resolver, differing only in whose `PATH`
     /// is searched.
     let which (program: string) : Result<string, ProcessError> =
-        ArgumentNullException.ThrowIfNull program
+        ArgumentNullException.ThrowIfNull(program, nameof program)
         Native.Common.resolveProgram program
 
     /// Run `program` with `args` in a private kill-on-dispose group, require a zero/accepted exit,

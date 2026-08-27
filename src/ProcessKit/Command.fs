@@ -773,7 +773,7 @@ type Command internal (config: CommandConfig) =
     /// must be non-empty and must not contain an embedded NUL (`'\000'`) — either would let the actual
     /// spawned command diverge from the one requested (see `CommandConfig.rejectEmbeddedNul`).
     new(program: string) =
-        ArgumentNullException.ThrowIfNull program
+        ArgumentNullException.ThrowIfNull(program, nameof program)
 
         if program.Length = 0 then
             raise (ArgumentException("program must not be empty", nameof program))
@@ -805,7 +805,7 @@ type Command internal (config: CommandConfig) =
     /// Append a single argument. `value` must not contain an embedded NUL (`'\000'`) — see
     /// `CommandConfig.rejectEmbeddedNul`.
     member _.Arg(value: string) =
-        ArgumentNullException.ThrowIfNull value
+        ArgumentNullException.ThrowIfNull(value, nameof value)
         CommandConfig.rejectEmbeddedNul (nameof value) value
 
         Command(
@@ -814,11 +814,11 @@ type Command internal (config: CommandConfig) =
         )
 
     /// Append several arguments, in order. Every element must be non-null (a null element inside an
-    /// otherwise non-null `seq` — a C#-reachable shape `ArgumentNullException.ThrowIfNull values` on
+    /// otherwise non-null `seq` — a C#-reachable null check on
     /// the sequence itself cannot catch) and must not contain an embedded NUL (`'\000'`); the exception
     /// names the offending element by index (`Args[2]`).
     member _.Args(values: seq<string>) =
-        ArgumentNullException.ThrowIfNull values
+        ArgumentNullException.ThrowIfNull(values, nameof values)
 
         let materialized = values |> Seq.toArray
 
@@ -842,7 +842,7 @@ type Command internal (config: CommandConfig) =
     /// parsers; never place untrusted input in `fragment`. POSIX spawn returns typed `Unsupported`, and an
     /// automatically resolved `.cmd`/`.bat` target is refused (invoke `cmd.exe` explicitly when needed).
     member _.WindowsRawArg(fragment: string) =
-        ArgumentNullException.ThrowIfNull fragment
+        ArgumentNullException.ThrowIfNull(fragment, nameof fragment)
         CommandConfig.rejectEmbeddedNul (nameof fragment) fragment
 
         Command(
@@ -853,7 +853,7 @@ type Command internal (config: CommandConfig) =
     /// Set the working directory for the run. `directory` must not contain an embedded NUL (`'\000'`)
     /// — see `CommandConfig.rejectEmbeddedNul`.
     member _.CurrentDir(directory: string) =
-        ArgumentNullException.ThrowIfNull directory
+        ArgumentNullException.ThrowIfNull(directory, nameof directory)
         CommandConfig.rejectEmbeddedNul (nameof directory) directory
 
         Command(
@@ -882,7 +882,7 @@ type Command internal (config: CommandConfig) =
     /// concern. `directory` must not contain an embedded NUL (`'\000'`). Repeatable: each call appends
     /// one more directory to the end of the priority list.
     member _.PreferLocal(directory: string) =
-        ArgumentNullException.ThrowIfNull directory
+        ArgumentNullException.ThrowIfNull(directory, nameof directory)
         CommandConfig.rejectEmbeddedNul (nameof directory) directory
 
         Command(
@@ -895,8 +895,8 @@ type Command internal (config: CommandConfig) =
     /// `ArgumentException` (either would corrupt the child's environment block, or let it diverge from
     /// what was requested).
     member _.Env(key: string, value: string) =
-        ArgumentNullException.ThrowIfNull key
-        ArgumentNullException.ThrowIfNull value
+        ArgumentNullException.ThrowIfNull(key, nameof key)
+        ArgumentNullException.ThrowIfNull(value, nameof value)
         CommandConfig.validateEnvKey key
         CommandConfig.validateEnvValue value
 
@@ -908,7 +908,7 @@ type Command internal (config: CommandConfig) =
     /// Remove an inherited environment variable from the child. `key` must be non-empty and must not
     /// contain `=` (same rule as `Env`).
     member _.EnvRemove(key: string) =
-        ArgumentNullException.ThrowIfNull key
+        ArgumentNullException.ThrowIfNull(key, nameof key)
         CommandConfig.validateEnvKey key
 
         Command(
@@ -933,7 +933,7 @@ type Command internal (config: CommandConfig) =
     /// A launch that produced no child leaves the source intact for the next one.
     /// The repeatable sources (`Stdin.FromString`/`FromBytes`/`FromFile`/`Stdin.Empty`) feed every run.
     member _.Stdin(source: Stdin) =
-        ArgumentNullException.ThrowIfNull source
+        ArgumentNullException.ThrowIfNull(source, nameof source)
         CommandConfig.ensureNoStdinInherit config "Stdin"
 
         Command(
@@ -1027,7 +1027,7 @@ type Command internal (config: CommandConfig) =
     /// to files with `StderrToFile`. As a stdout destination this overrides — and is overridden by — a later
     /// `Stdout(mode)` in the same chain (the last destination wins).
     member _.StdoutToFile(path: string, append: bool) =
-        ArgumentNullException.ThrowIfNull path
+        ArgumentNullException.ThrowIfNull(path, nameof path)
         CommandConfig.rejectEmbeddedNul (nameof path) path
         CommandConfig.ensureStdoutFileCompatible config
 
@@ -1051,7 +1051,7 @@ type Command internal (config: CommandConfig) =
     /// stderr to a file while capturing stdout normally — or redirecting both streams with `StdoutToFile` —
     /// is supported. See `StdoutToFile` for the full contract.
     member _.StderrToFile(path: string, append: bool) =
-        ArgumentNullException.ThrowIfNull path
+        ArgumentNullException.ThrowIfNull(path, nameof path)
         CommandConfig.rejectEmbeddedNul (nameof path) path
         CommandConfig.ensureStderrFileCompatible config
 
@@ -1070,7 +1070,7 @@ type Command internal (config: CommandConfig) =
     /// `Stdin.FromString`/`FromLines`/`FromAsyncLines` and `ProcessStdin.WriteLineAsync`; raw
     /// `Stdin.FromBytes` and `ProcessStdin.WriteAsync` remain byte-exact.
     member _.StdinEncoding(encoding: Encoding) =
-        ArgumentNullException.ThrowIfNull encoding
+        ArgumentNullException.ThrowIfNull(encoding, nameof encoding)
 
         Command({ config with StdinEncoding = encoding })
 
@@ -1078,7 +1078,7 @@ type Command internal (config: CommandConfig) =
     /// supervision. The default is `TimeProvider.System`; supplying a deterministic provider makes
     /// those time-dependent paths testable without changing process-wide time.
     member _.TimeProvider(timeProvider: TimeProvider) =
-        ArgumentNullException.ThrowIfNull timeProvider
+        ArgumentNullException.ThrowIfNull(timeProvider, nameof timeProvider)
 
         Command(
             { config with
@@ -1087,7 +1087,7 @@ type Command internal (config: CommandConfig) =
 
     /// Decode captured stdout with `encoding` (default UTF-8).
     member _.StdoutEncoding(encoding: Encoding) =
-        ArgumentNullException.ThrowIfNull encoding
+        ArgumentNullException.ThrowIfNull(encoding, nameof encoding)
 
         Command(
             { config with
@@ -1096,7 +1096,7 @@ type Command internal (config: CommandConfig) =
 
     /// Decode captured stderr with `encoding` (default UTF-8).
     member _.StderrEncoding(encoding: Encoding) =
-        ArgumentNullException.ThrowIfNull encoding
+        ArgumentNullException.ThrowIfNull(encoding, nameof encoding)
 
         Command(
             { config with
@@ -1107,7 +1107,7 @@ type Command internal (config: CommandConfig) =
     /// program — one whose non-ASCII input and output use a code page rather than UTF-8 — use
     /// `ConsoleEncoding()`, which resolves the right code page for the current host and applies it here.
     member _.Encoding(encoding: Encoding) =
-        ArgumentNullException.ThrowIfNull encoding
+        ArgumentNullException.ThrowIfNull(encoding, nameof encoding)
 
         Command(
             { config with
@@ -1147,7 +1147,7 @@ type Command internal (config: CommandConfig) =
     /// when stdout is `Null`, `Inherit`, or redirected with `StdoutToFile`, because those destinations
     /// leave no parent-side stdout stream for the handler to observe.
     member _.OnStdoutLine(handler: Action<string>) =
-        ArgumentNullException.ThrowIfNull handler
+        ArgumentNullException.ThrowIfNull(handler, nameof handler)
         CommandConfig.ensureStdoutPiped config "OnStdoutLine"
         CommandConfig.ensureNoStdoutFile config "OnStdoutLine"
 
@@ -1160,7 +1160,7 @@ type Command internal (config: CommandConfig) =
     /// when stderr is `Null`, `Inherit`, redirected with `StderrToFile`, or folded into stdout with
     /// `MergeStderr`, because those configurations leave no separate parent-side stderr stream.
     member _.OnStderrLine(handler: Action<string>) =
-        ArgumentNullException.ThrowIfNull handler
+        ArgumentNullException.ThrowIfNull(handler, nameof handler)
         CommandConfig.ensureStderrPiped config "OnStderrLine"
         CommandConfig.ensureNoMergeStderr config "OnStderrLine"
         CommandConfig.ensureNoPty config "OnStderrLine"
@@ -1175,7 +1175,7 @@ type Command internal (config: CommandConfig) =
     /// (`ArgumentException`) when stdout is `Null`, `Inherit`, or redirected with `StdoutToFile`, because
     /// those destinations leave no parent-side stdout stream to tee.
     member _.StdoutTee(sink: Stream) =
-        ArgumentNullException.ThrowIfNull sink
+        ArgumentNullException.ThrowIfNull(sink, nameof sink)
         CommandConfig.ensureStdoutPiped config "StdoutTee"
         CommandConfig.ensureNoStdoutFile config "StdoutTee"
         Command({ config with StdoutTee = Some sink })
@@ -1184,7 +1184,7 @@ type Command internal (config: CommandConfig) =
     /// (`ArgumentException`) when stderr is `Null`, `Inherit`, redirected with `StderrToFile`, or folded
     /// into stdout with `MergeStderr`, because those configurations leave no separate parent-side stream.
     member _.StderrTee(sink: Stream) =
-        ArgumentNullException.ThrowIfNull sink
+        ArgumentNullException.ThrowIfNull(sink, nameof sink)
         CommandConfig.ensureStderrPiped config "StderrTee"
         CommandConfig.ensureNoMergeStderr config "StderrTee"
         CommandConfig.ensureNoPty config "StderrTee"
@@ -1228,7 +1228,7 @@ type Command internal (config: CommandConfig) =
 
     /// Bound the in-memory backlog of captured lines.
     member _.OutputBuffer(policy: OutputBufferPolicy) =
-        ArgumentNullException.ThrowIfNull policy
+        ArgumentNullException.ThrowIfNull(policy, nameof policy)
         Command({ config with OutputBuffer = policy })
 
     /// Shape every decoded line on its way into the in-memory capture backlog — the
@@ -1245,7 +1245,7 @@ type Command internal (config: CommandConfig) =
     /// retains exactly what the child wrote. Composes with `OutputBuffer`, which decides how much of
     /// the shaped output survives; the last `CapturePolicy` call in a chain wins.
     member _.CapturePolicy(policy: ICapturePolicy) =
-        ArgumentNullException.ThrowIfNull policy
+        ArgumentNullException.ThrowIfNull(policy, nameof policy)
 
         Command(
             { config with
@@ -1269,7 +1269,7 @@ type Command internal (config: CommandConfig) =
     /// <a href="https://zelanton.github.io/ProcessKit-fSharp/streaming.html">Streaming</a> for the backpressure
     /// deadlock footgun before opting in to `StreamFullMode.Backpressure`.
     member _.StreamBuffer(policy: StreamBufferPolicy) =
-        ArgumentNullException.ThrowIfNull policy
+        ArgumentNullException.ThrowIfNull(policy, nameof policy)
 
         Command(
             { config with
@@ -1416,7 +1416,7 @@ type Command internal (config: CommandConfig) =
     /// `ProcessError.RetryPredicate` with the original `ProcessError` in `Original`; the callback
     /// exception never escapes as a raw task fault and no further attempt runs.
     member _.Retry(maxAttempts: int, delay: TimeSpan, shouldRetry: Func<ProcessError, bool>) =
-        ArgumentNullException.ThrowIfNull shouldRetry
+        ArgumentNullException.ThrowIfNull(shouldRetry, nameof shouldRetry)
         CommandConfig.validateRetryMaxAttempts maxAttempts
         ArgumentOutOfRangeException.ThrowIfLessThan(delay, TimeSpan.Zero)
 
@@ -1444,7 +1444,7 @@ type Command internal (config: CommandConfig) =
             jitter: bool,
             shouldRetry: Func<ProcessError, bool>
         ) =
-        ArgumentNullException.ThrowIfNull shouldRetry
+        ArgumentNullException.ThrowIfNull(shouldRetry, nameof shouldRetry)
         CommandConfig.validateRetryMaxAttempts maxAttempts
         ArgumentOutOfRangeException.ThrowIfLessThan(baseDelay, TimeSpan.Zero)
         ArgumentOutOfRangeException.ThrowIfLessThan(maxDelay, TimeSpan.Zero)
@@ -1494,7 +1494,7 @@ type Command internal (config: CommandConfig) =
     /// boundary with `ArgumentException`, matching every other builder knob that fails loud on an invalid
     /// value rather than silently keeping the previous codes. Pass at least one code.
     member _.OkCodes(codes: seq<int>) =
-        ArgumentNullException.ThrowIfNull codes
+        ArgumentNullException.ThrowIfNull(codes, nameof codes)
         let list = List.ofSeq codes
 
         if List.isEmpty list then
@@ -1725,7 +1725,7 @@ type Command internal (config: CommandConfig) =
     /// non-negative — rejected with `ArgumentOutOfRangeException` at the builder boundary, naming the
     /// offending element by index (`Groups[2]`).
     member _.Groups(gids: seq<int>) =
-        ArgumentNullException.ThrowIfNull gids
+        ArgumentNullException.ThrowIfNull(gids, nameof gids)
         CommandConfig.ensureNoWindowsTokenHardening config "Groups"
         let materialized = gids |> Seq.toArray
 
@@ -1782,7 +1782,7 @@ type Command internal (config: CommandConfig) =
     /// this library does neither; it refuses loudly instead. A lone `Setsid` (no privilege drop) does not
     /// route through any such helper, so it composes with `Arg0` normally.
     member _.Arg0(arg0: string) =
-        ArgumentNullException.ThrowIfNull arg0
+        ArgumentNullException.ThrowIfNull(arg0, nameof arg0)
 
         if arg0.Length = 0 then
             raise (ArgumentException("arg0 must not be empty", nameof arg0))
@@ -1935,7 +1935,7 @@ type Command internal (config: CommandConfig) =
     /// Emit structured lifecycle events (spawn / exit / timeout / retry) to `logger`. The program
     /// name and non-secret facts only — **argv and environment are never logged**.
     member _.Logger(logger: ILogger) =
-        ArgumentNullException.ThrowIfNull logger
+        ArgumentNullException.ThrowIfNull(logger, nameof logger)
         Command({ config with Logger = Some logger })
 
     /// Stamp a per-run correlation id, shared by the run's log/trace events and its retries. Internal:
@@ -1956,7 +1956,7 @@ type Command internal (config: CommandConfig) =
         )
 
     member internal _.WithRetryJitterSource(source: unit -> float) =
-        ArgumentNullException.ThrowIfNull source
+        ArgumentNullException.ThrowIfNull(source, nameof source)
 
         Command(
             { config with

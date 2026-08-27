@@ -449,7 +449,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     /// non-piped `Stdout`, or a `Stdin` source — a pipeline cannot honour those (see the type doc); the
     /// appended stage is always after the first.
     member _.Pipe(command: Command) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         PipelineStageGuard.validate (nameof command) commands.Length command
         // Appending demotes the current last stage to an intermediate one, where an OS-level MergeStderr —
         // or a PTY's merged terminal output — would leak into `command`'s stdin; reject either now (the
@@ -645,7 +645,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     member this.ParseAsync
         (parser: Func<string, 'T>, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<'T, ProcessError>> =
-        ArgumentNullException.ThrowIfNull parser
+        ArgumentNullException.ThrowIfNull(parser, nameof parser)
 
         CaptureVerbs.parse (List.last commands).Program parser.Invoke (fun () -> this.RunAsync cancellationToken)
 
@@ -656,7 +656,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     member this.TryParseAsync
         (parser: TryParser<'T>, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<'T, ProcessError>> =
-        ArgumentNullException.ThrowIfNull parser
+        ArgumentNullException.ThrowIfNull(parser, nameof parser)
 
         CaptureVerbs.tryParse (List.last commands).Program (TryParser.toResult parser) (fun () ->
             this.RunAsync cancellationToken)
@@ -684,7 +684,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     member this.OutputJsonAsync<'T>
         (typeInfo: JsonTypeInfo<'T>, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<'T, ProcessError>> =
-        ArgumentNullException.ThrowIfNull typeInfo
+        ArgumentNullException.ThrowIfNull(typeInfo, nameof typeInfo)
 
         CaptureVerbs.outputJsonTyped (List.last commands).Program typeInfo (fun () -> this.RunAsync cancellationToken)
 
@@ -700,8 +700,8 @@ type PipelineExtensions =
     /// chain) is allowed.
     [<Extension>]
     static member Pipe(command: Command, next: Command) =
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull next
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(next, nameof next)
         PipelineStageGuard.validate (nameof command) 0 command
         PipelineStageGuard.validate (nameof next) 1 next
         // `command` (stage 0) is not the last stage, so an OS-level MergeStderr — or a PTY's merged

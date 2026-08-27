@@ -31,8 +31,8 @@ type ProcessRunnerExtensions =
     static member RunAsync
         (runner: IProcessRunner, command: Command, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.run runner cancellationToken command
 
     /// Require a zero/accepted exit, discarding the captured output — including when the buffer
@@ -41,8 +41,8 @@ type ProcessRunnerExtensions =
     static member RunUnitAsync
         (runner: IProcessRunner, command: Command, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.runUnit runner cancellationToken command
 
     /// Run to completion, capturing stdout as decoded text (a non-zero exit is data). Applies the
@@ -52,8 +52,8 @@ type ProcessRunnerExtensions =
     static member OutputStringAsync
         (runner: IProcessRunner, command: Command, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.outputString runner cancellationToken command
 
     /// Run to completion, capturing stdout as raw bytes (a non-zero exit is data). Applies the
@@ -62,8 +62,8 @@ type ProcessRunnerExtensions =
     static member OutputBytesAsync
         (runner: IProcessRunner, command: Command, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.outputBytes runner cancellationToken command
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.
@@ -71,8 +71,8 @@ type ProcessRunnerExtensions =
     static member ExitCodeAsync
         (runner: IProcessRunner, command: Command, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.exitCode runner cancellationToken command
 
     /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
@@ -80,8 +80,8 @@ type ProcessRunnerExtensions =
     static member ProbeAsync
         (runner: IProcessRunner, command: Command, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.probe runner cancellationToken command
 
     /// Start the command and return a live `RunningProcess`. Forwards to the runner's `SpawnAsync` seam.
@@ -93,8 +93,8 @@ type ProcessRunnerExtensions =
     static member StartAsync
         (runner: IProcessRunner, command: Command, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.start runner cancellationToken command
 
     /// Require a zero/accepted exit and parse the trimmed stdout into a `'T`; a thrown parser error
@@ -107,9 +107,9 @@ type ProcessRunnerExtensions =
             parser: Func<string, 'T>,
             [<Optional>] cancellationToken: CancellationToken
         ) =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull parser
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(parser, nameof parser)
         Runner.parse runner cancellationToken parser.Invoke command
 
     /// Like `ParseAsync`, but with the standard .NET try-parse shape: pass a BCL parser like
@@ -124,9 +124,9 @@ type ProcessRunnerExtensions =
             parser: TryParser<'T>,
             [<Optional>] cancellationToken: CancellationToken
         ) =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull parser
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(parser, nameof parser)
         Runner.tryParse runner cancellationToken (TryParser.toResult parser) command
 
     /// Require a zero/accepted exit and deserialize the trimmed stdout as JSON into a `'T` via
@@ -148,8 +148,8 @@ type ProcessRunnerExtensions =
             [<Optional>] options: JsonSerializerOptions | null,
             [<Optional>] cancellationToken: CancellationToken
         ) =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.outputJson<'T> runner cancellationToken (Option.ofObj options) command
 
     /// Require a zero/accepted exit and deserialize the trimmed stdout using source-generated
@@ -163,9 +163,9 @@ type ProcessRunnerExtensions =
             typeInfo: JsonTypeInfo<'T>,
             [<Optional>] cancellationToken: CancellationToken
         ) =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull typeInfo
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(typeInfo, nameof typeInfo)
         Runner.outputJsonTyped<'T> runner cancellationToken typeInfo command
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
@@ -177,7 +177,7 @@ type ProcessRunnerExtensions =
             predicate: Func<string, bool>,
             [<Optional>] cancellationToken: CancellationToken
         ) =
-        ArgumentNullException.ThrowIfNull runner
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull predicate
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(predicate, nameof predicate)
         Runner.firstLine runner cancellationToken predicate.Invoke command

@@ -41,36 +41,36 @@ type Stdin internal (source: StdinSource) =
     /// (`ArgumentNullException` — a C# caller that forgets a null check would otherwise fail obscurely
     /// inside the background feeder rather than at the API boundary).
     static member FromString(text: string) =
-        ArgumentNullException.ThrowIfNull text
+        ArgumentNullException.ThrowIfNull(text, nameof text)
         Stdin(StdinSource.Text text)
 
     /// Raw bytes. `bytes` must not be null (`ArgumentNullException`). A defensive copy is taken at this
     /// boundary — the built `Command`/`Stdin` never aliases the caller's array, so mutating it afterward
     /// (including between retries) has no effect on what is written to the child.
     static member FromBytes(bytes: byte[]) =
-        ArgumentNullException.ThrowIfNull bytes
+        ArgumentNullException.ThrowIfNull(bytes, nameof bytes)
         Stdin(StdinSource.Bytes(Array.copy bytes))
 
     /// The contents of a file, streamed to the child. `path` must not be null (`ArgumentNullException`).
     static member FromFile(path: string) =
-        ArgumentNullException.ThrowIfNull path
+        ArgumentNullException.ThrowIfNull(path, nameof path)
         Stdin(StdinSource.File path)
 
     /// An open readable stream, copied to the child. `stream` must not be null (`ArgumentNullException`).
     static member FromStream(stream: Stream) =
-        ArgumentNullException.ThrowIfNull stream
+        ArgumentNullException.ThrowIfNull(stream, nameof stream)
         Stdin(StdinSource.Reader stream)
 
     /// Lines (each written followed by `\n`) produced eagerly from a sequence. `lines` must not be null
     /// (`ArgumentNullException`).
     static member FromLines(lines: seq<string>) =
-        ArgumentNullException.ThrowIfNull lines
+        ArgumentNullException.ThrowIfNull(lines, nameof lines)
         Stdin(StdinSource.Lines lines)
 
     /// Lines (each written followed by `\n`) produced asynchronously. `lines` must not be null
     /// (`ArgumentNullException`).
     static member FromAsyncLines(lines: IAsyncEnumerable<string>) =
-        ArgumentNullException.ThrowIfNull lines
+        ArgumentNullException.ThrowIfNull(lines, nameof lines)
         Stdin(StdinSource.AsyncLines lines)
 
     /// Inherit the parent process's own standard input directly (no pipe, no feeder). Internal — set
