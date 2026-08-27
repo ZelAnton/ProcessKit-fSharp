@@ -24,7 +24,7 @@ type ProcessKitOptions() =
         with get () = defaultTimeout
         and set (value: Nullable<TimeSpan>) =
             if value.HasValue then
-                ArgumentOutOfRangeException.ThrowIfLessThan(value.Value, TimeSpan.Zero)
+                ArgumentOutOfRangeException.ThrowIfLessThan(value.Value, TimeSpan.Zero, nameof value)
 
             defaultTimeout <- value
 

@@ -1971,7 +1971,7 @@ type SupervisionSession internal (config: SupervisorConfig, cancellationToken: C
     /// negative `gracePeriod` is rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero` escalates
     /// the child kill immediately.
     member _.StopAsync(gracePeriod: TimeSpan) : Task<Result<SupervisionOutcome, ProcessError>> =
-        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero, nameof gracePeriod)
 
         // Record the request, snapshot the current child, and interrupt any in-flight backoff / storm
         // sleep (see `requestGracefulStop`).
@@ -2097,7 +2097,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// non-negative (`0` means no restarts at all — a single run; a negative value is rejected with
     /// `ArgumentOutOfRangeException`).
     member _.MaxRestarts(count: int) =
-        ArgumentOutOfRangeException.ThrowIfNegative count
+        ArgumentOutOfRangeException.ThrowIfNegative(count, nameof count)
         Supervisor({ config with MaxRestarts = Some count })
 
     /// Exponential backoff before each restart: the delay is `base × factor^n`, capped by `MaxBackoff`,
@@ -2109,7 +2109,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// A negative `baseDelay` is rejected with `ArgumentOutOfRangeException`; `TimeSpan.Zero` is
     /// accepted and restarts with no backoff delay. Default: `200ms × 2.0`.
     member _.Backoff(baseDelay: TimeSpan, factor: float) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(baseDelay, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(baseDelay, TimeSpan.Zero, nameof baseDelay)
 
         Supervisor(
             { config with
@@ -2123,7 +2123,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// `RunAsync`) fire after *every* incarnation, so the backoff would never climb. `TimeSpan.Zero`
     /// is accepted (every backoff delay is then capped to zero — restart immediately).
     member _.MaxBackoff(cap: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(cap, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(cap, TimeSpan.Zero, nameof cap)
         Supervisor({ config with MaxBackoff = cap })
 
     /// Multiply each backoff delay by a uniform factor in `[0.5, 1.5)` (default: **on**), so a
@@ -2140,14 +2140,14 @@ type Supervisor internal (config: SupervisorConfig) =
     /// (it resets the score, increments `StormPauses`, and fires `OnStormPause`) but sleeps out no
     /// real time — enabling the guard's accounting without a wait.
     member _.StormPause(pause: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(pause, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(pause, TimeSpan.Zero, nameof pause)
         Supervisor({ config with StormPause = Some pause })
 
     /// Half-life of the failure score used by the storm guard (default: 30 s). A zero half-life
     /// keeps no history (every failure scores exactly `1.0`). A negative `decay` is rejected with
     /// `ArgumentOutOfRangeException`. No effect unless `StormPause` is set.
     member _.FailureDecay(decay: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(decay, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(decay, TimeSpan.Zero, nameof decay)
         Supervisor({ config with FailureDecay = decay })
 
     /// Failure score above which the storm guard trips (default: `5.0`). A non-finite threshold

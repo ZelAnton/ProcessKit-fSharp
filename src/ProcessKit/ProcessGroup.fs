@@ -1078,7 +1078,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// thrown eagerly by this call rather than deferred to enumeration — a sampling cadence must be a
     /// positive duration.
     member this.SampleStatsAsync(interval: TimeSpan) : IAsyncEnumerable<ProcessGroupStats> =
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero, nameof interval)
 
         // Cap an over-long interval into the armable range so the sampler's `Task.Delay` can't throw
         // synchronously (it then samples at the max ~24.8-day cadence instead of faulting).
@@ -1135,7 +1135,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// funnels concurrent callers onto one shared conclusion. A loser that needs "the tree is fully torn
     /// down" must await the SAME `Task` the winner returned, or otherwise synchronize with it itself.
     member this.ShutdownAsync(gracePeriod: TimeSpan) : Task =
-        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero, nameof gracePeriod)
 
         task {
             // Win the transition first (flag flipped under `sync`), so from here no StartAsync/Signal/
@@ -1203,7 +1203,7 @@ type ProcessGroup private (backend: IContainmentBackend, options: ProcessGroupOp
     /// `ProcessError.Unsupported` here rather than a fabricated report, since there is no teardown left
     /// for THIS call to have observed.
     member this.ShutdownReportAsync(gracePeriod: TimeSpan) : Task<Result<ShutdownReport, ProcessError>> =
-        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero, nameof gracePeriod)
 
         task {
             if claimRelease () then

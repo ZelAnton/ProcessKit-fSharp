@@ -296,7 +296,7 @@ type ResourceLimits
     /// misconfiguration rather than a meaningful limit, and previously degraded silently (e.g. a
     /// negative value converting to a huge `unativeint` on Windows — effectively "unlimited").
     member _.WithMemoryMax(bytes: int64) =
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(bytes, 0L)
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(bytes, 0L, nameof bytes)
         ResourceLimits(Some bytes, oomGroupKill, maxProcesses, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax, ioMax)
 
     /// A copy that asks Linux cgroup v2 to treat the cgroup as one OOM unit (`memory.oom.group=1`),
@@ -308,7 +308,7 @@ type ResourceLimits
     /// (`ArgumentOutOfRangeException`): the tree always has at least its own leader process, so a
     /// non-positive cap could never be satisfied.
     member _.WithMaxProcesses(count: int) =
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(count, 0)
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(count, 0, nameof count)
         ResourceLimits(memoryMax, oomGroupKill, Some count, cpuQuota, uiRestrictions, cpuAffinity, cpuTimeMax, ioMax)
 
     /// A copy with the CPU quota (in cores) set. `cores` must be a finite, strictly positive number —
@@ -708,7 +708,7 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, stopSignal: Signal
     /// A copy with the shutdown grace window set. A negative `timeout` is rejected
     /// (`ArgumentOutOfRangeException`); `TimeSpan.Zero` is valid (no grace — escalate immediately).
     member _.WithShutdownTimeout(timeout: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero, nameof timeout)
         ProcessGroupOptions(timeout, stopSignal, limits)
 
     /// A copy using `signal` for graceful shutdown before escalation.

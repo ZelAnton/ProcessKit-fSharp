@@ -871,7 +871,7 @@ type RunningProcess
     /// from the default runner (`Command.StartAsync()` / `IProcessRunner.SpawnAsync`) owns a private
     /// group and gets the full configured-soft-signal → grace → SIGKILL path on Unix.
     member this.StopAsync(gracePeriod: TimeSpan) : Task<Outcome> =
-        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(gracePeriod, TimeSpan.Zero, nameof gracePeriod)
 
         task {
             use _reap = terminal.ReapGuard()
@@ -1141,7 +1141,7 @@ type RunningProcess
     /// — a sampling cadence must be a positive duration. Validated up front, before the pipes are
     /// claimed, so an invalid call neither consumes this one-shot handle nor starts a tight loop.
     member _.ProfileAsync(interval: TimeSpan) : Task<RunProfile> =
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero, nameof interval)
 
         if not (gate.TryClaimBuffered()) then
             raise (InvalidOperationException alreadyConsumedMessage)

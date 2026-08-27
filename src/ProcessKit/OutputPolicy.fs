@@ -86,25 +86,25 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
     /// Retain at most `maxLines`, dropping the oldest when full. `maxLines` must be non-negative
     /// (`0` retains nothing; a negative value is rejected with `ArgumentOutOfRangeException`).
     static member Bounded(maxLines: int) =
-        ArgumentOutOfRangeException.ThrowIfNegative maxLines
+        ArgumentOutOfRangeException.ThrowIfNegative(maxLines, nameof maxLines)
         OutputBufferPolicy(Some maxLines, None, OverflowMode.DropOldest)
 
     /// Retain at most `maxLines` and error when the cap is reached — a fail-loud ceiling. `maxLines`
     /// must be non-negative (`0` retains nothing but still tracks totals; negative is rejected).
     static member FailLoud(maxLines: int) =
-        ArgumentOutOfRangeException.ThrowIfNegative maxLines
+        ArgumentOutOfRangeException.ThrowIfNegative(maxLines, nameof maxLines)
         OutputBufferPolicy(Some maxLines, None, OverflowMode.Error)
 
     /// A copy with the retained-line ceiling set, composable with any policy. `maxLines` must be
     /// non-negative (negative is rejected with `ArgumentOutOfRangeException`).
     member _.WithMaxLines(maxLines: int) =
-        ArgumentOutOfRangeException.ThrowIfNegative maxLines
+        ArgumentOutOfRangeException.ThrowIfNegative(maxLines, nameof maxLines)
         OutputBufferPolicy(Some maxLines, maxBytes, overflow)
 
     /// A copy with the retained-byte ceiling set, composable with any policy. `maxBytes` must be
     /// non-negative (negative is rejected with `ArgumentOutOfRangeException`).
     member _.WithMaxBytes(maxBytes: int) =
-        ArgumentOutOfRangeException.ThrowIfNegative maxBytes
+        ArgumentOutOfRangeException.ThrowIfNegative(maxBytes, nameof maxBytes)
         OutputBufferPolicy(maxLines, Some maxBytes, overflow)
 
     /// A copy with the overflow behaviour set.
@@ -165,12 +165,12 @@ type StreamBufferPolicy internal (capacity: int, fullMode: StreamFullMode) =
     /// A channel bounded to `capacity` items that backpressures the producer once full — the safest
     /// default for an opt-in cap: lossless, at the cost of the child's observable timing.
     static member Bounded(capacity: int) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1)
+        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1, nameof capacity)
         StreamBufferPolicy(capacity, StreamFullMode.Backpressure)
 
     /// A channel bounded to `capacity` items with an explicit `fullMode`.
     static member Bounded(capacity: int, fullMode: StreamFullMode) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1)
+        ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1, nameof capacity)
         StreamBufferPolicy(capacity, fullMode)
 
     /// A copy with the full-mode changed, composable with any policy.
