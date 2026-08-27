@@ -154,6 +154,18 @@ public class RangeValidationTests
         Assert.DoesNotThrow(() => new HostedProcessOptions { ShutdownGracePeriod = TimeSpan.Zero });
     }
 
+    [Test]
+    public void Uninitialized_fixtures_do_not_run_production_finalizers()
+    {
+        var reference = CollectibleUninitializedReference<ProcessGroup>();
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        Assert.That(reference.IsAlive, Is.False);
+    }
+
     private static TestCaseData Case(Action call, string expectedParamName, string name) =>
         new TestCaseData(call, expectedParamName).SetName($"{name} names {expectedParamName}");
 
@@ -169,6 +181,14 @@ public class RangeValidationTests
         Assert.That(exception!.ParamName, Is.EqualTo(expectedParamName));
     }
 
-    private static T Uninitialized<T>() where T : class =>
-        (T)RuntimeHelpers.GetUninitializedObject(typeof(T));
+    private static T Uninitialized<T>() where T : class
+    {
+        var instance = (T)RuntimeHelpers.GetUninitializedObject(typeof(T));
+        GC.SuppressFinalize(instance);
+        return instance;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static WeakReference CollectibleUninitializedReference<T>() where T : class =>
+        new(Uninitialized<T>());
 }
