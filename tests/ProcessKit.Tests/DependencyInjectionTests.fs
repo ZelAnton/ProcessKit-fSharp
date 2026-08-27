@@ -91,6 +91,14 @@ type DependencyInjectionTests() =
 
             Assert.That(thrown.ParamName, Is.EqualTo "command", verb)
 
+    let assertNullParameter (caseName: string) (expected: string) (call: unit -> unit) =
+        let thrown =
+            match Assert.Throws<ArgumentNullException>(Action call) with
+            | null -> failwith $"Expected {caseName} to reject a null {expected}."
+            | exceptionThrown -> exceptionThrown
+
+        Assert.That(thrown.ParamName, Is.EqualTo expected, caseName)
+
     /// Poll until `pid` is no longer a live process (reaped/exited), or the deadline elapses.
     let waitProcessGone (pid: int) (deadlineMs: int) : Task<bool> =
         task {
@@ -239,6 +247,79 @@ type DependencyInjectionTests() =
             | exceptionThrown -> exceptionThrown
 
         Assert.That(thrown.ParamName, Is.EqualTo "services")
+
+    [<Test>]
+    member _.``DI extension null guards preserve their public parameter names``() =
+        let services = ServiceCollection() :> IServiceCollection
+        let clientConfigure = Func<CliClient, CliClient>(id)
+
+        let calls: (string * string * (unit -> unit)) list =
+            [ "AddProcessKit configure",
+              "configure",
+              (fun () ->
+                  ServiceCollectionExtensions.AddProcessKit(services, Unchecked.defaultof<Action<ProcessKitOptions>>)
+                  |> ignore)
+              "AddProcessKit configuration",
+              "configuration",
+              (fun () ->
+                  ServiceCollectionExtensions.AddProcessKit(services, Unchecked.defaultof<IConfiguration>)
+                  |> ignore)
+              "AddProcessKitClient services",
+              "services",
+              (fun () ->
+                  ServiceCollectionExtensions.AddProcessKitClient(
+                      Unchecked.defaultof<IServiceCollection>,
+                      "tool",
+                      "tool",
+                      clientConfigure
+                  )
+                  |> ignore)
+              "AddProcessKitClient name",
+              "name",
+              (fun () ->
+                  ServiceCollectionExtensions.AddProcessKitClient(
+                      services,
+                      Unchecked.defaultof<string>,
+                      "tool",
+                      clientConfigure
+                  )
+                  |> ignore)
+              "AddProcessKitClient program",
+              "program",
+              (fun () ->
+                  ServiceCollectionExtensions.AddProcessKitClient(
+                      services,
+                      "tool",
+                      Unchecked.defaultof<string>,
+                      clientConfigure
+                  )
+                  |> ignore)
+              "AddProcessKitClient configure",
+              "configure",
+              (fun () ->
+                  ServiceCollectionExtensions.AddProcessKitClient(
+                      services,
+                      "tool",
+                      "tool",
+                      Unchecked.defaultof<Func<CliClient, CliClient>>
+                  )
+                  |> ignore)
+              "AddProcessKitGroup configure",
+              "configure",
+              (fun () ->
+                  ServiceCollectionExtensions.AddProcessKitGroup(
+                      services,
+                      Unchecked.defaultof<Action<ProcessKitOptions>>
+                  )
+                  |> ignore)
+              "AddProcessKitGroup configuration",
+              "configuration",
+              (fun () ->
+                  ServiceCollectionExtensions.AddProcessKitGroup(services, Unchecked.defaultof<IConfiguration>)
+                  |> ignore) ]
+
+        for caseName, expected, call in calls do
+            assertNullParameter caseName expected call
 
     [<Test>]
     member _.``the resolved runner is logger-aware when a logger factory is registered``() : Task =

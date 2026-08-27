@@ -46,10 +46,10 @@ type HostedServiceCollectionExtensions =
     [<Extension>]
     static member AddProcessKitHostedProcess
         (services: IServiceCollection, name: string, command: Command, configureSupervisor: Func<Supervisor, Supervisor>) : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
-        ArgumentNullException.ThrowIfNull name
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull configureSupervisor
+        ArgumentNullException.ThrowIfNull(services, nameof services)
+        ArgumentNullException.ThrowIfNull(name, nameof name)
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(configureSupervisor, nameof configureSupervisor)
 
         if Registration.hasHostedProcess services name then
             raise (
@@ -103,9 +103,9 @@ type HostedServiceCollectionExtensions =
     static member ConfigureProcessKitHostedProcess
         (services: IServiceCollection, name: string, configure: Action<HostedProcessOptions>)
         : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
-        ArgumentNullException.ThrowIfNull name
-        ArgumentNullException.ThrowIfNull configure
+        ArgumentNullException.ThrowIfNull(services, nameof services)
+        ArgumentNullException.ThrowIfNull(name, nameof name)
+        ArgumentNullException.ThrowIfNull(configure, nameof configure)
 
         services.Configure(name, configure) |> ignore
         services
@@ -121,8 +121,8 @@ type HostedServiceCollectionExtensions =
     static member AddProcessKitHostedProcessHealthCheck
         (services: IServiceCollection, name: string)
         : IServiceCollection =
-        ArgumentNullException.ThrowIfNull services
-        ArgumentNullException.ThrowIfNull name
+        ArgumentNullException.ThrowIfNull(services, nameof services)
+        ArgumentNullException.ThrowIfNull(name, nameof name)
 
         services.TryAddKeyedSingleton<HostedProcessHealthCheck>(
             name,

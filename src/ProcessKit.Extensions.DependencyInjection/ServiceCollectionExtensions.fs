@@ -121,7 +121,7 @@ type ServiceCollectionExtensions =
         (services: IServiceCollection, configure: Action<ProcessKitOptions>)
         : IServiceCollection =
         ArgumentNullException.ThrowIfNull(services, nameof services)
-        ArgumentNullException.ThrowIfNull configure
+        ArgumentNullException.ThrowIfNull(configure, nameof configure)
         services.Configure configure |> ignore
         ServiceCollectionExtensions.AddProcessKit services
 
@@ -135,7 +135,7 @@ type ServiceCollectionExtensions =
     [<RequiresDynamicCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a NativeAOT app.">]
     static member AddProcessKit(services: IServiceCollection, configuration: IConfiguration) : IServiceCollection =
         ArgumentNullException.ThrowIfNull(services, nameof services)
-        ArgumentNullException.ThrowIfNull configuration
+        ArgumentNullException.ThrowIfNull(configuration, nameof configuration)
         services.Configure<ProcessKitOptions> configuration |> ignore
         ServiceCollectionExtensions.AddProcessKit services
 
@@ -161,9 +161,9 @@ type ServiceCollectionExtensions =
         (services: IServiceCollection, name: string, program: string, configure: Func<CliClient, CliClient>)
         : IServiceCollection =
         ArgumentNullException.ThrowIfNull(services, nameof services)
-        ArgumentNullException.ThrowIfNull name
-        ArgumentNullException.ThrowIfNull program
-        ArgumentNullException.ThrowIfNull configure
+        ArgumentNullException.ThrowIfNull(name, nameof name)
+        ArgumentNullException.ThrowIfNull(program, nameof program)
+        ArgumentNullException.ThrowIfNull(configure, nameof configure)
 
         if DiInternals.hasClient services name then
             raise (
@@ -221,7 +221,7 @@ type ServiceCollectionExtensions =
         (services: IServiceCollection, configure: Action<ProcessKitOptions>)
         : IServiceCollection =
         ArgumentNullException.ThrowIfNull(services, nameof services)
-        ArgumentNullException.ThrowIfNull configure
+        ArgumentNullException.ThrowIfNull(configure, nameof configure)
         services.Configure configure |> ignore
         ServiceCollectionExtensions.AddProcessKitGroup services
 
@@ -235,6 +235,6 @@ type ServiceCollectionExtensions =
     [<RequiresDynamicCode "Binds ProcessKitOptions from IConfiguration by reflection; use the Action<ProcessKitOptions> overload in a NativeAOT app.">]
     static member AddProcessKitGroup(services: IServiceCollection, configuration: IConfiguration) : IServiceCollection =
         ArgumentNullException.ThrowIfNull(services, nameof services)
-        ArgumentNullException.ThrowIfNull configuration
+        ArgumentNullException.ThrowIfNull(configuration, nameof configuration)
         services.Configure<ProcessKitOptions> configuration |> ignore
         ServiceCollectionExtensions.AddProcessKitGroup services

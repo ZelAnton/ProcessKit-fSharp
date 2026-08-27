@@ -61,6 +61,11 @@ builder. The callback runs when the keyed client is resolved and must return a n
 null result is rejected with `ArgumentNullException` naming `configure` instead of being reported as a
 missing keyed registration.
 
+Across the DI registration overloads, a null argument is rejected with `ArgumentNullException` whose
+`ParamName` matches the public signature: `services`, `configure`, `configuration`, `name`, or
+`program`. The configured-client result check above remains deferred until keyed-client resolution and
+names the callback parameter, `configure`.
+
 ```csharp
 services.AddProcessKit();
 services.AddProcessKitClient("git", "git", c => c.WithDefaults(cmd => cmd.CurrentDir("/repo")));
@@ -114,6 +119,11 @@ services.ConfigureProcessKitHostedProcess("worker", o =>
     o.ShutdownGracePeriod = TimeSpan.FromSeconds(10);
 });
 ```
+
+These Hosting extensions preserve the same diagnostic contract: a null argument reports its public
+parameter name (`services`, `name`, `command`, `configureSupervisor`, or `configure`) from
+`AddProcessKitHostedProcess`, `ConfigureProcessKitHostedProcess`, and
+`AddProcessKitHostedProcessHealthCheck`.
 
 Resolve `HostedProcessService` by the same key when you need the last `SupervisionOutcome` or stop
 outcome for health reporting. It also exposes live supervision telemetry — `IsSupervisionActive`,

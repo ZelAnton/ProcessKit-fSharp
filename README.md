@@ -1079,6 +1079,10 @@ container has an `ILoggerFactory`). The runners registered by `AddProcessKit()` 
 (`ParamName = "command"`) before applying defaults or logging and before delegating to their
 underlying runner. A keyed `AddProcessKitClient(..., configure)` callback must likewise return a
 non-null `CliClient`; resolution rejects a null result with `ArgumentNullException` naming `configure`.
+The DI registration overloads also name each null argument after their public signatures
+(`services`, `configure`, `configuration`, `name`, or `program`); the Hosting registration and
+configuration overloads do the same for `services`, `name`, `command`, `configureSupervisor`, and
+`configure`.
 
 *Deeper: [Observability](docs/observability.md).*
 
