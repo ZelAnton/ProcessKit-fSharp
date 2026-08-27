@@ -1877,6 +1877,82 @@ type JsonRpcSessionTests() =
         }
         :> Task
 
+    [<TestCase("boolean", "true")>]
+    [<TestCase("object", "{\"a\":1}")>]
+    [<TestCase("array", "[1]")>]
+    member _.``a malformed response id ends the session before a later message is delivered``
+        (caseName: string, malformedId: string)
+        : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+            let call = session.RequestRawAsync("initialize", null)
+            use! _request = nextFrame peer.Stdin
+            let nextMessage = messages.MoveNextAsync().AsTask()
+
+            peer.Stdout.Emit(framed (responseJson malformedId "{}"))
+            peer.Stdout.Emit(framed """{"jsonrpc":"2.0","method":"window/logMessage"}""")
+
+            // On the old implementation the malformed response was discarded and this move returned
+            // the following notification, so this is the negative control for terminal propagation.
+            let faulted =
+                Assert.ThrowsAsync<ProcessException>(
+                    Func<Task>(fun () -> nextMessage.WaitAsync(TimeSpan.FromSeconds 5.0))
+                )
+
+            let! requestOutcome = call.WaitAsync(TimeSpan.FromSeconds 5.0)
+
+            let terminal =
+                match requestOutcome with
+                | Error error ->
+                    match error with
+                    | ProcessError.Parse(program, detail) ->
+                        Assert.That(program, Is.EqualTo "language-server")
+                        Assert.That(detail, Does.Contain "'id'")
+                        error
+                    | other ->
+                        Assert.Fail $"expected Parse for the {caseName} response id, got {other}"
+                        Unchecked.defaultof<ProcessError>
+                | Ok result ->
+                    Assert.Fail $"the {caseName} response id incorrectly completed the request with {result}"
+                    Unchecked.defaultof<ProcessError>
+
+            match faulted with
+            | null -> Assert.Fail $"expected the {caseName} response id to fault the message stream"
+            | error -> Assert.That(error.Error, Is.EqualTo terminal, "all observers must receive the terminal error")
+
+            match! session.RequestRawAsync("shutdown", null) with
+            | Error error -> Assert.That(error, Is.EqualTo terminal, "later calls must receive the terminal error")
+            | Ok result -> Assert.Fail $"the ended session accepted a later request with {result}"
+
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``valid but uncorrelated response ids are discarded without ending the session``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            let call = session.RequestRawAsync("initialize", null)
+            use! request = nextFrame peer.Stdin
+
+            let uncorrelatedIds =
+                [| "\"unknown\""; "9223372036854775807"; "null"; "9223372036854775808"; "1.5" |]
+
+            for id in uncorrelatedIds do
+                peer.Stdout.Emit(framed (responseJson id "\"decoy\""))
+
+            peer.Stdout.Emit(framed (responseJson (rawId request) "\"genuine\""))
+
+            let! answer = call.WaitAsync(TimeSpan.FromSeconds 5.0)
+            assertRaw "\"genuine\"" answer
+        }
+        :> Task
+
     [<Test>]
     member _.``an explicit null id is delivered as a request, not folded into a notification``() : Task =
         task {

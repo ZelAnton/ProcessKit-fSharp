@@ -284,6 +284,16 @@ type JsonRpcSession
     let protocolFault (detail: string) : exn =
         ProcessException(parseFailure detail) :> exn
 
+    let validateId (element: JsonElement) =
+        // JSON-RPC 2.0 restricts `id` to a string, a number, or null. Anything else cannot be
+        // correlated or echoed in a valid response, so it is a malformed message rather than an
+        // unknown id.
+        match element.ValueKind with
+        | JsonValueKind.String
+        | JsonValueKind.Number
+        | JsonValueKind.Null -> ()
+        | _ -> raise (protocolFault "the peer sent a message whose 'id' is not a string, a number, or null")
+
     let readId (element: JsonElement) : int64 option =
         match element.ValueKind with
         | JsonValueKind.Number ->
@@ -464,18 +474,7 @@ type JsonRpcSession
                     | null -> raise (protocolFault "the peer sent a message whose 'method' is not a string")
                     | text -> text
 
-            // JSON-RPC 2.0 restricts `id` to a string, a number, or null. Anything else (object, array,
-            // boolean) cannot be echoed back as a valid response id, so a request/notification carrying
-            // one is not a well-formed message — it is rejected through the same protocol-error contract
-            // as any other malformed frame, not silently accepted and later echoed by `SendResponse`.
-            match id with
-            | Some idElement when
-                idElement.ValueKind <> JsonValueKind.String
-                && idElement.ValueKind <> JsonValueKind.Number
-                && idElement.ValueKind <> JsonValueKind.Null
-                ->
-                raise (protocolFault "the peer sent a message whose 'id' is not a string, a number, or null")
-            | _ -> ()
+            id |> Option.iter validateId
 
             let message =
                 JsonRpcMessage(
@@ -501,6 +500,7 @@ type JsonRpcSession
             | None ->
                 raise (protocolFault "the peer sent a frame that is neither a request, a notification, nor a response")
             | Some idElement ->
+                validateId idElement
                 let error = property "error"
                 let result = property "result"
 
