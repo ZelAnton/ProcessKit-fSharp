@@ -57,9 +57,10 @@ services.AddProcessKitClient("git", "git",
 Register a keyed `CliClient` per external tool, so an app injects "the git client" or "the ffmpeg client"
 by role. Each client runs through the container's registered `IProcessRunner` (so it is logger-aware and
 honours a shared group or a test runner), and `configure` applies shared defaults via the `CliClient`
-builder. The callback runs when the keyed client is resolved and must return a non-null `CliClient`; a
-null result is rejected with `ArgumentNullException` naming `configure` instead of being reported as a
-missing keyed registration.
+builder. The callback runs when the keyed client is resolved and must return a non-null `CliClient` for
+the registered program. A null result is rejected with `ArgumentNullException`, and returning a client
+for another program is rejected with `ArgumentException`; both exceptions name `configure` and surface
+from keyed-client resolution instead of being reported as a missing registration.
 
 Across the DI registration overloads, a null argument is rejected with `ArgumentNullException` whose
 `ParamName` matches the public signature: `services`, `configure`, `configuration`, `name`, or

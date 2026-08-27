@@ -164,6 +164,21 @@ public class DependencyInjectionTests
     }
 
     [Test]
+    public void AddProcessKitClient_rejects_a_configure_result_for_another_program_when_the_keyed_client_is_resolved()
+    {
+        var services = new ServiceCollection();
+        services.AddProcessKitClient("git", "git", _ => new CliClient("hg"));
+
+        using var provider = services.BuildServiceProvider();
+
+        var exception = Assert.Throws<ArgumentException>(
+            () => provider.GetRequiredKeyedService<CliClient>("git"));
+
+        Assert.That(exception!.ParamName, Is.EqualTo("configure"));
+        Assert.That(exception.Message, Does.Contain("'git'").And.Contain("'hg'"));
+    }
+
+    [Test]
     public void DI_extension_null_guards_preserve_their_public_parameter_names()
     {
         var services = new ServiceCollection();
