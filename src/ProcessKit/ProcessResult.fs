@@ -244,7 +244,7 @@ module ProcessResult =
     /// would make `IsSuccess` `true` (use `Success` for that). Negative codes are allowed (Windows
     /// reports them).
     let Failure (stdout: 'T) (stderr: string) (exitCode: int) : ProcessResult<'T> =
-        ArgumentOutOfRangeException.ThrowIfZero exitCode
+        ArgumentOutOfRangeException.ThrowIfZero(exitCode, nameof exitCode)
         ProcessResult<'T>("", stdout, stderr, Outcome.Exited exitCode, TimeSpan.Zero, false, [ 0 ])
 
     /// Build a `ProcessResult` with full control over stderr, the `Outcome` (e.g. `Outcome.Signalled` /

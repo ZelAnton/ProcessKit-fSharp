@@ -254,6 +254,9 @@ record-replay `RecordReplayRunner`, referenced only from test projects) and the
 Public core and `ProcessKit.Testing` APIs that reject a required reference argument with
 `ArgumentNullException` report the signature name in `ParamName`. Multi-argument entry points keep
 their existing validation order, so the first invalid argument remains deterministic for C# callers.
+Public range-validation entry points in core, dependency-injection, and hosting APIs likewise report
+the rejected signature parameter in `ArgumentOutOfRangeException.ParamName`; methods with multiple
+range-checked inputs preserve their existing first-failure order.
 
 On Windows, `Command.WindowsRawArg` is an explicit escape hatch for trusted fixed fragments required
 by non-MSVCRT parsers. Ordinary arguments are still quoted first; raw fragments are appended verbatim,

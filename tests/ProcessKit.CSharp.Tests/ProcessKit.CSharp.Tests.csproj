@@ -5,7 +5,7 @@
 		<IsPackable>false</IsPackable>
 		<!-- Test project ships no package, so it needs no XML doc file. -->
 		<GenerateDocumentationFile>false</GenerateDocumentationFile>
-		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Testing\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
+		<AssemblySearchPaths>$(AssemblySearchPaths);$(MainProjectDir)bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Testing\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.DependencyInjection\bin\$(Configuration)\$(TargetFramework);$(RepoRoot)src\ProcessKit.Extensions.Hosting\bin\$(Configuration)\$(TargetFramework)</AssemblySearchPaths>
 	</PropertyGroup>
 
 	<ItemGroup>
@@ -32,6 +32,7 @@
 		<Reference Include="ProcessKit" />
 		<Reference Include="ProcessKit.Testing" />
 		<Reference Include="ProcessKit.Extensions.DependencyInjection" />
+		<Reference Include="ProcessKit.Extensions.Hosting" />
 	</ItemGroup>
 
 </Project>

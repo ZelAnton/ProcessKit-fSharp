@@ -124,8 +124,8 @@ type RotatingFileSink(path: string, maxBytes: int64, maxFiles: int) =
 
     override _.Write(buffer: byte[], offset: int, count: int) =
         ArgumentNullException.ThrowIfNull(buffer, nameof buffer)
-        ArgumentOutOfRangeException.ThrowIfNegative offset
-        ArgumentOutOfRangeException.ThrowIfNegative count
+        ArgumentOutOfRangeException.ThrowIfNegative(offset, nameof offset)
+        ArgumentOutOfRangeException.ThrowIfNegative(count, nameof count)
 
         if offset > buffer.Length - count then
             raise (ArgumentException "offset and count exceed the buffer length")

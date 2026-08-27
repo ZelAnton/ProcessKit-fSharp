@@ -1289,7 +1289,7 @@ type Command internal (config: CommandConfig) =
     /// this configured `duration`. A negative `duration` is rejected; one larger than ~24.8 days is
     /// treated as no timeout.
     member _.Timeout(duration: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero, nameof duration)
         Command({ config with Timeout = Some duration })
 
     /// On timeout, send the configured `StopSignal` and force-kill only if still alive after `grace`.
@@ -1297,7 +1297,7 @@ type Command internal (config: CommandConfig) =
     /// non-default stop signals are refused at spawn. A negative `grace` is rejected
     /// (`ArgumentOutOfRangeException`), matching `Timeout`.
     member _.TimeoutGrace(grace: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero, nameof grace)
 
         Command(
             { config with
@@ -1326,7 +1326,7 @@ type Command internal (config: CommandConfig) =
     /// (`ArgumentOutOfRangeException`, matching `Timeout`); one larger than ~24.8 days is treated as no
     /// idle deadline. Honours `TimeoutGrace` (a graceful stop, then a hard kill) exactly as `Timeout`.
     member _.IdleTimeout(duration: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero, nameof duration)
 
         let updated =
             { config with
@@ -1387,7 +1387,7 @@ type Command internal (config: CommandConfig) =
     /// silently downgraded. A negative `grace` is rejected (`ArgumentOutOfRangeException`), matching
     /// `TimeoutGrace`; `TimeSpan.Zero` escalates immediately.
     member _.CancelGrace(grace: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(grace, TimeSpan.Zero, nameof grace)
 
         Command({ config with CancelGrace = Some grace })
 
@@ -1418,7 +1418,7 @@ type Command internal (config: CommandConfig) =
     member _.Retry(maxAttempts: int, delay: TimeSpan, shouldRetry: Func<ProcessError, bool>) =
         ArgumentNullException.ThrowIfNull(shouldRetry, nameof shouldRetry)
         CommandConfig.validateRetryMaxAttempts maxAttempts
-        ArgumentOutOfRangeException.ThrowIfLessThan(delay, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(delay, TimeSpan.Zero, nameof delay)
 
         Command(
             { config with
@@ -1446,8 +1446,8 @@ type Command internal (config: CommandConfig) =
         ) =
         ArgumentNullException.ThrowIfNull(shouldRetry, nameof shouldRetry)
         CommandConfig.validateRetryMaxAttempts maxAttempts
-        ArgumentOutOfRangeException.ThrowIfLessThan(baseDelay, TimeSpan.Zero)
-        ArgumentOutOfRangeException.ThrowIfLessThan(maxDelay, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(baseDelay, TimeSpan.Zero, nameof baseDelay)
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxDelay, TimeSpan.Zero, nameof maxDelay)
 
         if not (Double.IsFinite factor) || factor < 1.0 then
             raise (ArgumentOutOfRangeException(nameof factor, factor, "factor must be finite and at least 1.0"))
@@ -1472,7 +1472,7 @@ type Command internal (config: CommandConfig) =
     /// reports `ProcessError.Unsupported`; pipelines, detached launches, and test doubles reject the
     /// setting rather than silently dropping it.
     member _.ExtraFd(targetFd: int) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(targetFd, 3)
+        ArgumentOutOfRangeException.ThrowIfLessThan(targetFd, 3, nameof targetFd)
 
         if config.ExtraFds.Contains targetFd then
             raise (ArgumentException($"extra file descriptor {targetFd} is already configured", nameof targetFd))
@@ -1590,8 +1590,8 @@ type Command internal (config: CommandConfig) =
     /// `ArgumentOutOfRangeException` is thrown at the builder boundary rather than being handed to
     /// `umask(2)` as-is.
     member _.Umask(mask: int) =
-        ArgumentOutOfRangeException.ThrowIfNegative mask
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(mask, 0o7777)
+        ArgumentOutOfRangeException.ThrowIfNegative(mask, nameof mask)
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(mask, 0o7777, nameof mask)
         CommandConfig.ensureNoWindowsTokenHardening config "Umask"
         Command({ config with Umask = Some mask })
 
@@ -1683,7 +1683,7 @@ type Command internal (config: CommandConfig) =
     /// `uid` must be non-negative (rejected with `ArgumentOutOfRangeException` at the builder boundary).
     /// Pair with `Gid` (or `User`) for a full drop.
     member _.Uid(uid: int) =
-        ArgumentOutOfRangeException.ThrowIfNegative uid
+        ArgumentOutOfRangeException.ThrowIfNegative(uid, nameof uid)
         CommandConfig.ensureNoWindowsTokenHardening config "Uid"
         Command({ config with Uid = Some uid })
 
@@ -1691,7 +1691,7 @@ type Command internal (config: CommandConfig) =
     /// and privilege requirement. `setgid` is applied before any `setuid`, so the two compose into a
     /// correct privilege drop. `gid` must be non-negative.
     member _.Gid(gid: int) =
-        ArgumentOutOfRangeException.ThrowIfNegative gid
+        ArgumentOutOfRangeException.ThrowIfNegative(gid, nameof gid)
         CommandConfig.ensureNoWindowsTokenHardening config "Gid"
         Command({ config with Gid = Some gid })
 
@@ -1700,8 +1700,8 @@ type Command internal (config: CommandConfig) =
     /// supplementary-group clearing, platform notes, and privilege requirement. Both ids must be
     /// non-negative.
     member _.User(uid: int, gid: int) =
-        ArgumentOutOfRangeException.ThrowIfNegative uid
-        ArgumentOutOfRangeException.ThrowIfNegative gid
+        ArgumentOutOfRangeException.ThrowIfNegative(uid, nameof uid)
+        ArgumentOutOfRangeException.ThrowIfNegative(gid, nameof gid)
         CommandConfig.ensureNoWindowsTokenHardening config "User"
 
         Command(

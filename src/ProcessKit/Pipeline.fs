@@ -461,7 +461,7 @@ type Pipeline internal (commands: Command list, timeout: TimeSpan option, cancel
     /// Kill the whole pipeline after `duration`, reporting the result as `Outcome.TimedOut`. A
     /// negative `duration` is rejected; one larger than ~24.8 days is treated as no timeout.
     member _.Timeout(duration: TimeSpan) =
-        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero)
+        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero, nameof duration)
         Pipeline(commands, Some duration, cancelOn)
 
     /// Also cancel the whole pipeline when `cancellationToken` fires (in addition to any verb token).

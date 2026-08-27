@@ -17,7 +17,7 @@ type HostedProcessOptions() =
     member _.ShutdownGracePeriod
         with get () = shutdownGracePeriod
         and set value =
-            ArgumentOutOfRangeException.ThrowIfLessThan(value, TimeSpan.Zero)
+            ArgumentOutOfRangeException.ThrowIfLessThan(value, TimeSpan.Zero, nameof value)
             shutdownGracePeriod <- value
 
 /// An `IHostedService` wrapper over `Supervisor` for one long-lived child process.
