@@ -42,14 +42,14 @@ type ProcessStdin internal (stream: Stream, encoding: Text.Encoding, target: Pro
     /// Write raw bytes to the child's stdin. `bytes` must not be null (`ArgumentNullException` —
     /// a C# caller that forgets a null check would otherwise see a raw `NullReferenceException`).
     member _.WriteAsync(bytes: byte[], [<Optional>] cancellationToken: CancellationToken) : Task =
-        ArgumentNullException.ThrowIfNull bytes
+        ArgumentNullException.ThrowIfNull(bytes, nameof bytes)
         stream.WriteAsync(bytes, 0, bytes.Length, cancellationToken)
 
     /// Write a line of text encoded with this command's `StdinEncoding`. The line ends with `\r` for a
     /// Windows ConPTY child and `\n` for a plain pipe or POSIX PTY. `text` must not be null
     /// (`ArgumentNullException`).
     member _.WriteLineAsync(text: string, [<Optional>] cancellationToken: CancellationToken) : Task =
-        ArgumentNullException.ThrowIfNull text
+        ArgumentNullException.ThrowIfNull(text, nameof text)
 
         let bytes =
             Pump.lineWithTerminator encoding (ProcessStdinTarget.lineTerminator target) text

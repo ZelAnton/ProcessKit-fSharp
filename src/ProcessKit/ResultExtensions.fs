@@ -28,8 +28,8 @@ type ResultExtensions =
     /// Project both cases to a single value.
     [<Extension>]
     static member Match(result: Result<'T, ProcessError>, onOk: Func<'T, 'R>, onError: Func<ProcessError, 'R>) : 'R =
-        ArgumentNullException.ThrowIfNull onOk
-        ArgumentNullException.ThrowIfNull onError
+        ArgumentNullException.ThrowIfNull(onOk, nameof onOk)
+        ArgumentNullException.ThrowIfNull(onError, nameof onError)
 
         match result with
         | Ok value -> onOk.Invoke value
@@ -38,8 +38,8 @@ type ResultExtensions =
     /// Run the matching side effect (no return value).
     [<Extension>]
     static member Switch(result: Result<'T, ProcessError>, onOk: Action<'T>, onError: Action<ProcessError>) : unit =
-        ArgumentNullException.ThrowIfNull onOk
-        ArgumentNullException.ThrowIfNull onError
+        ArgumentNullException.ThrowIfNull(onOk, nameof onOk)
+        ArgumentNullException.ThrowIfNull(onError, nameof onError)
 
         match result with
         | Ok value -> onOk.Invoke value

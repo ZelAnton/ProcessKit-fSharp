@@ -400,7 +400,7 @@ type RunningProcess
                 readinessToken)
 
     let httpStatusPredicate (acceptableStatusCodes: seq<int>) =
-        ArgumentNullException.ThrowIfNull acceptableStatusCodes
+        ArgumentNullException.ThrowIfNull(acceptableStatusCodes, nameof acceptableStatusCodes)
         let accepted = HashSet<int>(acceptableStatusCodes)
 
         if accepted.Count = 0 then
@@ -1424,7 +1424,7 @@ type RunningProcess
     /// `JsonSerializerContext`. Same empty-line-skip / `ProcessError.Parse` contract as the reflection
     /// overload above.
     member this.StdoutJsonLinesAsync<'T>(typeInfo: JsonTypeInfo<'T>) : IAsyncEnumerable<'T> =
-        ArgumentNullException.ThrowIfNull typeInfo
+        ArgumentNullException.ThrowIfNull(typeInfo, nameof typeInfo)
 
         // Through the non-generic `JsonTypeInfo` base overload for the same reason the reflection
         // overload above goes through `typeof<'T>` rather than the generic `Deserialize<'T>` — sidesteps
@@ -1601,7 +1601,7 @@ type RunningProcess
     member this.WaitForLineAsync
         (predicate: Func<string, bool>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<string, ProcessError>> =
-        ArgumentNullException.ThrowIfNull predicate
+        ArgumentNullException.ThrowIfNull(predicate, nameof predicate)
 
         if not (this.StartStdoutStreaming(terminalOnly = false)) then
             Task.FromResult(Error(alreadyConsumedError ()))
@@ -1666,7 +1666,7 @@ type RunningProcess
             timeout: TimeSpan,
             cancellationToken: CancellationToken
         ) : Task<Result<string, ProcessError>> =
-        ArgumentNullException.ThrowIfNull predicate
+        ArgumentNullException.ThrowIfNull(predicate, nameof predicate)
 
         match stderrStreamUnsupported verb "wait on the merged stream with WaitForLineAsync" with
         | Some error ->
@@ -1837,7 +1837,7 @@ type RunningProcess
     member _.WaitForPathAsync
         (path: string, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        ArgumentNullException.ThrowIfNull path
+        ArgumentNullException.ThrowIfNull(path, nameof path)
         waitForPath path timeout cancellationToken
 
     /// Wait until a TCP connection to `endpoint` succeeds, or fail with `NotReady` once the shared
@@ -1866,7 +1866,7 @@ type RunningProcess
     member _.WaitForPortAsync
         (endpoint: IPEndPoint, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        ArgumentNullException.ThrowIfNull endpoint
+        ArgumentNullException.ThrowIfNull(endpoint, nameof endpoint)
         waitForPort endpoint timeout cancellationToken
 
     /// Wait until a connection to the Unix domain socket at `path` succeeds, or fail with `NotReady` once
@@ -1882,7 +1882,7 @@ type RunningProcess
     member _.WaitForSocketAsync
         (path: string, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        ArgumentNullException.ThrowIfNull path
+        ArgumentNullException.ThrowIfNull(path, nameof path)
 
         match ReadinessProbe.unixDomainSocketsSupported (fun () -> Socket.OSSupportsUnixDomainSockets) with
         | Error err -> Task.FromResult(Error err)
@@ -1919,7 +1919,7 @@ type RunningProcess
     member _.WaitForNamedPipeAsync
         (pipeName: string, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        ArgumentNullException.ThrowIfNull pipeName
+        ArgumentNullException.ThrowIfNull(pipeName, nameof pipeName)
 
         match ReadinessProbe.namedPipeSupported (fun () -> RuntimeInformation.IsOSPlatform OSPlatform.Windows) with
         | Error err -> Task.FromResult(Error err)
@@ -1975,7 +1975,7 @@ type RunningProcess
             [<Optional>] cancellationToken: CancellationToken
         ) : Task<Result<unit, ProcessError>> =
         ReadinessProbe.validateAbsoluteUri uri
-        ArgumentNullException.ThrowIfNull client
+        ArgumentNullException.ThrowIfNull(client, nameof client)
         let isSatisfactory = httpStatusPredicate acceptableStatusCodes
         this.WaitForHttpAsync(uri, client, isSatisfactory, timeout, cancellationToken)
 
@@ -1990,7 +1990,7 @@ type RunningProcess
             [<Optional>] cancellationToken: CancellationToken
         ) : Task<Result<unit, ProcessError>> =
         ReadinessProbe.validateAbsoluteUri uri
-        ArgumentNullException.ThrowIfNull isSatisfactory
+        ArgumentNullException.ThrowIfNull(isSatisfactory, nameof isSatisfactory)
         waitForHttp uri isSatisfactory timeout cancellationToken
 
     /// Like the predicate overload, but sends requests through the caller-owned `client`. ProcessKit
@@ -2004,8 +2004,8 @@ type RunningProcess
             [<Optional>] cancellationToken: CancellationToken
         ) : Task<Result<unit, ProcessError>> =
         ReadinessProbe.validateAbsoluteUri uri
-        ArgumentNullException.ThrowIfNull client
-        ArgumentNullException.ThrowIfNull isSatisfactory
+        ArgumentNullException.ThrowIfNull(client, nameof client)
+        ArgumentNullException.ThrowIfNull(isSatisfactory, nameof isSatisfactory)
         waitForHttpWithClient client uri isSatisfactory timeout cancellationToken
 
     /// Poll `probe` until it returns true, or fail with `NotReady` once the shared `timeout` deadline
@@ -2029,7 +2029,7 @@ type RunningProcess
     member _.WaitForAsync
         (probe: Func<Task<bool>>, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<unit, ProcessError>> =
-        ArgumentNullException.ThrowIfNull probe
+        ArgumentNullException.ThrowIfNull(probe, nameof probe)
         waitForCustom probe timeout cancellationToken
 
     /// A memoized task that waits for the process to exit (draining its pipes) without reaping it —
@@ -2124,7 +2124,7 @@ type RunningProcess
     /// null handling. If a pump backing one of the raced `ExitTask`s faults, that exception propagates
     /// unchanged from the awaited task — also not wrapped in a `Result`.
     static member WaitAnyAsync(processes: RunningProcess[]) : Task<WaitAnyResult> =
-        ArgumentNullException.ThrowIfNull processes
+        ArgumentNullException.ThrowIfNull(processes, nameof processes)
 
         if processes.Length = 0 then
             raise (ArgumentException("expected at least one process", nameof processes))
@@ -2149,7 +2149,7 @@ type RunningProcess
     /// handling. If a pump backing one of the `ExitTask`s faults, that exception propagates unchanged
     /// from `Task.WhenAll` — also not wrapped in a `Result`.
     static member WaitAllAsync(processes: RunningProcess[]) : Task<Outcome[]> =
-        ArgumentNullException.ThrowIfNull processes
+        ArgumentNullException.ThrowIfNull(processes, nameof processes)
 
         if processes.Length = 0 then
             raise (ArgumentException("expected at least one process", nameof processes))

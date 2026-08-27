@@ -305,7 +305,7 @@ type RecordReplayOptions
     /// `WithCommandProjection` decides otherwise — that hook changes what is *stored*, this one changes
     /// what is *matched*, and the two never interfere).
     member _.WithArgNormalizer(normalizer: Func<string[], string[]>) =
-        ArgumentNullException.ThrowIfNull normalizer
+        ArgumentNullException.ThrowIfNull(normalizer, nameof normalizer)
         RecordReplayOptions(hashFileStdinContents, Some normalizer.Invoke, redaction, matchCwd, commandProjection)
 
     /// Scrub captured **text** before it is written to the cassette, so a secret echoed to stdout/stderr
@@ -315,7 +315,7 @@ type RecordReplayOptions
     /// the same terms — its `Stdout`/`Stderr`, its `Detail`, a JSON-RPC peer's `Data`, and the `PATH` a
     /// `NotFound` searched — so the error half of an entry is no less scrubbed than the result half.
     member _.WithRedaction(redact: Func<string, string>) =
-        ArgumentNullException.ThrowIfNull redact
+        ArgumentNullException.ThrowIfNull(redact, nameof redact)
         RecordReplayOptions(hashFileStdinContents, argNormalizer, Some redact.Invoke, matchCwd, commandProjection)
 
     /// Project the **persisted** command line: the program and arguments this hook returns are what a
@@ -340,7 +340,7 @@ type RecordReplayOptions
     /// what *this* recorder records, so an `Auto` session that grows an older cassette projects only its
     /// own new rows: a fixture that already carries a secret needs re-recording, not just reopening.
     member _.WithCommandProjection(project: Func<string, string[], struct (string * string[])>) =
-        ArgumentNullException.ThrowIfNull project
+        ArgumentNullException.ThrowIfNull(project, nameof project)
 
         let projection program args =
             let struct (projectedProgram, projectedArgs) = project.Invoke(program, args)
@@ -2042,9 +2042,9 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     /// Start recording real runs (delegated to `inner`) to a cassette at `path`, with matching/redaction
     /// `options` (the same `options` must be used when the cassette is later replayed).
     static member Record(path: string, inner: IProcessRunner, options: RecordReplayOptions) =
-        ArgumentNullException.ThrowIfNull path
-        ArgumentNullException.ThrowIfNull inner
-        ArgumentNullException.ThrowIfNull options
+        ArgumentNullException.ThrowIfNull(path, nameof path)
+        ArgumentNullException.ThrowIfNull(inner, nameof inner)
+        ArgumentNullException.ThrowIfNull(options, nameof options)
         new RecordReplayRunner(RecordMode(inner, List<CassetteEntry>(), ref false), path, options)
 
     /// Load a cassette at `path` for hermetic replay.
@@ -2053,8 +2053,8 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
 
     /// Load a cassette at `path` for hermetic replay, with the matching `options` used when it was recorded.
     static member Replay(path: string, options: RecordReplayOptions) : Result<RecordReplayRunner, ProcessError> =
-        ArgumentNullException.ThrowIfNull path
-        ArgumentNullException.ThrowIfNull options
+        ArgumentNullException.ThrowIfNull(path, nameof path)
+        ArgumentNullException.ThrowIfNull(options, nameof options)
 
         match loadEntries path with
         | Error error -> Error error
@@ -2078,9 +2078,9 @@ type RecordReplayRunner private (mode: Mode, path: string, options: RecordReplay
     static member Auto
         (path: string, inner: IProcessRunner, options: RecordReplayOptions)
         : Result<RecordReplayRunner, ProcessError> =
-        ArgumentNullException.ThrowIfNull path
-        ArgumentNullException.ThrowIfNull inner
-        ArgumentNullException.ThrowIfNull options
+        ArgumentNullException.ThrowIfNull(path, nameof path)
+        ArgumentNullException.ThrowIfNull(inner, nameof inner)
+        ArgumentNullException.ThrowIfNull(options, nameof options)
 
         // Auto grows a cassette, so a missing OR whitespace-only file is a fresh start (not a load
         // error). Existing payloads go through the same bounded read as Replay, and that one text value

@@ -34,7 +34,7 @@ type internal ReadinessAttempts =
 module internal ReadinessProbe =
 
     let validateAbsoluteUri (uri: Uri) =
-        ArgumentNullException.ThrowIfNull uri
+        ArgumentNullException.ThrowIfNull(uri, nameof uri)
 
         if not uri.IsAbsoluteUri then
             raise (ArgumentException("The HTTP probe URI must be absolute.", nameof uri))

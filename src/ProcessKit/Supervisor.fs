@@ -2074,19 +2074,19 @@ type Supervisor internal (config: SupervisorConfig) =
     /// Supervise `command` with the default `JobRunner` (a fresh private kill-on-drop group per
     /// incarnation).
     new(command: Command) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Supervisor(SupervisorConfig.create command)
 
     /// Run every incarnation through `runner` instead of the default `JobRunner` — e.g. a shared
     /// `ProcessGroup` runner for one kill-on-drop group, or a test double.
     member _.WithRunner(runner: IProcessRunner) =
-        ArgumentNullException.ThrowIfNull runner
+        ArgumentNullException.ThrowIfNull(runner, nameof runner)
         Supervisor({ config with Runner = runner })
 
     /// Bound (or widen) the output captured from each incarnation. The default is a bounded tail;
     /// pass `OutputBufferPolicy.Unbounded` to retain everything.
     member _.Capture(policy: OutputBufferPolicy) =
-        ArgumentNullException.ThrowIfNull policy
+        ArgumentNullException.ThrowIfNull(policy, nameof policy)
         Supervisor({ config with Capture = policy })
 
     /// When to restart (default: `OnCrash`).
@@ -2166,7 +2166,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// exception never escapes `RunAsync` or `SupervisionSession.Completion`; the error detail names
     /// `StopWhen` and retains the completed result context. The session still performs normal teardown.
     member _.StopWhen(predicate: Func<ProcessResult<string>, bool>) =
-        ArgumentNullException.ThrowIfNull predicate
+        ArgumentNullException.ThrowIfNull(predicate, nameof predicate)
 
         Supervisor(
             { config with
@@ -2197,7 +2197,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// exception never escapes `RunAsync` or `SupervisionSession.Completion`; the error detail names
     /// `GiveUpWhen` and retains the classified error context. The session still performs normal teardown.
     member _.GiveUpWhen(classifier: Func<ProcessError, bool>) =
-        ArgumentNullException.ThrowIfNull classifier
+        ArgumentNullException.ThrowIfNull(classifier, nameof classifier)
 
         Supervisor(
             { config with
@@ -2218,7 +2218,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// any other final semantics.
     /// Default: unset.
     member _.OnRestart(handler: Action<SupervisorRestartEvent>) =
-        ArgumentNullException.ThrowIfNull handler
+        ArgumentNullException.ThrowIfNull(handler, nameof handler)
 
         Supervisor(
             { config with
@@ -2234,7 +2234,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// and retains the result/error context that led to the pause. Normal session teardown still runs.
     /// Default: unset.
     member _.OnStormPause(handler: Action<SupervisorStormPauseEvent>) =
-        ArgumentNullException.ThrowIfNull handler
+        ArgumentNullException.ThrowIfNull(handler, nameof handler)
 
         Supervisor(
             { config with
@@ -2271,7 +2271,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// negative `interval` is clamped to a safe 1 ms minimum.
     member _.LivenessHttp(uri: Uri, isSatisfactory: Func<HttpResponseMessage, bool>, interval: TimeSpan) =
         ReadinessProbe.validateAbsoluteUri uri
-        ArgumentNullException.ThrowIfNull isSatisfactory
+        ArgumentNullException.ThrowIfNull(isSatisfactory, nameof isSatisfactory)
 
         Supervisor(
             { config with
@@ -2285,8 +2285,8 @@ type Supervisor internal (config: SupervisorConfig) =
         (uri: Uri, client: HttpClient, isSatisfactory: Func<HttpResponseMessage, bool>, interval: TimeSpan)
         =
         ReadinessProbe.validateAbsoluteUri uri
-        ArgumentNullException.ThrowIfNull client
-        ArgumentNullException.ThrowIfNull isSatisfactory
+        ArgumentNullException.ThrowIfNull(client, nameof client)
+        ArgumentNullException.ThrowIfNull(isSatisfactory, nameof isSatisfactory)
 
         Supervisor(
             { config with
@@ -2303,7 +2303,7 @@ type Supervisor internal (config: SupervisorConfig) =
     /// abandoned (its late outcome safely observed) rather than pinning the monitor. A zero or negative
     /// `interval` is clamped to a safe 1 ms minimum.
     member _.LivenessCheck(probe: Func<Task<bool>>, interval: TimeSpan) =
-        ArgumentNullException.ThrowIfNull probe
+        ArgumentNullException.ThrowIfNull(probe, nameof probe)
 
         Supervisor(
             { config with

@@ -126,7 +126,7 @@ type ProcessResult<'T>
     /// needle never matches across the stdout/stderr boundary; a null needle is skipped and an empty
     /// `needles` is `false`.
     member this.OutputContainsAny(needles: seq<string>) : bool =
-        ArgumentNullException.ThrowIfNull needles
+        ArgumentNullException.ThrowIfNull(needles, nameof needles)
         let stdoutText = this.StdoutText
         // `String.IsNullOrEmpty` / `box` guard against a null stderr or a null needle element that a
         // non-nullable-unaware C# caller can still pass (the F# types say non-null); a null needle is

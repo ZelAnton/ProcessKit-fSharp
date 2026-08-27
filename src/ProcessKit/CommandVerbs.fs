@@ -157,7 +157,7 @@ type CommandVerbs =
     /// Start the command and return a live `RunningProcess`.
     [<Extension>]
     static member StartAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.start CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero/accepted exit and return stdout, trailing whitespace trimmed. Output the
@@ -166,38 +166,38 @@ type CommandVerbs =
     /// than returned as if whole — use `OutputStringAsync` for the bounded payload plus `Truncated`.
     [<Extension>]
     static member RunAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.run CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero/accepted exit, discarding the captured output — including when the buffer
     /// policy truncated it, which this verb makes no claim about.
     [<Extension>]
     static member RunUnitAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.runUnit CommandVerbs.DefaultRunner cancellationToken command
 
     /// Run to completion, capturing stdout as decoded text (a non-zero exit is data).
     [<Extension>]
     static member OutputStringAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.outputString CommandVerbs.DefaultRunner cancellationToken command
 
     /// Run to completion, capturing stdout as raw bytes.
     [<Extension>]
     static member OutputBytesAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.outputBytes CommandVerbs.DefaultRunner cancellationToken command
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel code.
     [<Extension>]
     static member ExitCodeAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.exitCode CommandVerbs.DefaultRunner cancellationToken command
 
     /// Read the exit code as a yes/no answer: 0 -> true, 1 -> false, anything else errors.
     [<Extension>]
     static member ProbeAsync(command: Command, [<Optional>] cancellationToken: CancellationToken) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.probe CommandVerbs.DefaultRunner cancellationToken command
 
     /// Require a zero/accepted exit and parse the trimmed stdout into a `'T`; a thrown parser error
@@ -206,8 +206,8 @@ type CommandVerbs =
     static member ParseAsync
         (command: Command, parser: Func<string, 'T>, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull parser
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(parser, nameof parser)
         Runner.parse CommandVerbs.DefaultRunner cancellationToken parser.Invoke command
 
     /// Like `ParseAsync`, but with the standard .NET try-parse shape: pass a BCL parser like
@@ -218,8 +218,8 @@ type CommandVerbs =
     static member TryParseAsync
         (command: Command, parser: TryParser<'T>, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull parser
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(parser, nameof parser)
         Runner.tryParse CommandVerbs.DefaultRunner cancellationToken (TryParser.toResult parser) command
 
     /// Require a zero/accepted exit and deserialize the trimmed stdout as JSON into a `'T` via
@@ -240,7 +240,7 @@ type CommandVerbs =
             [<Optional>] options: JsonSerializerOptions | null,
             [<Optional>] cancellationToken: CancellationToken
         ) =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Runner.outputJson<'T> CommandVerbs.DefaultRunner cancellationToken (Option.ofObj options) command
 
     /// Require a zero/accepted exit and deserialize the trimmed stdout using source-generated
@@ -250,8 +250,8 @@ type CommandVerbs =
     static member OutputJsonAsync<'T>
         (command: Command, typeInfo: JsonTypeInfo<'T>, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull typeInfo
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(typeInfo, nameof typeInfo)
         Runner.outputJsonTyped<'T> CommandVerbs.DefaultRunner cancellationToken typeInfo command
 
     /// The first stdout line satisfying `predicate`, or `None` if stdout closes without a match.
@@ -259,8 +259,8 @@ type CommandVerbs =
     static member FirstLineAsync
         (command: Command, predicate: Func<string, bool>, [<Optional>] cancellationToken: CancellationToken)
         =
-        ArgumentNullException.ThrowIfNull command
-        ArgumentNullException.ThrowIfNull predicate
+        ArgumentNullException.ThrowIfNull(command, nameof command)
+        ArgumentNullException.ThrowIfNull(predicate, nameof predicate)
         Runner.firstLine CommandVerbs.DefaultRunner cancellationToken predicate.Invoke command
 
     /// Encode this command's text stdin and decode its captured stdout **and** stderr with the local console
@@ -289,7 +289,7 @@ type CommandVerbs =
     /// the console code page through the native layer, which compiles after `Command.fs`.)
     [<Extension>]
     static member ConsoleEncoding(command: Command) : Command =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         command.Encoding(ConsoleEncoding.current ())
 
     /// Resolve this command's program to a full path WITHOUT spawning it — a preflight/`doctor` check
@@ -310,7 +310,7 @@ type CommandVerbs =
     /// the command overrides `PATH` (`Env`) or leans on `PreferLocal`.
     [<Extension>]
     static member ResolveProgram(command: Command) : Result<string, ProcessError> =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
         Native.Common.resolveCommandProgram command
 
     /// Launch this command **outside all containment** and let it go — the library's single, deliberate
@@ -359,7 +359,7 @@ type CommandVerbs =
     /// intercept it; put your own seam in front of it if a test must avoid launching anything.
     [<Extension>]
     static member LaunchDetached(command: Command) : Result<DetachedProcess, ProcessError> =
-        ArgumentNullException.ThrowIfNull command
+        ArgumentNullException.ThrowIfNull(command, nameof command)
 
         match DetachedLaunch.incompatibleKnob command with
         | Some error -> Error error
