@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed the `AddProcessKitGroup` configuration overload to report `services` as the null argument.
 - Runners registered by `AddProcessKit` and `AddProcessKitGroup` now reject a null command synchronously with `ArgumentNullException` naming `command` before applying defaults, logging, cancellation, or invoking the underlying runner.
 - `AddProcessKitClient(..., configure)` now rejects a null configured client with `ArgumentNullException` naming `configure` when the keyed client is resolved, instead of reporting a missing keyed registration.
+- `AddProcessKitClient(..., configure)` now rejects a configured client for a different program with `ArgumentException` naming `configure` when the keyed client is resolved, instead of silently redirecting the registration to another executable.
+- `AddProcessKitClient(..., configure)` now rejects a configured client that replaces the container-selected `IProcessRunner`, preventing named clients from bypassing shared groups, logging, or test runners.
 
 ### Added
 -

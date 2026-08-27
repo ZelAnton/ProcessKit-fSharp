@@ -144,8 +144,9 @@ type ServiceCollectionExtensions =
     /// `IProcessRunner` when present (so it is logger-aware and honours a shared group / test runner),
     /// otherwise a default `JobRunner`. `configure` applies shared defaults via the `CliClient` builder
     /// (`WithDefaults` — timeout, working directory, environment, encoding, ok-codes, …). It runs when
-    /// the keyed client is resolved and must return a non-null `CliClient`; a null result throws
-    /// `ArgumentNullException` naming `configure`.
+    /// the keyed client is resolved and must return a non-null `CliClient` for the registered `program`;
+    /// a null result throws `ArgumentNullException`, and changing the program throws `ArgumentException`,
+    /// both naming `configure`.
     ///
     /// The `name` must be unique across `AddProcessKitClient` calls on this `IServiceCollection`.
     /// Registering a second client under a name already in use throws `InvalidOperationException`
@@ -181,6 +182,25 @@ type ServiceCollectionExtensions =
 
                 let client = configure.Invoke(CliClient(program).WithRunner runner)
                 ArgumentNullException.ThrowIfNull(client, nameof configure)
+
+                let configuredProgram = client.Command(Array.empty<string>).Program
+
+                if not (String.Equals(configuredProgram, program, StringComparison.Ordinal)) then
+                    raise (
+                        ArgumentException(
+                            $"'{program}' is the registered CliClient program and cannot be changed to '{configuredProgram}' by AddProcessKitClient: configure shared defaults on the provided CliClient instead",
+                            nameof configure
+                        )
+                    )
+
+                if not (Object.ReferenceEquals(client.Runner, runner)) then
+                    raise (
+                        ArgumentException(
+                            "AddProcessKitClient configure must preserve the container-selected IProcessRunner: configure shared defaults on the provided CliClient instead",
+                            nameof configure
+                        )
+                    )
+
                 client)
         )
 
