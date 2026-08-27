@@ -193,6 +193,14 @@ type ServiceCollectionExtensions =
                         )
                     )
 
+                if not (Object.ReferenceEquals(client.Runner, runner)) then
+                    raise (
+                        ArgumentException(
+                            "AddProcessKitClient configure must preserve the container-selected IProcessRunner: configure shared defaults on the provided CliClient instead",
+                            nameof configure
+                        )
+                    )
+
                 client)
         )
 

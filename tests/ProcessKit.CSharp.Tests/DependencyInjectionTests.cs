@@ -179,6 +179,26 @@ public class DependencyInjectionTests
     }
 
     [Test]
+    public void AddProcessKitClient_rejects_a_configure_result_that_replaces_the_container_runner()
+    {
+        var services = new ServiceCollection();
+        var containerRunner = new ScriptedRunner();
+        var replacementRunner = new ScriptedRunner();
+        services.AddSingleton<IProcessRunner>(containerRunner);
+        services.AddProcessKitClient(
+            "git",
+            "git",
+            _ => new CliClient("git").WithRunner(replacementRunner));
+
+        using var provider = services.BuildServiceProvider();
+
+        var exception = Assert.Throws<ArgumentException>(
+            () => provider.GetRequiredKeyedService<CliClient>("git"));
+
+        Assert.That(exception!.ParamName, Is.EqualTo("configure"));
+    }
+
+    [Test]
     public void DI_extension_null_guards_preserve_their_public_parameter_names()
     {
         var services = new ServiceCollection();
