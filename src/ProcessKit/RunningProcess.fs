@@ -1679,34 +1679,58 @@ type RunningProcess
             match this.StartStderrReadiness() with
             | None -> Task.FromResult(Error(alreadyConsumedError ()))
             | Some watch ->
-                task {
-                    // Clamp so an out-of-range timeout can't throw out of the CTS constructor, and
-                    // report the clamped value in `NotReady` — identical to `WaitForLineAsync` above
-                    // and to `ReadinessProbe.waitForCoreUsing`: an over-long requested timeout is
-                    // silently capped at ~24.8 days, so reporting the raw value would claim a budget
-                    // longer than the one actually enforced.
-                    let armedTimeout = Timeouts.clampArmable timeout
-                    use timeoutCts = new CancellationTokenSource(armedTimeout, config.TimeProvider)
+                let projected =
+                    task {
+                        // Clamp so an out-of-range timeout can't throw out of the CTS constructor, and
+                        // report the clamped value in `NotReady` — identical to `WaitForLineAsync` above
+                        // and to `ReadinessProbe.waitForCoreUsing`: an over-long requested timeout is
+                        // silently capped at ~24.8 days, so reporting the raw value would claim a budget
+                        // longer than the one actually enforced.
+                        let armedTimeout = Timeouts.clampArmable timeout
+                        use timeoutCts = new CancellationTokenSource(armedTimeout, config.TimeProvider)
 
-                    use linked =
-                        CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)
+                        use linked =
+                            CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken)
 
-                    try
-                        match! watch.WaitAsync(mode, predicate, linked.Token) with
-                        | ValueSome text -> return Ok text
-                        | ValueNone ->
+                        let waiting = watch.WaitAsync(mode, predicate, linked.Token)
+
+                        let! observed =
+                            task {
+                                try
+                                    let! result = waiting
+                                    return Choice1Of2 result
+                                with
+                                | :? OperationCanceledException as ex ->
+                                    // Reify every failure before it reaches an async method builder. In
+                                    // particular, a faulted cancellation-shaped predicate exception must
+                                    // remain distinguishable from the watch's genuine cancellation task.
+                                    return Choice2Of2(ex :> exn)
+                                | ex -> return Choice2Of2 ex
+                            }
+
+                        match observed with
+                        | Choice1Of2(ValueSome text) -> return Task.FromResult(Ok text)
+                        | Choice1Of2 ValueNone ->
                             // stderr ended (the child exited, or the pipe reached EOF) without the
                             // predicate ever being satisfied: the readiness condition was never met,
                             // which is `NotReady` — not an indefinite wait, and not a fault.
-                            return Error(ProcessError.NotReady(config.Program, armedTimeout))
-                    with :? OperationCanceledException ->
-                        // The caller's token wins over the deadline: a cancelled wait is an error, a
-                        // timed-out one is "not ready yet".
-                        if cancellationToken.IsCancellationRequested then
-                            return Error(ProcessError.Cancelled config.Program)
-                        else
-                            return Error(ProcessError.NotReady(config.Program, armedTimeout))
-                }
+                            return Task.FromResult(Error(ProcessError.NotReady(config.Program, armedTimeout)))
+                        | Choice2Of2 _ when waiting.IsCanceled ->
+                            // The caller's token wins over the deadline: a cancelled wait is an error, a
+                            // timed-out one is "not ready yet". A FAULTED wait whose predicate threw an
+                            // OperationCanceledException follows the branch below instead.
+                            if cancellationToken.IsCancellationRequested then
+                                return Task.FromResult(Error(ProcessError.Cancelled config.Program))
+                            else
+                                return Task.FromResult(Error(ProcessError.NotReady(config.Program, armedTimeout)))
+                        | Choice2Of2 ex ->
+                            // Returning a faulted task as the value of this successful setup computation,
+                            // then unwrapping it below, keeps OperationCanceledException and
+                            // TaskCanceledException FAULTED with their exact original exception object.
+                            return Task.FromException<Result<string, ProcessError>> ex
+                    }
+
+                projected.Unwrap()
 
     /// Wait until a **stderr** line satisfies `predicate`, or fail with `NotReady` after `timeout` (or
     /// `Cancelled` if `cancellationToken` fires first) — `WaitForLineAsync`'s exact contract, pointed at

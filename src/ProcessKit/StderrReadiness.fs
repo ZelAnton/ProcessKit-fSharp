@@ -122,6 +122,13 @@ type internal StderrReadinessWatch(retentionBytes: int) =
 
     let waiters = ResizeArray<StderrReadinessWaiter>()
 
+    // A retained predicate can synchronously start another wait on this watch. `Monitor` is recursive,
+    // so `gate` alone would let that nested wait scan and consume the queue snapshot its caller is
+    // still evaluating. Such starts are held here until the outer scan commits or rolls back, then
+    // resolved in call order against the observations that remain.
+    let deferredRetainedWaiters = ResizeArray<StderrReadinessWaiter>()
+    let mutable retainedScanActive = false
+
     // Set once stderr observation is over for this handle: the pump reached EOF, failed, or the
     // session's own outcome concluded past an abandoned pump. `fault` carries the pump's failure when
     // that is why it ended, so a wait surfaces the real error instead of a readiness verdict.
@@ -259,6 +266,26 @@ type internal StderrReadinessWatch(retentionBytes: int) =
 
             Ok found
 
+    // Resolve waits started reentrantly by a retained predicate. The list can grow while one of these
+    // predicates runs, so drain it from the front rather than iterating a fixed snapshot. A cancelled
+    // deferred wait is removed by `Release` before it reaches here.
+    let resolveDeferredRetainedWaiters () =
+        while deferredRetainedWaiters.Count > 0 do
+            let waiter = deferredRetainedWaiters[0]
+            deferredRetainedWaiters.RemoveAt 0
+
+            if not waiter.Completion.Task.IsCompleted then
+                match scanRetained waiter.Mode waiter.Predicate with
+                | Error ex -> waiter.Completion.TrySetException ex |> ignore
+                | Ok(ValueSome text) -> waiter.Completion.TrySetResult(ValueSome text) |> ignore
+                | Ok ValueNone ->
+                    if ended then
+                        match fault with
+                        | Some ex -> waiter.Completion.TrySetException ex |> ignore
+                        | None -> waiter.Completion.TrySetResult ValueNone |> ignore
+                    else
+                        waiters.Add waiter
+
     /// The text the pump appended to its in-flight line since the previous report (see
     /// `Pump.ITailObserver`). Offered whole — the accumulated tail, not just the new fragment — to the
     /// armed tail waits, so a prompt split across two reads still matches as one string.
@@ -327,22 +354,42 @@ type internal StderrReadinessWatch(retentionBytes: int) =
     /// observe completion, and this is that same order), then either answer immediately or go live.
     member _.TryStart(mode: StderrReadinessMode, predicate: Func<string, bool>) : StderrReadinessStart =
         lock gate (fun () ->
-            match scanRetained mode predicate with
-            | Error ex -> StderrReadinessStart.Faulted ex
-            | Ok(ValueSome text) -> StderrReadinessStart.Matched text
-            | Ok ValueNone ->
-                if ended then
-                    match fault with
-                    | Some ex -> StderrReadinessStart.Faulted ex
-                    | None -> StderrReadinessStart.Ended
-                else
-                    let waiter = StderrReadinessWaiter(mode, predicate)
-                    waiters.Add waiter
-                    StderrReadinessStart.Armed waiter)
+            if retainedScanActive then
+                // The outer retained scan owns its snapshot until it commits or rolls back. Return an
+                // ordinary armed wait now; the outermost `TryStart` resolves it against the remainder
+                // before releasing `gate`, so reentrancy cannot double-consume the same observations.
+                let waiter = StderrReadinessWaiter(mode, predicate)
+                deferredRetainedWaiters.Add waiter
+                StderrReadinessStart.Armed waiter
+            else
+                retainedScanActive <- true
+
+                try
+                    let retainedResult = scanRetained mode predicate
+                    resolveDeferredRetainedWaiters ()
+
+                    match retainedResult with
+                    | Error ex -> StderrReadinessStart.Faulted ex
+                    | Ok(ValueSome text) -> StderrReadinessStart.Matched text
+                    | Ok ValueNone ->
+                        if ended then
+                            match fault with
+                            | Some ex -> StderrReadinessStart.Faulted ex
+                            | None -> StderrReadinessStart.Ended
+                        else
+                            // Reentrant waits were started from inside this predicate, so they precede
+                            // the outer wait when neither matched retained output.
+                            let waiter = StderrReadinessWaiter(mode, predicate)
+                            waiters.Add waiter
+                            StderrReadinessStart.Armed waiter
+                finally
+                    retainedScanActive <- false)
 
     /// Drop `waiter` — its wait was cancelled, timed out, or has already been answered.
     member _.Release(waiter: StderrReadinessWaiter) =
-        lock gate (fun () -> waiters.Remove waiter |> ignore)
+        lock gate (fun () ->
+            waiters.Remove waiter |> ignore
+            deferredRetainedWaiters.Remove waiter |> ignore)
 
     /// Wait until a framed stderr line (`Line`) or the unterminated tail (`Tail`) satisfies
     /// `predicate`. `ValueSome text` is the text that matched; `ValueNone` means stderr observation
@@ -359,19 +406,43 @@ type internal StderrReadinessWatch(retentionBytes: int) =
         | StderrReadinessStart.Ended -> Task.FromResult ValueNone
         | StderrReadinessStart.Faulted ex -> Task.FromException<string voption> ex
         | StderrReadinessStart.Armed waiter ->
-            task {
-                // Registered AFTER the waiter is armed, so an already-cancelled token resolves it
-                // immediately rather than leaving it live on the watch. Disposed with this scope, which
-                // also waits out a callback running concurrently.
-                use _registration =
-                    cancellationToken.Register(fun () ->
-                        this.Release waiter
-                        waiter.Completion.TrySetCanceled cancellationToken |> ignore)
+            // An async method builder classifies every escaping OperationCanceledException as task
+            // cancellation, even when a predicate FAULTED its completion with that exception. Mirror
+            // the completion through a TCS instead: TrySetException keeps that distinction intact,
+            // while TrySetCanceled remains the watch's genuine cancellation channel.
+            let returned =
+                TaskCompletionSource<string voption>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-                try
-                    return! waiter.Completion.Task
-                finally
+            // Registered AFTER the waiter is armed, so an already-cancelled token resolves it
+            // immediately rather than leaving it live on the watch.
+            let registration =
+                cancellationToken.Register(fun () ->
+                    this.Release waiter
+                    waiter.Completion.TrySetCanceled cancellationToken |> ignore)
+
+            waiter.Completion.Task.ContinueWith(
+                Action<Task<string voption>>(fun completed ->
+                    registration.Dispose()
+
                     // The pump removes a waiter it completes, so this covers the other exits —
                     // cancellation, the deadline, a faulting predicate — and is idempotent either way.
                     this.Release waiter
-            }
+
+                    if completed.IsCanceled then
+                        returned.TrySetCanceled cancellationToken |> ignore
+                    elif completed.IsFaulted then
+                        try
+                            completed.GetAwaiter().GetResult() |> ignore
+                        with ex ->
+                            // `GetResult` unwraps the one fault this waiter owns, preserving its exact
+                            // exception object instead of exposing Task's nullable AggregateException.
+                            returned.TrySetException ex |> ignore
+                    else
+                        returned.TrySetResult completed.Result |> ignore),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default
+            )
+            |> ignore
+
+            returned.Task

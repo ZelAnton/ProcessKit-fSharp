@@ -657,6 +657,10 @@ If a `WaitForStderrLineAsync` or `WaitForStderrTailAsync` predicate throws, the 
 with that same exception, whether the predicate examined output retained between waits or output that
 arrived after the wait was armed. Catch it around `await`; the failed wait leaves the stderr pump and
 other waits running, and a retained observation is not consumed merely because its predicate threw.
+This includes `OperationCanceledException` and its subclasses: only cancellation of the wait itself —
+through the caller's token or its deadline — becomes a typed `Cancelled` or `NotReady` result. A
+predicate may also start another stderr readiness wait on the same handle without blocking; the outer
+scan claims first, then the nested wait sees only the retained observations that remain.
 
 HTTP readiness and supervisor liveness accept a caller-owned `HttpClient` for authentication headers,
 custom TLS validation, proxies, or alternate transports. ProcessKit reuses but never mutates or

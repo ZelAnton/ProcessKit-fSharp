@@ -2445,6 +2445,16 @@ type StderrReadinessTests() =
 
     let writeUtf8 (stream: Stream) (text: string) = write stream Encoding.UTF8 text
 
+    let assertFaultedWith (expected: exn) (failed: Task<Result<string, ProcessError>>) =
+        Assert.That(failed.IsFaulted, Is.True)
+        Assert.That(failed.IsCanceled, Is.False)
+
+        match failed.Exception with
+        | null -> Assert.Fail "the faulted wait did not expose its exception"
+        | aggregate ->
+            Assert.That(aggregate.InnerExceptions.Count, Is.EqualTo 1)
+            Assert.That(aggregate.InnerException, Is.SameAs expected)
+
     [<Test>]
     member _.``WaitForStderrLine matches a stderr line from a real child``() : Task =
         task {
@@ -2993,6 +3003,179 @@ type StderrReadinessTests() =
             with
             | ValueSome tail -> Assert.That(tail, Is.EqualTo "retained tail")
             | ValueNone -> Assert.Fail "the failed scan consumed the retained tail"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a retained stderr predicate cancellation faults the public wait with the same exception``() : Task =
+        task {
+            let barrierEntered =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use releaseBarrier = new ManualResetEventSlim(false)
+
+            let config =
+                (Command.create "test"
+                 |> Command.onStderrLine (fun line ->
+                     if line = "barrier" then
+                         barrierEntered.TrySetResult() |> ignore
+                         releaseBarrier.Wait()))
+                    .Config
+
+            let running, _stdout, stderr = liveChild config
+            use running = running
+
+            try
+                let seed =
+                    running.WaitForStderrLineAsync((fun line -> line = "seed"), TimeSpan.FromSeconds 10.0)
+
+                do! writeUtf8 stderr "seed\n"
+
+                match! seed with
+                | Ok line -> Assert.That(line, Is.EqualTo "seed")
+                | Error error -> Assert.Fail $"{error}"
+
+                // The barrier handler runs before its own line reaches the watch. Once it is entered,
+                // the preceding line has definitely been retained and the pump cannot race this scan.
+                do! writeUtf8 stderr "retained\nbarrier\n"
+                do! barrierEntered.Task
+                let predicateError = OperationCanceledException "retained predicate cancellation"
+
+                let failed =
+                    running.WaitForStderrLineAsync((fun _ -> raise predicateError), TimeSpan.FromSeconds 10.0)
+
+                assertFaultedWith predicateError failed
+
+                let thrown =
+                    Assert.ThrowsAsync<OperationCanceledException>(Func<Task>(fun () -> failed :> Task))
+
+                Assert.That(thrown, Is.SameAs predicateError)
+                assertFaultedWith predicateError failed
+
+                match! running.WaitForStderrLineAsync((fun line -> line = "retained"), TimeSpan.FromSeconds 10.0) with
+                | Ok line -> Assert.That(line, Is.EqualTo "retained")
+                | Error error -> Assert.Fail $"{error}"
+            finally
+                releaseBarrier.Set()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``an armed stderr-tail predicate cancellation faults the public wait with the same exception``() : Task =
+        task {
+            let running, _stdout, stderr = liveChild (Command.create "test").Config
+            use running = running
+            let predicateError = TaskCanceledException "armed predicate cancellation"
+
+            let failed =
+                running.WaitForStderrTailAsync((fun _ -> raise predicateError), TimeSpan.FromSeconds 10.0)
+
+            do! writeUtf8 stderr "prompt"
+
+            let! completed = Task.WhenAny(failed :> Task, Task.Delay 5000)
+            Assert.That(completed, Is.SameAs(failed :> Task), "the armed predicate did not settle")
+            assertFaultedWith predicateError failed
+
+            let thrown =
+                Assert.ThrowsAsync<TaskCanceledException>(Func<Task>(fun () -> failed :> Task))
+
+            Assert.That(thrown, Is.SameAs predicateError)
+            assertFaultedWith predicateError failed
+
+            match! running.WaitForStderrTailAsync((fun tail -> tail = "prompt"), TimeSpan.FromSeconds 10.0) with
+            | Ok tail -> Assert.That(tail, Is.EqualTo "prompt")
+            | Error error -> Assert.Fail $"{error}"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a reentrant retained wait claims only the observations left by its outer wait``() : Task =
+        task {
+            let barrierEntered =
+                TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            use releaseBarrier = new ManualResetEventSlim(false)
+
+            let config =
+                (Command.create "test"
+                 |> Command.onStderrLine (fun line ->
+                     if line = "barrier" then
+                         barrierEntered.TrySetResult() |> ignore
+                         releaseBarrier.Wait()))
+                    .Config
+
+            let running, _stdout, stderr = liveChild config
+            use running = running
+
+            try
+                let seed =
+                    running.WaitForStderrLineAsync((fun line -> line = "seed"), TimeSpan.FromSeconds 10.0)
+
+                do! writeUtf8 stderr "seed\n"
+
+                match! seed with
+                | Ok line -> Assert.That(line, Is.EqualTo "seed")
+                | Error error -> Assert.Fail $"{error}"
+
+                do! writeUtf8 stderr "outer\nnested\nlater\nbarrier\n"
+                do! barrierEntered.Task
+
+                let outerSeen = ResizeArray<string>()
+                let nestedSeen = ResizeArray<string>()
+                let laterSeen = ResizeArray<string>()
+                let mutable nestedWait: Task<Result<string, ProcessError>> option = None
+
+                let outerWait =
+                    running.WaitForStderrLineAsync(
+                        (fun line ->
+                            outerSeen.Add line
+
+                            if line = "outer" then
+                                nestedWait <-
+                                    Some(
+                                        running.WaitForStderrLineAsync(
+                                            (fun nested ->
+                                                nestedSeen.Add nested
+                                                nested = "nested"),
+                                            TimeSpan.FromSeconds 10.0
+                                        )
+                                    )
+
+                            line = "outer"),
+                        TimeSpan.FromSeconds 10.0
+                    )
+
+                match! outerWait with
+                | Ok line -> Assert.That(line, Is.EqualTo "outer")
+                | Error error -> Assert.Fail $"{error}"
+
+                match nestedWait with
+                | None -> Assert.Fail "the outer predicate did not start its nested wait"
+                | Some waiting ->
+                    match! waiting with
+                    | Ok line -> Assert.That(line, Is.EqualTo "nested")
+                    | Error error -> Assert.Fail $"{error}"
+
+                Assert.That(List.ofSeq outerSeen, Is.EqualTo<string list> [ "outer" ])
+                Assert.That(List.ofSeq nestedSeen, Is.EqualTo<string list> [ "nested" ])
+
+                let laterWait =
+                    running.WaitForStderrLineAsync(
+                        (fun line ->
+                            laterSeen.Add line
+                            line = "later"),
+                        TimeSpan.FromSeconds 10.0
+                    )
+
+                Assert.That(laterWait.IsCompleted, Is.True, "the unclaimed retained line must remain queued")
+
+                match! laterWait with
+                | Ok line -> Assert.That(line, Is.EqualTo "later")
+                | Error error -> Assert.Fail $"{error}"
+
+                Assert.That(List.ofSeq laterSeen, Is.EqualTo<string list> [ "later" ])
+            finally
+                releaseBarrier.Set()
         }
         :> Task
 
