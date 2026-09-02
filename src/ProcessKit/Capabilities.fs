@@ -264,6 +264,9 @@ type internal MechanismChoice =
 /// effects, which is what makes it shareable with a probe that must create nothing.
 module internal MechanismSelection =
 
+    let cgroupControllerMissing (controller: string) (file: string) =
+        $"the cgroup v2 '{controller}' controller ({file}); this hierarchy's cgroup.controllers does not list it, so no such cap can be enforced here"
+
     /// The decision, with the platform facts injected. The cgroup probes are thunks so they run only on
     /// the branch that consults them — `Create` must not pay a filesystem probe on a Windows or limit-free
     /// POSIX group — and so a test can drive every mechanism from any build host.
@@ -273,6 +276,7 @@ module internal MechanismSelection =
         (isFreeBsd: bool)
         (cgroupV2Available: unit -> bool)
         (cgroupIoAvailable: unit -> bool)
+        (cgroupCpusetAvailable: unit -> bool)
         (options: ProcessGroupOptions)
         : MechanismChoice =
         let limits = options.Limits
@@ -315,6 +319,10 @@ module internal MechanismSelection =
                             MechanismChoice.Refused(
                                 ProcessError.Unsupported
                                     "the Linux cgroup v2 hierarchy does not expose the io controller required by io.max"
+                            )
+                        elif limits.CpuAffinity.IsSome && not (cgroupCpusetAvailable ()) then
+                            MechanismChoice.Refused(
+                                ProcessError.Unsupported(cgroupControllerMissing "cpuset" "cpuset.cpus")
                             )
                         else
                             MechanismChoice.Selected Mechanism.CgroupV2
@@ -371,6 +379,7 @@ module internal MechanismSelection =
             Native.FreeBsd.isFreeBsd
             Native.Cgroup.cgroupV2Available
             Native.Cgroup.cgroupIoAvailable
+            (fun () -> Native.Cgroup.cgroupControllerAvailable "cpuset")
             options
 
 /// Builds a `ContainmentCapabilities` from a set of platform facts.
@@ -460,9 +469,6 @@ module internal CapabilityProbe =
     /// neighbouring facts, not the same one.
     let private cgroupRootQualification =
         "the cgroup v2 controllers must be delegable from the REAL cgroup v2 hierarchy root; inside a container or a systemd scope/service that write is refused and ProcessGroup.Create fails with ProcessError.ResourceLimit"
-
-    let private cgroupControllerMissing (controller: string) (file: string) =
-        $"the cgroup v2 '{controller}' controller ({file}); this hierarchy's cgroup.controllers does not list it, so no such cap can be enforced here"
 
     let private noWholeTreeContainer =
         "a whole-tree container - a Windows Job Object or a usable Linux cgroup v2 hierarchy; this host has neither, so ProcessGroup.Create refuses the cap with ProcessError.ResourceLimit rather than running the tree unbounded"
@@ -558,11 +564,11 @@ module internal CapabilityProbe =
                 (if facts.CgroupCpusetAvailable then
                      cgroupCap "cpuset.cpus"
                  else
-                     Capability.Unsupported(cgroupControllerMissing "cpuset" "cpuset.cpus")),
+                     Capability.Unsupported(MechanismSelection.cgroupControllerMissing "cpuset" "cpuset.cpus")),
                 (if facts.CgroupIoAvailable then
                      cgroupCap "io.max"
                  else
-                     Capability.Unsupported(cgroupControllerMissing "io" "io.max")),
+                     Capability.Unsupported(MechanismSelection.cgroupControllerMissing "io" "io.max")),
                 Capability.Unsupported uiRestrictionsWindowsOnly,
                 Capability.Qualified
                     $"ProcessGroup.UpdateLimits rewrites the live cgroup's controller files in place, so it needs a group created WITH whole-tree limits (which is what selects the cgroup v2 mechanism); a limit-free Linux group uses the POSIX process group and is refused with ProcessError.ResourceLimit - and {cgroupRootQualification}"
@@ -751,6 +757,7 @@ module internal CapabilityProbe =
                 facts.IsFreeBsd
                 (fun () -> facts.CgroupV2Available)
                 (fun () -> facts.CgroupIoAvailable)
+                (fun () -> facts.CgroupCpusetAvailable)
                 options
 
         // The axes that follow from the MECHANISM cannot be answered when no group can be created with

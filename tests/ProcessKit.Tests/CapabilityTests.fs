@@ -243,10 +243,95 @@ type CapabilityTests() =
                     CgroupCpusetAvailable = false }
                 (CapabilityFacts.wholeTreeLimits ())
 
+        Assert.That(caps.Mechanism, Is.EqualTo(Some Mechanism.CgroupV2))
         unsupported "CpuAffinity" "'cpuset' controller" caps.ResourceLimits.CpuAffinity
         // Everything the missing controller has nothing to do with is untouched.
         qualified "MemoryMax" "memory.max" caps.ResourceLimits.MemoryMax
         qualified "IoMax" "io.max" caps.ResourceLimits.IoMax
+
+    [<Test>]
+    member _.``Linux CpuAffinity refuses selection when the cpuset controller is unavailable``() =
+        let options = ProcessGroupOptions().WithCpuAffinity [ 0 ]
+
+        let withoutCpuset =
+            { CapabilityFacts.linux with
+                CgroupCpusetAvailable = false }
+
+        let caps = CapabilityProbe.snapshot withoutCpuset options
+
+        Assert.That(caps.Mechanism, Is.EqualTo(None: Mechanism option))
+        unsupported "Creation" "'cpuset' controller" caps.Creation
+        unsupported "Creation" "cpuset.cpus" caps.Creation
+        unsupported "CpuAffinity" "'cpuset' controller" caps.ResourceLimits.CpuAffinity
+
+        match
+            MechanismSelection.chooseUsing
+                withoutCpuset.IsWindows
+                withoutCpuset.IsLinux
+                withoutCpuset.IsFreeBsd
+                (fun () -> withoutCpuset.CgroupV2Available)
+                (fun () ->
+                    Assert.Fail "CpuAffinity selection must not probe the unrelated io controller"
+                    false)
+                (fun () -> withoutCpuset.CgroupCpusetAvailable)
+                options
+        with
+        | MechanismChoice.Refused(ProcessError.Unsupported detail) ->
+            Assert.That(detail, Does.Contain "'cpuset' controller")
+            Assert.That(detail, Does.Contain "cpuset.cpus")
+        | other -> Assert.Fail $"expected a typed cpuset Unsupported refusal, got {other}"
+
+        let availableCaps = CapabilityProbe.snapshot CapabilityFacts.linux options
+        Assert.That(availableCaps.Mechanism, Is.EqualTo(Some Mechanism.CgroupV2))
+        qualified "Creation" "REAL cgroup v2 hierarchy root" availableCaps.Creation
+
+    [<Test>]
+    member _.``cgroup selection probes only controllers required by the requested limits``() =
+        let unexpected probe () =
+            Assert.Fail $"the {probe} probe was not required by these options"
+            false
+
+        let noLimitChoice =
+            MechanismSelection.chooseUsing
+                false
+                true
+                false
+                (unexpected "cgroup v2")
+                (unexpected "io")
+                (unexpected "cpuset")
+                (CapabilityFacts.noLimits ())
+
+        match noLimitChoice with
+        | MechanismChoice.Selected Mechanism.ProcessGroup -> ()
+        | other -> Assert.Fail $"expected the limit-free process-group selection, got {other}"
+
+        let memoryChoice =
+            MechanismSelection.chooseUsing
+                false
+                true
+                false
+                (fun () -> true)
+                (unexpected "io")
+                (unexpected "cpuset")
+                (CapabilityFacts.wholeTreeLimits ())
+
+        match memoryChoice with
+        | MechanismChoice.Selected Mechanism.CgroupV2 -> ()
+        | other -> Assert.Fail $"expected the memory-limited cgroup v2 selection, got {other}"
+
+        let ioChoice =
+            MechanismSelection.chooseUsing
+                false
+                true
+                false
+                (fun () -> true)
+                (fun () -> true)
+                (unexpected "cpuset")
+                (ProcessGroupOptions().WithIoMax("8:16", 4096L, 0L, 12L, 0L))
+
+        match ioChoice with
+        | MechanismChoice.Selected Mechanism.CgroupV2 -> ()
+        | other -> Assert.Fail $"expected the I/O-limited cgroup v2 selection, got {other}"
 
     [<Test>]
     member _.``a limit-free Linux group is a process group, yet the host's cgroup limits are not understated``() =

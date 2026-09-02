@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Linux `ProcessGroup.Create` now rejects `CpuAffinity` before creating a group with `ProcessError.Unsupported` when the cgroup v2 hierarchy lacks the `cpuset` controller; `ProcessGroup.Capabilities(options)` reports the same missing `cpuset.cpus` prerequisite and no selected mechanism.
 - `ProcessError.NotFound` now counts each positional empty component of a non-empty POSIX `PATH` as the effective working directory in its `searched N PATH entries` message, matching executable resolution; Windows still omits empty components from the count.
 - POSIX `ProcessError.Spawn` diagnostics now preserve the requested program when `Command.Rlimit` composes with privilege helpers across ordinary, PTY, cgroup, and detached launches.
 - Raw `ReportJson.*TypeInfo` serialization now writes a null report reference as JSON `null` instead of failing inside a converter with `NullReferenceException`; non-null report shapes and the `ToReportJson()` null guards are unchanged.
