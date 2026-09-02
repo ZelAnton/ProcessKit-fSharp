@@ -43,6 +43,54 @@ public class NullValidationTests
             (Action)(() => _ = new RecordReplayOptions().WithArgNormalizer(null!)),
             "normalizer"
         ).SetName("Testing options name normalizer");
+
+        yield return Case(() => _ = new Command("tool").Priority(null!), "priority", "Command.Priority");
+        yield return Case(() => _ = new Command("tool").IoPriority(null!), "priority", "Command.IoPriority");
+        yield return Case(
+            () => _ = new Command("tool").LineTerminator(null!),
+            "terminator",
+            "Command.LineTerminator"
+        );
+        yield return Case(
+            () => _ = new Command("tool").StdoutLineTerminator(null!),
+            "terminator",
+            "Command.StdoutLineTerminator"
+        );
+        yield return Case(
+            () => _ = new Command("tool").StderrLineTerminator(null!),
+            "terminator",
+            "Command.StderrLineTerminator"
+        );
+        yield return Case(() => _ = new Command("tool").Stdout(null!), "mode", "Command.Stdout");
+        yield return Case(() => _ = new Command("tool").Stderr(null!), "mode", "Command.Stderr");
+        yield return Case(() => _ = new Command("tool").StopSignal(null!), "signal", "Command.StopSignal");
+        yield return Case(() => _ = new Command("tool").CancelSignal(null!), "signal", "Command.CancelSignal");
+        yield return Case(
+            () => _ = new Command("tool").WindowsIntegrityLevel(null!),
+            "level",
+            "Command.WindowsIntegrityLevel"
+        );
+        yield return Case(
+            () => _ = OutputBufferPolicy.Default.WithOverflow(null!),
+            "overflow",
+            "OutputBufferPolicy.WithOverflow"
+        );
+        yield return Case(
+            () => _ = StreamBufferPolicy.Bounded(1).WithFullMode(null!),
+            "fullMode",
+            "StreamBufferPolicy.WithFullMode"
+        );
+        yield return Case(() => _ = ProcessResult.Failure("", null!, 1), "stderr", "ProcessResult.Failure");
+        yield return Case(
+            () => _ = ProcessResult.Create("", null!, Outcome.NewExited(0), TimeSpan.Zero),
+            "stderr",
+            "ProcessResult.Create stderr"
+        );
+        yield return Case(
+            () => _ = ProcessResult.Create("", "", null!, TimeSpan.Zero),
+            "outcome",
+            "ProcessResult.Create outcome"
+        );
     }
 
     [TestCaseSource(nameof(PublicBoundaryCases))]
@@ -99,6 +147,15 @@ public class NullValidationTests
         AssertParamName(() => _ = client.ParseAsync<string>(null!, null!, default), "parser");
         AssertParamName(() => _ = client.ParseAsync(null!, static value => value, default), "args");
     }
+
+    [Test]
+    public void ProcessResult_Create_validates_stderr_before_outcome()
+    {
+        AssertParamName(() => _ = ProcessResult.Create("", null!, null!, TimeSpan.Zero), "stderr");
+    }
+
+    private static TestCaseData Case(Action call, string expectedParamName, string name) =>
+        new TestCaseData(call, expectedParamName).SetName(name);
 
     private static void AssertParamName(Action call, string expectedParamName)
     {

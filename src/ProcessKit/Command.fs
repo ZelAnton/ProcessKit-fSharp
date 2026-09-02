@@ -983,6 +983,7 @@ type Command internal (config: CommandConfig) =
     /// Set how the child's standard output is connected (default `Piped`). This is a stdout *destination*
     /// setter, so it also clears any prior `StdoutToFile` redirect — the last destination in a chain wins.
     member _.Stdout(mode: StdioMode) =
+        ArgumentNullException.ThrowIfNull(mode, nameof mode)
         CommandConfig.ensureStdoutModeCompatible config mode
 
         let updated =
@@ -996,6 +997,7 @@ type Command internal (config: CommandConfig) =
     /// Set how the child's standard error is connected (default `Piped`). Also clears any prior
     /// `StderrToFile` redirect — the last destination in a chain wins (see `Stdout`).
     member _.Stderr(mode: StdioMode) =
+        ArgumentNullException.ThrowIfNull(mode, nameof mode)
         CommandConfig.ensureStderrModeCompatible config mode
 
         let updated =
@@ -1121,6 +1123,8 @@ type Command internal (config: CommandConfig) =
     /// `\r`. Affects only the line-pumped path (streaming, per-line handlers, `OutputStringAsync`); the
     /// raw `OutputBytesAsync` bytes and the tees stay byte-exact.
     member _.StdoutLineTerminator(terminator: LineTerminator) =
+        ArgumentNullException.ThrowIfNull(terminator, nameof terminator)
+
         Command(
             { config with
                 StdoutLineTerminator = terminator }
@@ -1129,6 +1133,8 @@ type Command internal (config: CommandConfig) =
     /// Frame captured/streamed **stderr** lines with `terminator` (default `LineTerminator.Lf`). See
     /// `StdoutLineTerminator`; the stdout framing is left untouched.
     member _.StderrLineTerminator(terminator: LineTerminator) =
+        ArgumentNullException.ThrowIfNull(terminator, nameof terminator)
+
         Command(
             { config with
                 StderrLineTerminator = terminator }
@@ -1137,6 +1143,8 @@ type Command internal (config: CommandConfig) =
     /// Frame **both** captured/streamed streams' lines with `terminator`. See `StdoutLineTerminator`
     /// for what the line framing governs (and what it leaves byte-exact).
     member _.LineTerminator(terminator: LineTerminator) =
+        ArgumentNullException.ThrowIfNull(terminator, nameof terminator)
+
         Command(
             { config with
                 StdoutLineTerminator = terminator
@@ -1309,6 +1317,7 @@ type Command internal (config: CommandConfig) =
     /// faithfully represent arbitrary POSIX signals; its existing WM_CLOSE/CTRL+BREAK mechanisms remain
     /// available through the documented Windows control APIs.
     member _.StopSignal(signal: Signal) =
+        ArgumentNullException.ThrowIfNull(signal, nameof signal)
         SignalValidation.gracefulStop (nameof signal) signal
         Command({ config with StopSignal = signal })
 
@@ -1400,6 +1409,7 @@ type Command internal (config: CommandConfig) =
     /// value at spawn with `ProcessError.Unsupported` (it cannot faithfully represent an arbitrary POSIX
     /// signal), exactly as `StopSignal` does, never a silent downgrade to the hard kill.
     member _.CancelSignal(signal: Signal) =
+        ArgumentNullException.ThrowIfNull(signal, nameof signal)
         SignalValidation.gracefulStop (nameof signal) signal
 
         Command(
@@ -1539,6 +1549,7 @@ type Command internal (config: CommandConfig) =
     /// (`Priority.High`/`Priority.AboveNormal`) needs privilege — without it the spawn fails with
     /// `ProcessError.Spawn` rather than silently running lower. See `Priority`.
     member _.Priority(priority: Priority) =
+        ArgumentNullException.ThrowIfNull(priority, nameof priority)
         Command({ config with Priority = Some priority })
 
     /// Set the **Linux I/O-scheduling priority** of the child — and of the tree it spawns — so that
@@ -1833,6 +1844,7 @@ type Command internal (config: CommandConfig) =
     /// writes its output back normally. **Windows-only**, with the same honest `ProcessError.Unsupported`
     /// on POSIX and the same builder-boundary conflicts as `WindowsRestrictedToken`.
     member _.WindowsIntegrityLevel(level: WindowsIntegrityLevel) =
+        ArgumentNullException.ThrowIfNull(level, nameof level)
         CommandConfig.ensureWindowsTokenHardeningCompatible config "WindowsIntegrityLevel"
 
         Command(

@@ -245,11 +245,14 @@ module ProcessResult =
     /// reports them).
     let Failure (stdout: 'T) (stderr: string) (exitCode: int) : ProcessResult<'T> =
         ArgumentOutOfRangeException.ThrowIfZero(exitCode, nameof exitCode)
+        ArgumentNullException.ThrowIfNull(stderr, nameof stderr)
         ProcessResult<'T>("", stdout, stderr, Outcome.Exited exitCode, TimeSpan.Zero, false, [ 0 ])
 
     /// Build a `ProcessResult` with full control over stderr, the `Outcome` (e.g. `Outcome.Signalled` /
     /// `Outcome.TimedOut`), and the duration. Success is judged against the default `{0}` ok-codes.
     let Create (stdout: 'T) (stderr: string) (outcome: Outcome) (duration: TimeSpan) : ProcessResult<'T> =
+        ArgumentNullException.ThrowIfNull(stderr, nameof stderr)
+        ArgumentNullException.ThrowIfNull(outcome, nameof outcome)
         ProcessResult<'T>("", stdout, stderr, outcome, duration, false, [ 0 ])
 
     /// The exit code; a signal kill or timeout errors instead of inventing a sentinel.

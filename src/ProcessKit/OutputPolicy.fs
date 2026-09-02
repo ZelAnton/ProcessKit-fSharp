@@ -109,6 +109,7 @@ type OutputBufferPolicy internal (maxLines: int option, maxBytes: int option, ov
 
     /// A copy with the overflow behaviour set.
     member _.WithOverflow(overflow: OverflowMode) =
+        ArgumentNullException.ThrowIfNull(overflow, nameof overflow)
         OutputBufferPolicy(maxLines, maxBytes, overflow)
 
     /// The default policy: retain everything.
@@ -174,7 +175,9 @@ type StreamBufferPolicy internal (capacity: int, fullMode: StreamFullMode) =
         StreamBufferPolicy(capacity, fullMode)
 
     /// A copy with the full-mode changed, composable with any policy.
-    member _.WithFullMode(fullMode: StreamFullMode) = StreamBufferPolicy(capacity, fullMode)
+    member _.WithFullMode(fullMode: StreamFullMode) =
+        ArgumentNullException.ThrowIfNull(fullMode, nameof fullMode)
+        StreamBufferPolicy(capacity, fullMode)
 
 /// Which of a child's two captured streams a decoded line came from.
 ///

@@ -88,11 +88,6 @@ type ApiParityTests() =
         Assert.That(r.OutputContainsAny [ nullStr ], Is.False)
         Assert.That(r.OutputContainsAny [ "" ], Is.True) // empty needle matches (String.Contains parity)
 
-        // A null stderr (constructible via the factories) must not crash and reads as empty.
-        let nullErr = ProcessResult.Failure "out" nullStr 1
-        Assert.That(nullErr.OutputContainsAny [ "absent" ], Is.False)
-        Assert.That(nullErr.Combined, Is.EqualTo "out")
-
         // A non-string/byte[] capture (via the generic factory) uses ToString for the text form.
         let intResult = ProcessResult.Success 42
         Assert.That(intResult.Combined, Is.EqualTo "42")
