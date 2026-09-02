@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Public command builders, output-buffer policies, and `ProcessResult` test factories now reject null discriminated-union and required reference arguments with `ArgumentNullException` naming the exact parameter, instead of failing later with `NullReferenceException`.
+- Public command builders and output-buffer policies now reject null discriminated-union arguments at the call boundary with `ArgumentNullException` naming the exact parameter. `ProcessResult.Failure` and `ProcessResult.Create` apply the same early, exact-parameter contract to required `stderr`/`outcome` arguments; in particular, `Failure` no longer accepts a null `stderr` that its text helpers previously treated as empty.
 - `WaitForStderrLineAsync` and `WaitForStderrTailAsync` now return a faulted task with the predicate's original exception when a predicate throws while inspecting retained or newly arrived stderr, including cancellation-shaped exceptions that previously became `Cancelled` or `NotReady`; a failed retained scan leaves its observations available to a later wait.
 - Reentrant stderr readiness waits started by a retained-output predicate now consume only observations left after the outer scan commits, preventing duplicate claims, queue underflow, and loss of later retained output.
 - `PtySession.ExpectAsync(Regex, ...)` now returns regex timeouts and other matcher failures as typed `ProcessError` values, while matching outside the shared output-window lock, conditionally consuming only a current snapshot, and honoring caller cancellation or the pattern deadline before retrying stale work or reporting a matcher failure.
