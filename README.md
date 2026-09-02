@@ -874,6 +874,10 @@ when the consumer falls behind. If a consumer is abandoned, `FinishAsync`, `Stop
 waits, and disposal release the parked writer before waiting for the process outcome. See
 [Streaming & interactive I/O](docs/streaming.md) for the full streaming and lifecycle contract.
 
+For bounded parent-side log rotation, attach a caller-owned `RotatingFileSink` through `StdoutTee`
+or `StderrTee` and dispose it after the run. A later `WriteAsync` or `FlushAsync` fails with an
+`ObjectDisposedException` that names `RotatingFileSink`.
+
 For conversational language-server, build-server, or MCP-style children, use the
 [JSON-RPC 2.0 session layer](docs/streaming.md#json-rpc-sessions-lsp--bsp--mcp). It rejects every
 incoming frame whose `jsonrpc` member is missing, non-string, or not exactly `"2.0"` with a typed

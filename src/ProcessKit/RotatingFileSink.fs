@@ -41,7 +41,7 @@ type RotatingFileSink(path: string, maxBytes: int64, maxFiles: int) =
     let mutable active: FileStream option = Some(openActive ())
 
     let throwIfDisposed () =
-        ObjectDisposedException.ThrowIf(disposed, nameof RotatingFileSink)
+        ObjectDisposedException.ThrowIf(disposed, typeof<RotatingFileSink>)
 
     let current () =
         match active with

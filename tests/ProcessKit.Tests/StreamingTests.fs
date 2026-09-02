@@ -4189,6 +4189,37 @@ type StreamingTests() =
         :> Task
 
     [<Test>]
+    member _.``RotatingFileSink async operations name the disposed sink``() =
+        let directory = Directory.CreateTempSubdirectory("pk-rotate-disposed-").FullName
+        let path = Path.Combine(directory, "worker.log")
+        let sink = new RotatingFileSink(path, 4L, 2)
+
+        try
+            sink.Dispose()
+
+            let writeError =
+                Assert.ThrowsAsync<ObjectDisposedException>(
+                    Func<Task>(fun () ->
+                        sink.WriteAsync(ReadOnlyMemory<byte>([| 1uy |]), CancellationToken.None).AsTask())
+                )
+
+            let flushError =
+                Assert.ThrowsAsync<ObjectDisposedException>(
+                    Func<Task>(fun () -> sink.FlushAsync(CancellationToken.None))
+                )
+
+            match writeError with
+            | null -> Assert.Fail "expected WriteAsync after disposal to throw"
+            | error -> Assert.That(error.ObjectName, Is.EqualTo typeof<RotatingFileSink>.FullName)
+
+            match flushError with
+            | null -> Assert.Fail "expected FlushAsync after disposal to throw"
+            | error -> Assert.That(error.ObjectName, Is.EqualTo typeof<RotatingFileSink>.FullName)
+        finally
+            sink.Dispose()
+            Directory.Delete(directory, true)
+
+    [<Test>]
     member _.``RotatingFileSink composes with StdoutTee without changing captured bytes``() : Task =
         task {
             let directory = Directory.CreateTempSubdirectory("pk-rotate-tee-").FullName

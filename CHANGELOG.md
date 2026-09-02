@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `RotatingFileSink` now identifies itself in `ObjectDisposedException.ObjectName` when an operation is attempted after disposal, instead of reporting `System.String`.
 - `JsonRpcSession` now releases a peer request's response claim when response-body encoding throws, allowing a corrected `RespondAsync`, `RespondRawAsync`, or `RespondErrorAsync` attempt before any frame is written.
 - Public core, dependency-injection, and hosting range checks now report the rejected signature parameter in `ArgumentOutOfRangeException.ParamName` while preserving validation order.
 - `JsonRpcSession` now ends the session with `ProcessError.Parse` when a peer response carries a boolean, object, or array `id`, instead of discarding the malformed response as unknown; unknown or late responses with valid string, number, or `null` ids continue to be discarded.
