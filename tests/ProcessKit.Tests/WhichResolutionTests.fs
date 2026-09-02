@@ -1321,6 +1321,15 @@ type TrustedHelperResolutionTests() =
 
         path
 
+    /// Write an executable helper whose shebang names no interpreter. The helper itself therefore
+    /// resolves successfully, while the kernel makes posix_spawnp return ENOENT before any child starts.
+    let writeHelperWithMissingInterpreter (dir: string) (helper: string) =
+        let path = Path.Combine(dir, helper)
+        let missingInterpreter = Path.Combine(dir, "missing-interpreter")
+        File.WriteAllText(path, $"#!{missingInterpreter}\n")
+        File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+        path
+
     /// The process `PATH`, never null — the native `setenv` restore takes a non-nullable string, unlike
     /// managed `SetEnvironmentVariable`.
     let currentPath () =
@@ -1491,6 +1500,49 @@ type TrustedHelperResolutionTests() =
 
                 Assert.That(File.Exists prlimitMarker, Is.False, "the pre-spawn refusal must not execute prlimit")
                 Assert.That(File.Exists setsidMarker, Is.False, "the pre-spawn refusal must not execute setsid")
+            finally
+                Native.Posix.trustedHelperDirectoriesForTests <- None
+                Directory.Delete(trustedDir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``rlimit native ENOENT fallbacks preserve the requested program``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: Command.Rlimit uses the util-linux prlimit helper."
+
+            let trustedDir = freshDir "rlimit-native-enoent"
+            let prlimitPath = writeHelperWithMissingInterpreter trustedDir "prlimit"
+            let callerProgram = "/bin/sh"
+
+            let assertRequestedProgram (label: string) (result: Result<'a, ProcessError>) =
+                match result with
+                | Error(ProcessError.Spawn(program, reason)) ->
+                    Assert.That(program, Is.EqualTo callerProgram, label)
+                    Assert.That(reason, Does.Contain "the OS reported the program as not found", label)
+                | Error other -> Assert.Fail $"{label}: expected ProcessError.Spawn, got {other}"
+                | Ok _ -> Assert.Fail $"{label}: the helper with a missing interpreter must not start"
+
+            try
+                Native.Posix.trustedHelperDirectoriesForTests <- Some [ trustedDir ]
+
+                Assert.That(
+                    Native.Posix.trustedHelperPathForTests "prlimit",
+                    Is.EqualTo(Some prlimitPath),
+                    "the executable helper must resolve before its missing interpreter causes ENOENT"
+                )
+
+                let limited =
+                    Command.create callerProgram
+                    |> Command.args [ "-c"; "exit 0" ]
+                    |> Command.rlimit RlimitResource.NoFile 64L 128L
+
+                let! ordinary = limited.OutputStringAsync()
+                assertRequestedProgram "ordinary spawn" ordinary
+
+                Native.Posix.spawnDetachedPosix limited
+                |> assertRequestedProgram "detached spawn"
             finally
                 Native.Posix.trustedHelperDirectoriesForTests <- None
                 Directory.Delete(trustedDir, true)

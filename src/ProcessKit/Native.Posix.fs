@@ -3844,6 +3844,16 @@ module internal Posix =
     let setprivWrappedArgvForTests (command: Command) : Result<string list, ProcessError> =
         setprivWrappedArgv command.Program command
 
+    /// Preserve the program the caller requested when a helper-wrapped native spawn reaches the
+    /// narrow ENOENT fallback where the rewritten command still resolves locally. Resolution must
+    /// continue to inspect the command actually handed to posix_spawnp so its NotFound classification
+    /// and searched-path diagnostics remain unchanged; only the fallback Spawn identity belongs to the
+    /// original request.
+    let private notFoundFromPosixSpawnFailure (diagnosticProgram: string) (command: Command) : ProcessError =
+        match notFoundFromSpawnFailure command with
+        | ProcessError.Spawn(_, reason) -> ProcessError.Spawn(diagnosticProgram, reason)
+        | error -> error
+
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
     /// child's pid) and capture its stdout/stderr. The whole group can later be reaped with
     /// `killProcessGroup`. This is the one real POSIX spawn path; `spawnPosix` routes a command that
@@ -4381,7 +4391,7 @@ module internal Posix =
                             // brought us here is not a `posix_spawn` return to be interpreted as one.
                             match ioPriorityRefusal.Value with
                             | Some error -> Error error
-                            | None when rc = ENOENT -> Error(notFoundFromSpawnFailure command)
+                            | None when rc = ENOENT -> Error(notFoundFromPosixSpawnFailure diagnosticProgram command)
                             | None -> Error(ProcessError.Spawn(diagnosticProgram, $"posix_spawn failed ({rc})"))
                         else
                             // posix_spawnp succeeded: the child is running with pid `pid` (== its own pgid).
@@ -5656,7 +5666,7 @@ module internal Posix =
                         | None ->
                             if rc <> 0 then
                                 if rc = ENOENT then
-                                    Error(notFoundFromSpawnFailure command)
+                                    Error(notFoundFromPosixSpawnFailure diagnosticProgram command)
                                 else
                                     Error(ProcessError.Spawn(diagnosticProgram, $"posix_spawn failed ({rc})"))
                             else
