@@ -83,6 +83,108 @@ type ExpectMatch internal (before: string, text: string) =
     /// The text the pattern matched.
     member _.Text = text
 
+[<RequireQualifiedAccess>]
+module internal PtyExpectLoop =
+
+    let invalidPatternError: Result<ExpectMatch, ProcessError> =
+        Error(ProcessError.Unsupported "expect patterns must match at least one character")
+
+    let private readFaultError (fault: exn) : Result<ExpectMatch, ProcessError> =
+        match fault with
+        | :? ProcessException as ex -> Error ex.Error
+        | ex -> Error(ProcessError.Io ex.Message)
+
+    let run
+        (window: ExpectWindow)
+        (program: string)
+        (timeProvider: TimeProvider)
+        (matcher: string -> (int * int) option)
+        (timeout: TimeSpan)
+        (cancellationToken: CancellationToken)
+        : Task<Result<ExpectMatch, ProcessError>> =
+        task {
+            // Clamp so an out-of-range timeout can't throw out of the CTS constructor, and report the
+            // CLAMPED value in `NotReady` — the same rule `WaitForLineAsync`/`ReadinessProbe` follow, so
+            // a reported budget is always the one actually enforced.
+            let armed = Timeouts.clampArmable timeout
+            use deadline = new CancellationTokenSource(armed, timeProvider)
+
+            use linked =
+                CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellationToken)
+
+            let interruptionOutcome () =
+                if cancellationToken.IsCancellationRequested then
+                    Some(Error(ProcessError.Cancelled program))
+                elif deadline.IsCancellationRequested then
+                    Some(Error(ProcessError.NotReady(program, armed)))
+                else
+                    None
+
+            let matcherFailureOutcome (fault: exn) =
+                match interruptionOutcome () with
+                | Some outcome -> outcome
+                | None ->
+                    match fault with
+                    | :? RegexMatchTimeoutException as ex -> Error(ProcessError.NotReady(program, ex.MatchTimeout))
+                    | ex -> Error(ProcessError.Io $"expect pattern matching failed: {ex.Message}")
+
+            let mutable result = ValueNone
+
+            while result.IsNone do
+                // Capture the change signal BEFORE testing the window: output landing between the two
+                // either shows up in this very test or completes the captured task, so a wake-up can
+                // never be lost (see `ExpectWindow.Changed`).
+                let changed = window.Changed
+
+                // Matching runs over an immutable snapshot outside the window gate. The conditional
+                // consume below returns `None` when output or a competing waiter changed that snapshot;
+                // retrying is what keeps a stale match from consuming different text while letting the
+                // output pumps continue during an expensive regular expression.
+                let step =
+                    try
+                        Choice1Of2(window.TryConsume matcher)
+                    with
+                    | :? RegexMatchTimeoutException as ex -> Choice2Of2(matcherFailureOutcome ex)
+                    | ex -> Choice2Of2(matcherFailureOutcome ex)
+
+                match step with
+                | Choice2Of2 outcome -> result <- ValueSome outcome
+                | Choice1Of2 None ->
+                    // A stale snapshot is not a terminal verdict. Before retrying, observe the same
+                    // caller-first cancellation/deadline ordering used by the parked-wait path so a
+                    // continuously changing window cannot postpone an already-fired limit forever.
+                    match interruptionOutcome () with
+                    | Some outcome -> result <- ValueSome outcome
+                    | None -> ()
+                | Choice1Of2(Some(ExpectStep.Matched(before, matched))) ->
+                    result <- ValueSome(Ok(ExpectMatch(before, matched)))
+                | Choice1Of2(Some ExpectStep.InvalidPattern) -> result <- ValueSome invalidPatternError
+                // The child's output has ended (it closed the terminal, or exited) and the pattern
+                // never arrived: report it now rather than burning the rest of the timeout on output
+                // that can no longer come.
+                | Choice1Of2(Some(ExpectStep.Ended(Some fault))) -> result <- ValueSome(readFaultError fault)
+                | Choice1Of2(Some(ExpectStep.Ended None)) ->
+                    result <- ValueSome(Error(ProcessError.NotReady(program, armed)))
+                | Choice1Of2(Some ExpectStep.Waiting) ->
+                    try
+                        do! changed.WaitAsync linked.Token
+                    with
+                    | :? OperationCanceledException ->
+                        // The caller's token wins over the deadline: a cancelled wait is an error, a
+                        // timed-out one is "the pattern has not arrived yet". Either way the window is
+                        // left untouched, so a retry — or the next pattern — still sees this output.
+                        match interruptionOutcome () with
+                        | Some outcome -> result <- ValueSome outcome
+                        | None ->
+                            invalidOp "A linked expect wait was cancelled without either source token being cancelled"
+                    | ex -> raise ex
+
+            match result with
+            | ValueSome outcome -> return outcome
+            | ValueNone ->
+                return invalidOp "Loop invariant violated: result should always be ValueSome after exiting the loop"
+        }
+
 /// An expect-style conversation with a live child: wait for a pattern in its terminal output, send it
 /// input, repeat — the classic automation loop for an interactive program (`ssh`, a REPL, an
 /// installer, a credential prompt). Built over a started `RunningProcess`, and designed for one from a
@@ -167,78 +269,12 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     // send and close verbs await this task before touching the pipe, preserving the single-writer rule.
     let stdin: Task<ProcessStdin option> = running.TakeStdinAsync()
 
-    // Turn a genuine reader fault into the same typed error the streaming verbs surface. The pumps
-    // already reclassified an OS read failure into `ProcessError.Io`; anything else is reported as
-    // `Io` too rather than escaping these `Result`-returning verbs as a raw exception.
-    let readFaultError (fault: exn) : Result<ExpectMatch, ProcessError> =
-        match fault with
-        | :? ProcessException as ex -> Error ex.Error
-        | ex -> Error(ProcessError.Io ex.Message)
-
-    let invalidPatternError: Result<ExpectMatch, ProcessError> =
-        Error(ProcessError.Unsupported "expect patterns must match at least one character")
-
     let expectCore
         (matcher: string -> (int * int) option)
         (timeout: TimeSpan)
         (cancellationToken: CancellationToken)
         : Task<Result<ExpectMatch, ProcessError>> =
-        task {
-            // Clamp so an out-of-range timeout can't throw out of the CTS constructor, and report the
-            // CLAMPED value in `NotReady` — the same rule `WaitForLineAsync`/`ReadinessProbe` follow, so
-            // a reported budget is always the one actually enforced.
-            let armed = Timeouts.clampArmable timeout
-            use deadline = new CancellationTokenSource(armed, config.TimeProvider)
-
-            use linked =
-                CancellationTokenSource.CreateLinkedTokenSource(deadline.Token, cancellationToken)
-
-            let mutable result = ValueNone
-
-            while result.IsNone do
-                // Capture the change signal BEFORE testing the window: output landing between the two
-                // either shows up in this very test or completes the captured task, so a wake-up can
-                // never be lost (see `ExpectWindow.Changed`).
-                let changed = window.Changed
-
-                // Matching runs over an immutable snapshot outside the window gate. The conditional
-                // consume below returns `None` when output or a competing waiter changed that snapshot;
-                // retrying is what keeps a stale match from consuming different text while letting the
-                // output pumps continue during an expensive regular expression.
-                let step =
-                    try
-                        Ok(window.TryConsume matcher)
-                    with
-                    | :? RegexMatchTimeoutException as ex -> Error(ProcessError.NotReady(program, ex.MatchTimeout))
-                    | ex -> Error(ProcessError.Io $"expect pattern matching failed: {ex.Message}")
-
-                match step with
-                | Error error -> result <- ValueSome(Error error)
-                | Ok None -> ()
-                | Ok(Some(ExpectStep.Matched(before, matched))) -> result <- ValueSome(Ok(ExpectMatch(before, matched)))
-                | Ok(Some ExpectStep.InvalidPattern) -> result <- ValueSome invalidPatternError
-                // The child's output has ended (it closed the terminal, or exited) and the pattern
-                // never arrived: report it now rather than burning the rest of the timeout on output
-                // that can no longer come.
-                | Ok(Some(ExpectStep.Ended(Some fault))) -> result <- ValueSome(readFaultError fault)
-                | Ok(Some(ExpectStep.Ended None)) -> result <- ValueSome(Error(ProcessError.NotReady(program, armed)))
-                | Ok(Some ExpectStep.Waiting) ->
-                    try
-                        do! changed.WaitAsync linked.Token
-                    with :? OperationCanceledException ->
-                        // The caller's token wins over the deadline: a cancelled wait is an error, a
-                        // timed-out one is "the pattern has not arrived yet". Either way the window is
-                        // left untouched, so a retry — or the next pattern — still sees this output.
-                        if cancellationToken.IsCancellationRequested then
-                            result <- ValueSome(Error(ProcessError.Cancelled program))
-                        else
-                            result <- ValueSome(Error(ProcessError.NotReady(program, armed)))
-
-            match result with
-            | ValueSome outcome -> return outcome
-            | ValueNone ->
-                return invalidOp "Loop invariant violated: result should always be ValueSome after exiting the loop"
-        }
+        PtyExpectLoop.run window program config.TimeProvider matcher timeout cancellationToken
 
     let sendBytes (bytes: byte[]) (cancellationToken: CancellationToken) : Task<Result<unit, ProcessError>> =
         task {
@@ -308,7 +344,7 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
         ArgumentNullException.ThrowIfNull(pattern, nameof pattern)
 
         if pattern.Length = 0 then
-            Task.FromResult invalidPatternError
+            Task.FromResult PtyExpectLoop.invalidPatternError
         else
             expectCore
                 (fun text ->
@@ -328,6 +364,9 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     /// output. The snapshot is consumed only if it is still current, so concurrent expects cannot both
     /// consume one match. A `RegexMatchTimeoutException` becomes `NotReady` with the regex's own
     /// `MatchTimeout`, and any other matcher exception becomes `Io`; neither faults the returned task.
+    /// If caller cancellation or the pattern deadline fires while matching a snapshot, that limit wins
+    /// before a stale snapshot is retried or a matcher failure is classified. A successful current
+    /// match still wins and is consumed atomically.
     /// A zero-width match is rejected with a typed `Unsupported` result, because it cannot advance the
     /// session window.
     member _.ExpectAsync

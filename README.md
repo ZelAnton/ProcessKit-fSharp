@@ -957,7 +957,9 @@ costly regex does not block incoming output or another window operation. Consump
 on that snapshot still being current, preventing stale or concurrent matches from consuming different
 text or the same text twice. A regex `MatchTimeout` is returned as `ProcessError.NotReady` with that
 match budget; another matcher exception is returned as `ProcessError.Io`, rather than faulting the
-returned task. The close verbs on all
+returned task. Caller cancellation and the per-pattern deadline are checked before retrying a stale
+snapshot or classifying a matcher failure; caller cancellation wins when both limits have fired, while
+a successful current match is still consumed. The close verbs on all
 interactive sessions — `PtySession.CloseStdinAsync(cancellationToken)`,
 `ContentLengthSession.FinishInputAsync(cancellationToken)`, and
 `JsonRpcSession.FinishInputAsync(cancellationToken)` — return

@@ -4,11 +4,11 @@ open System
 open System.Text
 open System.Threading.Tasks
 
-/// What one look at an `ExpectWindow` tells a pattern waiter (`PtySession.ExpectAsync`): the pattern
-/// matched, nothing matched yet, or nothing matched and no more output can come. Deliberately ONE
-/// verdict rather than a matched-then-ended pair of questions — see `ExpectWindow.TryConsume`, which
-/// decides all three under a single lock so a match arriving with the end of output can never be lost
-/// to it.
+/// What one current `ExpectWindow` snapshot tells a pattern waiter (`PtySession.ExpectAsync`): the
+/// pattern matched, nothing matched yet, or nothing matched and no more output can come. Deliberately
+/// ONE verdict rather than a matched-then-ended pair of questions — see `ExpectWindow.TryConsume`,
+/// which matches outside the gate, then verifies the snapshot version and decides the current verdict
+/// atomically so a match arriving with the end of output can never be lost to it.
 [<RequireQualifiedAccess; NoComparison>]
 type internal ExpectStep =
 

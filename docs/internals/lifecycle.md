@@ -198,9 +198,12 @@ it does not reset the claim or, by itself, promise to kill the child.
 ### PTY, pipelines, and framed sessions
 
 **PTY.** The readers use `Pump.readTextUntilDone`, not the line pump. They decode arbitrary chunks
-into `ExpectWindow`; line terminators, line handlers, and line counters do not apply. A waiter's
-`Matched`, `Waiting`, or `Ended` decision is one locked `ExpectWindow` step, so a final match racing
-end-of-output cannot be lost. `PtySession` supplies the expect/send conversation over this state.
+into `ExpectWindow`; line terminators, line handlers, and line counters do not apply. A waiter takes
+an immutable text-and-version snapshot under the window gate, runs its matcher without holding that
+gate, then reacquires it to validate the version and atomically consume or decide `Waiting`/`Ended`.
+A stale version is retried. Because version validation and the current verdict share the final locked
+step, a final match racing end-of-output still cannot be lost. `PtySession` supplies the expect/send
+conversation over this state.
 
 **Pipelines.** The pipeline runner spawns raw contained stages into one internal `ProcessGroup`; it
 does not expose a separate `RunningProcess` for every stage. Stage N stdout is copied to stage N+1

@@ -130,6 +130,12 @@ type PtySessionTests() =
 
         consumeCurrent ()
 
+    let runExpectLoop window program timeProvider matcher timeout cancellationToken =
+        Task.Run<Result<ExpectMatch, ProcessError>>(
+            Func<Task<Result<ExpectMatch, ProcessError>>>(fun () ->
+                PtyExpectLoop.run window program timeProvider matcher timeout cancellationToken)
+        )
+
     let filterAnsi (text: string) (chunkSizes: int list) =
         let filter = AnsiEscapeFilter()
         let output = StringBuilder()
@@ -629,6 +635,167 @@ type PtySessionTests() =
                 | Error(ProcessError.Cancelled _) -> ()
                 | Error other -> Assert.Fail $"expected ProcessError.Cancelled, got {other}"
                 | Ok _ -> Assert.Fail "nothing should have matched"
+        }
+
+    [<Test>]
+    member _.``caller cancellation wins and stops a stale snapshot before another matcher attempt``() : Task =
+        task {
+            let provider = ManualTimerProvider()
+            let window = ExpectWindow(1024, None)
+            use matcherStarted = new ManualResetEventSlim(false)
+            use releaseMatcher = new ManualResetEventSlim(false)
+            use cancellation = new CancellationTokenSource()
+            let mutable attempts = 0
+            window.Append "seed"
+
+            let pending =
+                runExpectLoop
+                    window
+                    "stale-cancel"
+                    provider
+                    (fun _ ->
+                        Interlocked.Increment(&attempts) |> ignore
+                        matcherStarted.Set()
+                        releaseMatcher.Wait()
+                        None)
+                    (TimeSpan.FromHours 1.0)
+                    cancellation.Token
+
+            try
+                Assert.That(matcherStarted.Wait(TimeSpan.FromSeconds 2.0), Is.True, "matcher did not start")
+                do! provider.TimerCreated.WaitAsync(TimeSpan.FromSeconds 2.0)
+                window.Append "changed"
+                cancellation.Cancel()
+                provider.FireAll()
+            finally
+                releaseMatcher.Set()
+
+            match! pending.WaitAsync(TimeSpan.FromSeconds 2.0) with
+            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "stale-cancel")
+            | Error other -> Assert.Fail $"expected ProcessError.Cancelled, got {other}"
+            | Ok matched -> Assert.Fail $"the matcher returned no match, got '{matched.Text}'"
+
+            Assert.That(attempts, Is.EqualTo 1, "a cancelled stale snapshot must not start another matcher attempt")
+            Assert.That(window.Pending, Is.EqualTo "seedchanged")
+        }
+
+    [<Test>]
+    member _.``pattern deadline stops a stale snapshot before another matcher attempt``() : Task =
+        task {
+            let provider = ManualTimerProvider()
+            let window = ExpectWindow(1024, None)
+            use matcherStarted = new ManualResetEventSlim(false)
+            use releaseMatcher = new ManualResetEventSlim(false)
+            let budget = TimeSpan.FromHours 1.0
+            let mutable attempts = 0
+            window.Append "seed"
+
+            let pending =
+                runExpectLoop
+                    window
+                    "stale-deadline"
+                    provider
+                    (fun _ ->
+                        Interlocked.Increment(&attempts) |> ignore
+                        matcherStarted.Set()
+                        releaseMatcher.Wait()
+                        None)
+                    budget
+                    CancellationToken.None
+
+            try
+                Assert.That(matcherStarted.Wait(TimeSpan.FromSeconds 2.0), Is.True, "matcher did not start")
+                do! provider.TimerCreated.WaitAsync(TimeSpan.FromSeconds 2.0)
+                window.Append "changed"
+                provider.FireAll()
+            finally
+                releaseMatcher.Set()
+
+            match! pending.WaitAsync(TimeSpan.FromSeconds 2.0) with
+            | Error(ProcessError.NotReady(program, reported)) ->
+                Assert.That(program, Is.EqualTo "stale-deadline")
+                Assert.That(reported, Is.EqualTo budget)
+            | Error other -> Assert.Fail $"expected ProcessError.NotReady, got {other}"
+            | Ok matched -> Assert.Fail $"the matcher returned no match, got '{matched.Text}'"
+
+            Assert.That(attempts, Is.EqualTo 1, "an expired stale snapshot must not start another matcher attempt")
+            Assert.That(window.Pending, Is.EqualTo "seedchanged")
+        }
+
+    [<Test>]
+    member _.``caller cancellation wins over a Regex timeout raised during matching``() : Task =
+        task {
+            let window = ExpectWindow(1024, None)
+            use matcherStarted = new ManualResetEventSlim(false)
+            use releaseMatcher = new ManualResetEventSlim(false)
+            use cancellation = new CancellationTokenSource()
+            let matchTimeout = TimeSpan.FromMilliseconds 10.0
+            window.Append "seed"
+
+            let pending =
+                runExpectLoop
+                    window
+                    "cancelled-regex"
+                    TimeProvider.System
+                    (fun _ ->
+                        matcherStarted.Set()
+                        releaseMatcher.Wait()
+                        raise (RegexMatchTimeoutException("seed", "pattern", matchTimeout)))
+                    (TimeSpan.FromHours 1.0)
+                    cancellation.Token
+
+            try
+                Assert.That(matcherStarted.Wait(TimeSpan.FromSeconds 2.0), Is.True, "matcher did not start")
+                cancellation.Cancel()
+            finally
+                releaseMatcher.Set()
+
+            match! pending.WaitAsync(TimeSpan.FromSeconds 2.0) with
+            | Error(ProcessError.Cancelled program) -> Assert.That(program, Is.EqualTo "cancelled-regex")
+            | Error other -> Assert.Fail $"caller cancellation should win over Regex timeout, got {other}"
+            | Ok matched -> Assert.Fail $"the throwing matcher cannot succeed, got '{matched.Text}'"
+
+            Assert.That(window.Pending, Is.EqualTo "seed")
+        }
+
+    [<Test>]
+    member _.``pattern deadline wins over a Regex timeout raised during matching``() : Task =
+        task {
+            let provider = ManualTimerProvider()
+            let window = ExpectWindow(1024, None)
+            use matcherStarted = new ManualResetEventSlim(false)
+            use releaseMatcher = new ManualResetEventSlim(false)
+            let budget = TimeSpan.FromHours 1.0
+            let matchTimeout = TimeSpan.FromMilliseconds 10.0
+            window.Append "seed"
+
+            let pending =
+                runExpectLoop
+                    window
+                    "expired-regex"
+                    provider
+                    (fun _ ->
+                        matcherStarted.Set()
+                        releaseMatcher.Wait()
+                        raise (RegexMatchTimeoutException("seed", "pattern", matchTimeout)))
+                    budget
+                    CancellationToken.None
+
+            try
+                Assert.That(matcherStarted.Wait(TimeSpan.FromSeconds 2.0), Is.True, "matcher did not start")
+                do! provider.TimerCreated.WaitAsync(TimeSpan.FromSeconds 2.0)
+                provider.FireAll()
+            finally
+                releaseMatcher.Set()
+
+            match! pending.WaitAsync(TimeSpan.FromSeconds 2.0) with
+            | Error(ProcessError.NotReady(program, reported)) ->
+                Assert.That(program, Is.EqualTo "expired-regex")
+                Assert.That(reported, Is.EqualTo budget, "the pattern deadline must win over the Regex budget")
+            | Error other -> Assert.Fail $"the pattern deadline should win over Regex timeout, got {other}"
+            | Ok matched -> Assert.Fail $"the throwing matcher cannot succeed, got '{matched.Text}'"
+
+            Assert.That(window.Pending, Is.EqualTo "seed")
         }
 
     [<Test>]
