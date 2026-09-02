@@ -3867,7 +3867,27 @@ type StreamingTests() =
         }
         :> Task
 
-    // --- T-087: a genuine mid-stream stdout/stderr read fault surfaces as ProcessError.Io ---
+    // --- A genuine mid-stream stdout/stderr read fault surfaces as ProcessError.Io ---
+
+    [<Test>]
+    member _.``OutputBytesAsync surfaces a genuine stdout read fault as ProcessError.Io``() : Task =
+        task {
+            let detail = "raw stdout read failed"
+            use stdout = new ErroringStream([ [| 0uy; 255uy; 0uy |] ], IOException detail)
+            let config = (Command.create "test").Config
+            use running = syntheticProcessOverStreams config (Some(stdout :> Stream)) None
+
+            try
+                let! _ = running.OutputBytesAsync()
+                Assert.Fail "expected a genuine raw stdout read fault to surface"
+            with
+            | :? ProcessException as pe ->
+                match pe.Error with
+                | ProcessError.Io actualDetail -> Assert.That(actualDetail, Is.EqualTo detail)
+                | other -> Assert.Fail $"expected ProcessError.Io, got {other}"
+            | :? IOException as ex -> Assert.Fail $"raw IOException escaped: {ex.Message}"
+        }
+        :> Task
 
     [<Test>]
     member _.``OutputStringAsync surfaces a genuine stdout read fault as ProcessError.Io``() : Task =

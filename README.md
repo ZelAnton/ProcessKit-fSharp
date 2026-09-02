@@ -131,6 +131,11 @@ verb returns `Task<Result<_, ProcessError>>`:
 | the first matching output line | `.FirstLineAsync(p)` | `string option` — `None` when stdout closes without a match |
 | a live handle — streaming, stdin, probes | `.StartAsync()` | `RunningProcess` |
 
+`OutputBytesAsync()` reads stdout without decoding it. If that read fails before teardown with an
+`IOException` or `ObjectDisposedException`, the task surfaces a `ProcessException` whose `Error` is
+`ProcessError.Io` and whose detail is the underlying stream message. The same exceptions caused by a
+concurrent `StopAsync()` or disposal are treated as the expected end of capture instead.
+
 The same vocabulary repeats on every layer (`IProcessRunner`, `CliClient`, `Pipeline`), and
 `Exec.run "git" [ "status" ]` / `Exec.outputString …` skip the builder for one-liners.
 

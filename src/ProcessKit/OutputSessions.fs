@@ -629,13 +629,18 @@ type internal OutputSessions
     /// It shares the buffered-pump teardown race above: a concurrent `StopAsync`/`Dispose` can dispose
     /// the pipe mid-read. That is quiet here, and honest as well — the sink keeps everything read
     /// before the race instead of an empty capture. A genuine mid-run read fault (teardown not begun)
-    /// still propagates unchanged — T-087.
+    /// is reclassified as `ProcessError.Io`, consistently with the other buffered pumps.
     member _.CaptureRawStdout(sink: Pump.RawSink) : Task =
         task {
             try
                 do! Pump.captureRawInto sink stdoutStream config.StdoutTee CancellationToken.None
-            with (:? IOException | :? ObjectDisposedException) when isTearingDown () ->
+            with
+            | (:? IOException | :? ObjectDisposedException) when isTearingDown () ->
+                // A concurrent teardown disposed the pipe while this pump was reading. The sink retains
+                // the bytes already captured, so this expected race needs no further recovery.
                 ()
+            | :? IOException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
+            | :? ObjectDisposedException as ex -> ExceptionDispatchInfo.Throw(reportedPumpFault ex)
         }
         :> Task
 
