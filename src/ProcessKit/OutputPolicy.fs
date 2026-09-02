@@ -172,6 +172,7 @@ type StreamBufferPolicy internal (capacity: int, fullMode: StreamFullMode) =
     /// A channel bounded to `capacity` items with an explicit `fullMode`.
     static member Bounded(capacity: int, fullMode: StreamFullMode) =
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1, nameof capacity)
+        ArgumentNullException.ThrowIfNull(fullMode, nameof fullMode)
         StreamBufferPolicy(capacity, fullMode)
 
     /// A copy with the full-mode changed, composable with any policy.

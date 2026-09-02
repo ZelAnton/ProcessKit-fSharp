@@ -80,6 +80,11 @@ public class NullValidationTests
             "fullMode",
             "StreamBufferPolicy.WithFullMode"
         );
+        yield return Case(
+            () => _ = StreamBufferPolicy.Bounded(1, null!),
+            "fullMode",
+            "StreamBufferPolicy.Bounded fullMode"
+        );
         yield return Case(() => _ = ProcessResult.Failure("", null!, 1), "stderr", "ProcessResult.Failure");
         yield return Case(
             () => _ = ProcessResult.Create("", null!, Outcome.NewExited(0), TimeSpan.Zero),
@@ -152,6 +157,16 @@ public class NullValidationTests
     public void ProcessResult_Create_validates_stderr_before_outcome()
     {
         AssertParamName(() => _ = ProcessResult.Create("", null!, null!, TimeSpan.Zero), "stderr");
+    }
+
+    [Test]
+    public void StreamBufferPolicy_Bounded_validates_capacity_before_fullMode()
+    {
+        var exception = Assert.Throws<ArgumentOutOfRangeException>(
+            () => _ = StreamBufferPolicy.Bounded(0, null!)
+        );
+
+        Assert.That(exception!.ParamName, Is.EqualTo("capacity"));
     }
 
     private static TestCaseData Case(Action call, string expectedParamName, string name) =>
