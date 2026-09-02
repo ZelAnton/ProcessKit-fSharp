@@ -2892,16 +2892,119 @@ type StderrReadinessTests() =
         :> Task
 
     [<Test>]
+    member _.``a retained-line predicate failure faults the returned task without consuming retained lines``() : Task =
+        task {
+            let watch = StderrReadinessWatch 1024
+            watch.ObserveLine "first"
+            watch.ObserveLine "second"
+            let predicateError = InvalidOperationException "retained line predicate boom"
+            let mutable synchronousFault: exn option = None
+
+            let waiting =
+                try
+                    ValueSome(
+                        watch.WaitAsync(
+                            StderrReadinessMode.Line,
+                            Func<string, bool>(fun line ->
+                                if line = "second" then
+                                    raise predicateError
+
+                                false),
+                            CancellationToken.None
+                        )
+                    )
+                with ex ->
+                    synchronousFault <- Some ex
+                    ValueNone
+
+            match synchronousFault with
+            | Some ex -> Assert.Fail $"the wait threw synchronously: {ex}"
+            | None -> ()
+
+            match waiting with
+            | ValueNone -> Assert.Fail "the wait did not return a task"
+            | ValueSome waiting ->
+                let thrown =
+                    Assert.ThrowsAsync<InvalidOperationException>(Func<Task>(fun () -> waiting :> Task))
+
+                Assert.That(thrown, Is.SameAs predicateError)
+
+            match!
+                watch.WaitAsync(
+                    StderrReadinessMode.Line,
+                    Func<string, bool>(fun line -> line = "first"),
+                    CancellationToken.None
+                )
+            with
+            | ValueSome line -> Assert.That(line, Is.EqualTo "first")
+            | ValueNone -> Assert.Fail "the failed scan consumed the first retained line"
+
+            match!
+                watch.WaitAsync(
+                    StderrReadinessMode.Line,
+                    Func<string, bool>(fun line -> line = "second"),
+                    CancellationToken.None
+                )
+            with
+            | ValueSome line -> Assert.That(line, Is.EqualTo "second")
+            | ValueNone -> Assert.Fail "the failed scan consumed the retained line that threw"
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a retained-tail predicate failure faults the returned task without consuming the tail``() : Task =
+        task {
+            let watch = StderrReadinessWatch 1024
+            watch.ObserveTail "retained tail"
+            let predicateError = InvalidOperationException "retained tail predicate boom"
+            let mutable synchronousFault: exn option = None
+
+            let waiting =
+                try
+                    ValueSome(
+                        watch.WaitAsync(
+                            StderrReadinessMode.Tail,
+                            Func<string, bool>(fun _ -> raise predicateError),
+                            CancellationToken.None
+                        )
+                    )
+                with ex ->
+                    synchronousFault <- Some ex
+                    ValueNone
+
+            match synchronousFault with
+            | Some ex -> Assert.Fail $"the wait threw synchronously: {ex}"
+            | None -> ()
+
+            match waiting with
+            | ValueNone -> Assert.Fail "the wait did not return a task"
+            | ValueSome waiting ->
+                let thrown =
+                    Assert.ThrowsAsync<InvalidOperationException>(Func<Task>(fun () -> waiting :> Task))
+
+                Assert.That(thrown, Is.SameAs predicateError)
+
+            match!
+                watch.WaitAsync(
+                    StderrReadinessMode.Tail,
+                    Func<string, bool>(fun tail -> tail = "retained tail"),
+                    CancellationToken.None
+                )
+            with
+            | ValueSome tail -> Assert.That(tail, Is.EqualTo "retained tail")
+            | ValueNone -> Assert.Fail "the failed scan consumed the retained tail"
+        }
+        :> Task
+
+    [<Test>]
     member _.``a throwing predicate fails only its own wait``() : Task =
         task {
             let running, _stdout, stderr = liveChild (Command.create "test").Config
             use running = running
+            let predicateError = InvalidOperationException "predicate boom"
 
             let waiting =
-                running.WaitForStderrLineAsync(
-                    (fun _ -> raise (InvalidOperationException "predicate boom")),
-                    TimeSpan.FromSeconds 10.0
-                )
+                running.WaitForStderrLineAsync((fun _ -> raise predicateError), TimeSpan.FromSeconds 10.0)
 
             do! writeUtf8 stderr "first\n"
 
@@ -2910,7 +3013,7 @@ type StderrReadinessTests() =
 
             match thrown with
             | null -> Assert.Fail "expected the predicate's own exception to fail its wait"
-            | thrown -> Assert.That(thrown.Message, Does.Contain "predicate boom")
+            | thrown -> Assert.That(thrown, Is.SameAs predicateError)
 
             // The pump, the session and every other verb carried on: a later wait still works.
             do! writeUtf8 stderr "second\n"

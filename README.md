@@ -653,6 +653,11 @@ A probe that doesn't pass within its deadline — or that can no longer pass (th
 stderr does) — fails with `ProcessError.NotReady` (distinct from a timeout)
 and **does not kill the child**: the caller decides what happens next.
 
+If a `WaitForStderrLineAsync` or `WaitForStderrTailAsync` predicate throws, the returned task faults
+with that same exception, whether the predicate examined output retained between waits or output that
+arrived after the wait was armed. Catch it around `await`; the failed wait leaves the stderr pump and
+other waits running, and a retained observation is not consumed merely because its predicate threw.
+
 HTTP readiness and supervisor liveness accept a caller-owned `HttpClient` for authentication headers,
 custom TLS validation, proxies, or alternate transports. ProcessKit reuses but never mutates or
 disposes that client; the caller retains its lifetime. HTTP probe URIs must be absolute, explicit

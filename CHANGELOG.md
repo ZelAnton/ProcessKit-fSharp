@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `WaitForStderrLineAsync` and `WaitForStderrTailAsync` now return a faulted task when a predicate throws while inspecting retained stderr, matching their live-wait behavior and preserving the retained observations for a later wait.
 - `PtySession.ExpectAsync(Regex, ...)` now returns regex timeouts and other matcher failures as typed `ProcessError` values, while matching outside the shared output-window lock, conditionally consuming only a current snapshot, and honoring caller cancellation or the pattern deadline before retrying stale work or reporting a matcher failure.
 - `OutputBytesAsync` and its bytes-capture helpers now surface genuine raw-stdout read failures as `ProcessException` carrying `ProcessError.Io`, instead of leaking raw I/O or disposal exceptions.
 - `RotatingFileSink` now identifies itself in `ObjectDisposedException.ObjectName` when an operation is attempted after disposal, instead of reporting `System.String`.

@@ -204,32 +204,60 @@ type internal StderrReadinessWatch(retentionBytes: int) =
 
     // Scan what is retained, oldest first — the framed lines, then (for a TAIL wait) the tail the pump
     // is still assembling — consuming everything up to and including a match. Runs under `gate`, on the
-    // ARMING caller's thread, so a throwing predicate simply faults that caller's own wait.
-    let scanRetained (mode: StderrReadinessMode) (predicate: Func<string, bool>) : string voption =
+    // ARMING caller's thread. Consumption is committed only after every predicate invocation involved
+    // in this scan succeeds, so a throwing predicate leaves all retained observations available to the
+    // next wait and faults only its own returned task.
+    let scanRetained (mode: StderrReadinessMode) (predicate: Func<string, bool>) : Result<string voption, exn> =
+        let retainedLines = pendingLines.ToArray()
         let mutable found = ValueNone
+        let mutable predicateFault: exn option = None
+        let mutable consumedLineCount = 0
+        let mutable index = 0
 
-        while found.IsNone && pendingLines.Count > 0 do
-            let struct (line, cost) = pendingLines.Dequeue()
-            pendingBytes <- pendingBytes - cost
+        while predicateFault.IsNone && found.IsNone && index < retainedLines.Length do
+            let struct (line, _) = retainedLines[index]
 
-            if predicate.Invoke line then
-                found <- ValueSome line
+            try
+                if predicate.Invoke line then
+                    found <- ValueSome line
 
-        match found with
-        | ValueSome _ -> found
-        | ValueNone ->
-            // A tail wait also sees what the pump has assembled but not framed yet; a line wait, by
-            // definition, does not — that text is not a line until a terminator (or EOF) makes it one.
-            if mode = StderrReadinessMode.Tail && tail.Length > 0 then
-                let snapshot = tail.ToString()
+                consumedLineCount <- consumedLineCount + 1
+            with ex ->
+                // The caller supplied this predicate, so every exception type is its wait's fault.
+                // Recording it here keeps the retained scan transactional under the shared lock.
+                predicateFault <- Some ex
 
+            index <- index + 1
+
+        let mutable matchedTail = false
+
+        if
+            predicateFault.IsNone
+            && found.IsNone
+            && mode = StderrReadinessMode.Tail
+            && tail.Length > 0
+        then
+            let snapshot = tail.ToString()
+
+            try
                 if predicate.Invoke snapshot then
-                    clearTail ()
-                    ValueSome snapshot
-                else
-                    ValueNone
-            else
-                ValueNone
+                    found <- ValueSome snapshot
+                    matchedTail <- true
+            with ex ->
+                // As above, preserve both retained shapes when the caller's predicate fails.
+                predicateFault <- Some ex
+
+        match predicateFault with
+        | Some ex -> Error ex
+        | None ->
+            for _ in 1..consumedLineCount do
+                let struct (_, cost) = pendingLines.Dequeue()
+                pendingBytes <- pendingBytes - cost
+
+            if matchedTail then
+                clearTail ()
+
+            Ok found
 
     /// The text the pump appended to its in-flight line since the previous report (see
     /// `Pump.ITailObserver`). Offered whole — the accumulated tail, not just the new fragment — to the
@@ -300,8 +328,9 @@ type internal StderrReadinessWatch(retentionBytes: int) =
     member _.TryStart(mode: StderrReadinessMode, predicate: Func<string, bool>) : StderrReadinessStart =
         lock gate (fun () ->
             match scanRetained mode predicate with
-            | ValueSome text -> StderrReadinessStart.Matched text
-            | ValueNone ->
+            | Error ex -> StderrReadinessStart.Faulted ex
+            | Ok(ValueSome text) -> StderrReadinessStart.Matched text
+            | Ok ValueNone ->
                 if ended then
                     match fault with
                     | Some ex -> StderrReadinessStart.Faulted ex
