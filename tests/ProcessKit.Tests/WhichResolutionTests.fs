@@ -84,6 +84,28 @@ type WhichResolutionTests() =
             | other -> Assert.Fail $"expected NotFound, got {other}"
 
     [<Test>]
+    member _.``NotFound message counts positional empty PATH entries only on POSIX``() =
+        let separator = string Path.PathSeparator
+
+        let path =
+            separator + "missing-first" + separator + separator + "missing-last" + separator
+
+        let expectedEntryCount = if isWindows then 2 else 5
+        let command = Command.create missingProgram |> Command.env "PATH" path
+
+        match command.ResolveProgram() with
+        | Ok resolved -> Assert.Fail $"expected NotFound, but resolved to '{resolved}'"
+        | Error(ProcessError.NotFound(program, searched) as error) ->
+            Assert.That(program, Is.EqualTo missingProgram)
+            Assert.That(searched, Is.EqualTo(Some path))
+
+            Assert.That(
+                error.Message,
+                Is.EqualTo $"program '{missingProgram}' was not found (searched {expectedEntryCount} PATH entries)"
+            )
+        | Error other -> Assert.Fail $"expected NotFound, got {other}"
+
+    [<Test>]
     member _.``which and a real spawn agree: a missing bare-name program is NotFound on both paths``() : Task =
         task {
             let whichResult = Exec.which missingProgram

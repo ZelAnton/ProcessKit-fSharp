@@ -2,7 +2,47 @@ namespace ProcessKit
 
 open System
 open System.Runtime.CompilerServices
+open System.Runtime.InteropServices
 open System.Text
+
+/// The platform-specific rule for walking an effective `PATH` value. A wholly absent/empty value has
+/// no entries on either platform. Within a non-empty value, POSIX preserves every positional empty
+/// component as the effective working directory, while Windows ignores empty components.
+module internal PathSearchEntries =
+
+    let private preserveEmptyEntries =
+        not (RuntimeInformation.IsOSPlatform OSPlatform.Windows)
+
+    let private fold (folder: 'State -> string -> int -> int -> 'State) (state: 'State) (path: string) : 'State =
+        if String.IsNullOrEmpty path then
+            state
+        else
+            let mutable result = state
+            let mutable entryStart = 0
+            let mutable index = 0
+
+            while index <= path.Length do
+                if index = path.Length || path[index] = IO.Path.PathSeparator then
+                    let entryLength = index - entryStart
+
+                    if entryLength > 0 || preserveEmptyEntries then
+                        result <- folder result path entryStart entryLength
+
+                    entryStart <- index + 1
+
+                index <- index + 1
+
+            result
+
+    let split (path: string) : string array =
+        let entries = ResizeArray<string>()
+
+        fold (fun () value start length -> entries.Add(value.Substring(start, length))) () path
+
+        entries.ToArray()
+
+    let count (path: string) : int =
+        fold (fun total _ _ _ -> total + 1) 0 path
 
 /// The one sanitize-and-bound rule every caller-, child-, or peer-controlled fragment goes through
 /// before it reaches `ProcessError.Message` (and from there `ProcessError.ToString()`,
@@ -156,27 +196,15 @@ module internal MessageText =
     /// program", which is the question a not-found failure actually raises. The value itself stays on
     /// the `Searched` field, in full, for a caller that wants to print or diff it.
     ///
-    /// Entries are counted the way the resolver splits that value — on `Path.PathSeparator`, empty
-    /// entries dropped — so the number is how many `PATH` entries the lookup walked. It is not the total
-    /// number of directories probed, and `Searched` never was either: a bare name is tried against
-    /// `Command.PreferLocal` first, and on Windows against the pre-`PATH` locations `CreateProcessW`
-    /// searches. Counted by index rather than by `Split`, so a pathologically long value is never
-    /// materialized into an array.
+    /// Entries are counted by the same `PathSearchEntries` walk as the resolver: on POSIX, every
+    /// positional empty component of a non-empty value counts as the effective working directory; on
+    /// Windows, empty components are ignored. A wholly absent/empty value has no entries on either
+    /// platform. The count is not the total number of directories probed, and `Searched` never was
+    /// either: a bare name is tried against `Command.PreferLocal` first, and on Windows against the
+    /// pre-`PATH` locations `CreateProcessW` searches. The counting fold creates no array or substring,
+    /// so a pathologically long value is not duplicated just to render an error.
     let searchedPath (searched: string) : string =
-        let mutable entries = 0
-
-        if not (String.IsNullOrEmpty searched) then
-            let mutable index = 0
-            let mutable insideEntry = false
-
-            while index < searched.Length do
-                if searched[index] = IO.Path.PathSeparator then
-                    insideEntry <- false
-                elif not insideEntry then
-                    insideEntry <- true
-                    entries <- entries + 1
-
-                index <- index + 1
+        let entries = PathSearchEntries.count searched
 
         match entries with
         | 0 -> "an empty PATH"
@@ -251,9 +279,11 @@ type ProcessError =
     /// whole `PATH` value the lookup walked, `None` when no `PATH` search applied (a path-form program
     /// is resolved against its own directory instead).
     ///
-    /// `Message` reports only **how many entries** that path held, not the entries: a `PATH` is an
-    /// environment value, and a several-thousand-character one has no place in a log line. Read this
-    /// field when you want to name the directories that were searched.
+    /// `Message` reports only **how many effective entries** that path held, not the entries: positional
+    /// empty components of a non-empty POSIX `PATH` count as the effective working directory, while
+    /// Windows ignores empty components. A `PATH` is an environment value, and a
+    /// several-thousand-character one has no place in a log line. Read this field when you want to name
+    /// the directories that were searched.
     | NotFound of Program: string * Searched: string option
 
     /// A success-requiring verb (`run`) observed a non-zero exit code. `StdoutBytes` (an accessor, not a

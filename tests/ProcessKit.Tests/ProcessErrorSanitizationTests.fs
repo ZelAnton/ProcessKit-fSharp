@@ -278,16 +278,32 @@ type ProcessErrorSanitizationTests() =
         let single = ProcessError.NotFound("tool", Some "/usr/local/bin")
         Assert.That(single.Message, Is.EqualTo "program 'tool' was not found (searched 1 PATH entry)")
 
-        // Empty entries are dropped exactly as the resolver drops them, so the number is how many PATH
-        // entries the lookup walked...
+        // Positional empty entries in a non-empty PATH are the effective working directory on POSIX,
+        // while Windows drops them. The message follows the resolver's platform rule.
         let padded =
             ProcessError.NotFound("tool", Some $"{separator}{separator}/opt/bin{separator}")
 
-        Assert.That(padded.Message, Is.EqualTo "program 'tool' was not found (searched 1 PATH entry)")
+        let paddedDescription =
+            if OperatingSystem.IsWindows() then
+                "1 PATH entry"
+            else
+                "4 PATH entries"
 
-        // ...and a value that holds no entry at all says so, rather than claiming "0 PATH entries".
-        let empty = ProcessError.NotFound("tool", Some separator)
-        Assert.That(empty.Message, Is.EqualTo "program 'tool' was not found (searched an empty PATH)")
+        Assert.That(padded.Message, Is.EqualTo $"program 'tool' was not found (searched {paddedDescription})")
+
+        // A separator-only value has two positional empty entries on POSIX, but none on Windows.
+        let separatorOnly = ProcessError.NotFound("tool", Some separator)
+
+        let separatorOnlyDescription =
+            if OperatingSystem.IsWindows() then
+                "an empty PATH"
+            else
+                "2 PATH entries"
+
+        Assert.That(
+            separatorOnly.Message,
+            Is.EqualTo $"program 'tool' was not found (searched {separatorOnlyDescription})"
+        )
 
         // No PATH search applied (a path-form program): no parenthetical at all.
         let unsearched = ProcessError.NotFound("./tool", None)

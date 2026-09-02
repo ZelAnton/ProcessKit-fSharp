@@ -415,19 +415,7 @@ module internal Common =
             else
                 Path.Combine(effectiveWorkingDirectory, directory)
 
-        let pathDirs =
-            if String.IsNullOrEmpty ctx.Path then
-                [||]
-            else
-                let entries = ctx.Path.Split Path.PathSeparator
-
-                let entries =
-                    if RuntimeInformation.IsOSPlatform OSPlatform.Windows then
-                        entries |> Array.filter (fun directory -> directory <> "")
-                    else
-                        entries
-
-                entries |> Array.map resolvePathEntry
+        let pathDirs = ctx.Path |> PathSearchEntries.split |> Array.map resolvePathEntry
 
         let dirs =
             if RuntimeInformation.IsOSPlatform OSPlatform.Windows then

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `ProcessError.NotFound` now counts each positional empty component of a non-empty POSIX `PATH` as the effective working directory in its `searched N PATH entries` message, matching executable resolution; Windows still omits empty components from the count.
 - POSIX `ProcessError.Spawn` diagnostics now preserve the requested program when `Command.Rlimit` composes with privilege helpers across ordinary, PTY, cgroup, and detached launches.
 - Raw `ReportJson.*TypeInfo` serialization now writes a null report reference as JSON `null` instead of failing inside a converter with `NullReferenceException`; non-null report shapes and the `ToReportJson()` null guards are unchanged.
 - Public command builders and output-buffer policies now reject null discriminated-union arguments at the call boundary with `ArgumentNullException` naming the exact parameter. `ProcessResult.Failure` and `ProcessResult.Create` apply the same early, exact-parameter contract to required `stderr`/`outcome` arguments; in particular, `Failure` no longer accepts a null `stderr` that its text helpers previously treated as empty.
