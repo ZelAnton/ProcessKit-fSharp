@@ -6,6 +6,7 @@ open System.Collections.Concurrent
 open System.Collections.Immutable
 open System.IO
 open System.Runtime.InteropServices
+open System.Runtime.CompilerServices
 open System.Net.Sockets
 open System.Threading
 open System.Threading.Tasks
@@ -3543,7 +3544,7 @@ module internal Posix =
     /// the check simple and testable and never ships an untested, more-permissive security path; if a
     /// real rootless-container need arises, loosening this to capability-aware is a strictly non-breaking
     /// change. The public docs (Command.Uid, CHANGELOG, docs/commands.md) state this root-only contract.
-    let private privilegeDropPrecheck (command: Command) : ProcessError option =
+    let private privilegeDropPrecheck (diagnosticProgram: string) (command: Command) : ProcessError option =
         let config = command.Config
 
         if geteuid () = 0 then
@@ -3563,7 +3564,7 @@ module internal Posix =
                 | None -> false
 
             if wantsDifferentUid || wantsDifferentGid then
-                Some(ProcessError.Spawn(command.Program, "dropping to a different Uid/Gid needs root (euid 0)"))
+                Some(ProcessError.Spawn(diagnosticProgram, "dropping to a different Uid/Gid needs root (euid 0)"))
             else
                 None
 
@@ -3697,9 +3698,9 @@ module internal Posix =
     /// only answer that keeps the contract: arming without the guard would leave the pre-arm window open
     /// while still reporting `KillOnParentDeathScope.DirectChildOnly` — the silent downgrade this library
     /// does not ship.
-    let private parentDeathGuardMissing (command: Command) : ProcessError =
+    let private parentDeathGuardMissing (diagnosticProgram: string) : ProcessError =
         ProcessError.Spawn(
-            command.Program,
+            diagnosticProgram,
             $"KillOnParentDeath needs '/bin/{parentDeathGuardShellName}' to run the guard that detects a parent which died before PR_SET_PDEATHSIG could be armed; it was not found there (present on every mainstream Linux)"
         )
 
@@ -3709,10 +3710,14 @@ module internal Posix =
     /// `setsid --ctty` pty shim, the `/bin/sh` cgroup launcher), so the guard sits in the same place in
     /// all of them: immediately after the `setpriv` flags that arm the signal, immediately before the
     /// target, with nothing in between that could fork.
-    let private parentDeathGuardedTarget (command: Command) (target: string list) : Result<string list, ProcessError> =
+    let private parentDeathGuardedTarget
+        (diagnosticProgram: string)
+        (command: Command)
+        (target: string list)
+        : Result<string list, ProcessError> =
         if command.Config.KillOnParentDeath then
             match parentDeathGuardShell () with
-            | None -> Error(parentDeathGuardMissing command)
+            | None -> Error(parentDeathGuardMissing diagnosticProgram)
             | Some shellPath ->
                 Ok(
                     shellPath
@@ -3737,13 +3742,13 @@ module internal Posix =
     /// would otherwise fall through to a plain `posix_spawn` and be silently dropped — the very silent
     /// downgrade the project forbids. Refuse it up front with a typed `ProcessError.Spawn`, mirroring the
     /// honest-failure contract of the uid/gid drop itself. `None` = clear to go.
-    let private groupsRequireDropError (command: Command) : ProcessError option =
+    let private groupsRequireDropError (diagnosticProgram: string) (command: Command) : ProcessError option =
         let config = command.Config
 
         if config.Groups.IsSome && config.Uid.IsNone && config.Gid.IsNone then
             Some(
                 ProcessError.Spawn(
-                    command.Program,
+                    diagnosticProgram,
                     "Command.Groups (supplementary groups) is applied by the setpriv privilege-drop helper and needs a Uid or Gid drop to take effect; it was set without either"
                 )
             )
@@ -3756,7 +3761,7 @@ module internal Posix =
     /// learns what their own request needed. The one message for this condition, shared by the up-front
     /// resolution on all three drop paths (plain / pty shim / cgroup launcher) and by
     /// `remapSetprivNotFound`, so they cannot drift apart.
-    let private setprivHelperMissing (command: Command) : ProcessError =
+    let private setprivHelperMissing (diagnosticProgram: string) (command: Command) : ProcessError =
         let config = command.Config
 
         let reason =
@@ -3768,7 +3773,7 @@ module internal Posix =
             | false, false -> "this command needs"
 
         ProcessError.Spawn(
-            command.Program,
+            diagnosticProgram,
             $"{reason} the '{setprivHelper}' helper (util-linux), which is loaded only from a trusted system directory ({trustedHelperDirectoriesText ()}) and never from PATH so it cannot be hijacked; it was not found in any of them (present on mainstream Linux; absent on macOS/BSD)"
         )
 
@@ -3784,13 +3789,13 @@ module internal Posix =
     /// The helper is the ABSOLUTE path of a trusted-directory match, pinned as `argv[0]` of the spawn, so
     /// `posix_spawnp` runs exactly that image with no `PATH` search; a helper no trusted directory holds
     /// is an honest typed `Error` here, BEFORE any child exists (see `setprivHelperMissing`).
-    let private setprivCommand (command: Command) : Result<Command, ProcessError> =
+    let private setprivCommand (diagnosticProgram: string) (command: Command) : Result<Command, ProcessError> =
         match trustedHelperPath setprivHelper with
-        | None -> Error(setprivHelperMissing command)
+        | None -> Error(setprivHelperMissing diagnosticProgram command)
         | Some helperPath ->
             let config = command.Config
 
-            match parentDeathGuardedTarget command (config.Program :: List.ofSeq config.Args) with
+            match parentDeathGuardedTarget diagnosticProgram command (config.Program :: List.ofSeq config.Args) with
             | Error error -> Error error
             | Ok target ->
                 let argv = setprivFlags config @ target
@@ -3818,15 +3823,15 @@ module internal Posix =
     /// can reach `setpriv` pins it identically and fails identically (`setprivHelperMissing`) when no
     /// trusted directory holds it — and both nest the same parent-death guard (`parentDeathGuardedTarget`)
     /// directly around the target when `Command.KillOnParentDeath` is set.
-    let private setprivWrappedArgv (command: Command) : Result<string list, ProcessError> =
+    let private setprivWrappedArgv (diagnosticProgram: string) (command: Command) : Result<string list, ProcessError> =
         let config = command.Config
         let target = config.Program :: List.ofSeq config.Args
 
         if needsSetpriv config then
             match trustedHelperPath setprivHelper with
-            | None -> Error(setprivHelperMissing command)
+            | None -> Error(setprivHelperMissing diagnosticProgram command)
             | Some helperPath ->
-                match parentDeathGuardedTarget command target with
+                match parentDeathGuardedTarget diagnosticProgram command target with
                 | Error error -> Error error
                 | Ok guarded -> Ok(helperPath :: (setprivFlags config @ guarded))
         else
@@ -3836,13 +3841,14 @@ module internal Posix =
     /// `/bin/sh` cgroup launcher `exec` for a command — the `setpriv` flags, the parent-death guard, and
     /// the target. Exposed so a test can pin the guard's position in every helper chain (and its absence
     /// from a plain drop) without needing root, a pty, or a delegated cgroup.
-    let setprivWrappedArgvForTests (command: Command) : Result<string list, ProcessError> = setprivWrappedArgv command
+    let setprivWrappedArgvForTests (command: Command) : Result<string list, ProcessError> =
+        setprivWrappedArgv command.Program command
 
     /// Spawn `command` into a brand-new process group (`POSIX_SPAWN_SETPGROUP`, so pgid = the
     /// child's pid) and capture its stdout/stderr. The whole group can later be reaped with
     /// `killProcessGroup`. This is the one real POSIX spawn path; `spawnPosix` routes a command that
     /// requests `Uid`/`Gid` here too, after rewriting it to run through the `setpriv` helper.
-    let private spawnPosixViaSpawn (command: Command) : Result<Spawned, ProcessError> =
+    let private spawnPosixViaSpawn (diagnosticProgram: string) (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
         // `Command.InheritStdin` hands the child the PARENT's own standard input directly (no
         // socketpair, no feeder) — the interactive/console case. Every other configuration goes
@@ -4085,7 +4091,7 @@ module internal Posix =
                 closeFd fd
 
             closeParentEnds ()
-            Error(ProcessError.Spawn(command.Program, message))
+            Error(ProcessError.Spawn(diagnosticProgram, message))
         | None ->
             // Native scratch for the opaque posix_spawn_file_actions_t / posix_spawnattr_t (a generous
             // zeroed buffer holds either platform's representation — glibc structs or macOS pointers)
@@ -4150,7 +4156,7 @@ module internal Posix =
                             let rc = call ()
 
                             if rc <> 0 then
-                                err <- Some(ProcessError.Spawn(command.Program, $"{helper} failed (rc {rc})"))
+                                err <- Some(ProcessError.Spawn(diagnosticProgram, $"{helper} failed (rc {rc})"))
 
                     register "posix_spawn_file_actions_init" (fun () -> posix_spawn_file_actions_init fileActions)
 
@@ -4233,7 +4239,7 @@ module internal Posix =
                                 err <-
                                     Some(
                                         ProcessError.Spawn(
-                                            command.Program,
+                                            diagnosticProgram,
                                             $"posix_spawn_file_actions_addchdir_np failed for CurrentDir (rc {rc})"
                                         )
                                     )
@@ -4354,7 +4360,7 @@ module internal Posix =
                                 match config.IoPriority with
                                 | None -> spawnUnderUmask ()
                                 | Some priority ->
-                                    match withIoPriority command.Program priority with
+                                    match withIoPriority diagnosticProgram priority with
                                     | Error error ->
                                         ioPriorityRefusal.Value <- Some error
                                         -1, 0
@@ -4376,7 +4382,7 @@ module internal Posix =
                             match ioPriorityRefusal.Value with
                             | Some error -> Error error
                             | None when rc = ENOENT -> Error(notFoundFromSpawnFailure command)
-                            | None -> Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
+                            | None -> Error(ProcessError.Spawn(diagnosticProgram, $"posix_spawn failed ({rc})"))
                         else
                             // posix_spawnp succeeded: the child is running with pid `pid` (== its own pgid).
                             // Target-number reservations protected the file-action construction only. The
@@ -4452,7 +4458,7 @@ module internal Posix =
 
                                     Error(
                                         ProcessError.Spawn(
-                                            command.Program,
+                                            diagnosticProgram,
                                             $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
                                         )
                                     )
@@ -4601,7 +4607,7 @@ module internal Posix =
                                 // original fault as an honest Spawn error — never a raw exception, and the cleanup
                                 // never replaces the primary cause.
                                 postSpawnTeardown ()
-                                Error(ProcessError.Spawn(command.Program, ex.Message))
+                                Error(ProcessError.Spawn(diagnosticProgram, ex.Message))
                 finally
                     // Release the native scratch on every path (success, honest helper failure, or an
                     // exception unwinding through here) — destroying only the structs that initialized
@@ -4633,7 +4639,7 @@ module internal Posix =
                 // this same unwind.
                 closeChildSideFds ()
                 closeParentEnds ()
-                Error(ProcessError.Spawn(command.Program, ex.Message))
+                Error(ProcessError.Spawn(diagnosticProgram, ex.Message))
 
     // ----------------------------------------------------------------------------------
     // POSIX pty (Command.Pty): the `setsid --ctty` controlling-terminal helper + host gating
@@ -4697,11 +4703,11 @@ module internal Posix =
     /// link of the chain is resolved on `PATH`; a helper no trusted directory holds is an honest typed
     /// `Error` before any child exists — `Unsupported` for the ctty helper (the same capability answer
     /// `ptyHostUnsupported` gives), `Spawn` for `setpriv` (the same answer the non-pty drop gives).
-    let private cttyShimCommand (command: Command) : Result<Command, ProcessError> =
+    let private cttyShimCommand (diagnosticProgram: string) (command: Command) : Result<Command, ProcessError> =
         match trustedHelperPath cttyHelper with
         | None -> Error(cttyHelperUnsupported ())
         | Some cttyPath ->
-            match setprivWrappedArgv command with
+            match setprivWrappedArgv diagnosticProgram command with
             | Error error -> Error error
             | Ok target ->
                 let config = command.Config
@@ -4728,20 +4734,24 @@ module internal Posix =
     /// `setsid --ctty` shim (with any drop nested inside). A `NotFound` for the just-resolved `setsid`
     /// (the pinned trusted-directory match vanished between the availability check and the spawn) maps
     /// back to a typed `Unsupported`.
-    let private spawnPosixPty (command: Command) : Result<Spawned, ProcessError> =
+    let private spawnPosixPty
+        (diagnosticProgram: string)
+        (originalCommand: Command)
+        (command: Command)
+        : Result<Spawned, ProcessError> =
         let config = command.Config
 
         match ptyHostUnsupported () with
         | Some error -> Error error
         | None ->
-            match groupsRequireDropError command with
+            match groupsRequireDropError diagnosticProgram originalCommand with
             | Some error -> Error error
             | None ->
                 let proceed () =
-                    match cttyShimCommand command with
+                    match cttyShimCommand diagnosticProgram command with
                     | Error error -> Error error
                     | Ok shim ->
-                        match spawnPosixViaSpawn shim with
+                        match spawnPosixViaSpawn diagnosticProgram shim with
                         | Error(ProcessError.NotFound _) ->
                             Error(
                                 ProcessError.Unsupported
@@ -4750,7 +4760,7 @@ module internal Posix =
                         | other -> other
 
                 if config.Uid.IsSome || config.Gid.IsSome then
-                    match privilegeDropPrecheck command with
+                    match privilegeDropPrecheck diagnosticProgram originalCommand with
                     | Some error -> Error error
                     | None -> proceed ()
                 else
@@ -4923,6 +4933,20 @@ module internal Posix =
             else
                 configured @ [ Rlimit(RlimitResource.Cpu, groupSoft, groupHard) ]
 
+    // A backend may apply process limits before the native entry point sees the command. Keep the
+    // diagnostic identity beside that immutable rewritten command without exposing it to the child or
+    // extending the public command configuration; weak keys ensure completed commands are not retained.
+    let private processLimitDiagnosticPrograms = ConditionalWeakTable<Command, string>()
+
+    let private diagnosticProgram (command: Command) : string =
+        match processLimitDiagnosticPrograms.TryGetValue command with
+        | true, program -> program
+        | false, _ -> command.Program
+
+    let private rememberDiagnosticProgram (source: Command) (rewritten: Command) : Command =
+        processLimitDiagnosticPrograms.Add(rewritten, diagnosticProgram source)
+        rewritten
+
     /// Apply everything that has to reach the child as a `setrlimit(2)` pair before its program starts:
     /// the command's own `Command.Rlimit` values and, when the spawning group carries one, its whole-tree
     /// `ResourceLimits.CpuTimeMax` (see `foldCpuTimeMax` for how the shared CPU axis is resolved).
@@ -4949,52 +4973,58 @@ module internal Posix =
     /// needs privilege the drop has just given up, and `prlimit` then fails BEFORE `exec`ing anything, so
     /// the child never runs with the cap silently unapplied.
     let withProcessLimits (cpuTimeMax: TimeSpan option) (command: Command) : Result<Command, ProcessError> =
-        if command.Config.Rlimits.IsEmpty then
-            match cpuTimeMax with
-            | None -> Ok command
-            | Some duration -> withCpuTimeLimitShim duration command
-        else
-            let command = applyPreferLocal command
-            let config = command.Config
-
-            if config.Arg0.IsSome then
-                Error(
-                    ProcessError.Unsupported
-                        $"Command.Arg0 combined with Command.Rlimit: the {rlimitHelper} helper re-execs the target by name and has no seam for a distinct argv[0]"
-                )
+        let rewritten =
+            if command.Config.Rlimits.IsEmpty then
+                match cpuTimeMax with
+                | None -> Ok command
+                | Some duration -> withCpuTimeLimitShim duration command
             else
-                match trustedHelperPath rlimitHelper with
-                | None -> Error(rlimitHelperMissing ())
-                | Some helperPath ->
-                    match resolveCommandProgram command with
-                    | Error error -> Error error
-                    | Ok resolvedProgram ->
-                        let effective = foldCpuTimeMax cpuTimeMax config.Rlimits
+                let command = applyPreferLocal command
+                let config = command.Config
 
-                        let args =
-                            seq {
-                                for limit in effective do
-                                    yield $"{rlimitOption limit.Resource}={limit.Soft}:{limit.Hard}"
+                if config.Arg0.IsSome then
+                    Error(
+                        ProcessError.Unsupported
+                            $"Command.Arg0 combined with Command.Rlimit: the {rlimitHelper} helper re-execs the target by name and has no seam for a distinct argv[0]"
+                    )
+                else
+                    match trustedHelperPath rlimitHelper with
+                    | None -> Error(rlimitHelperMissing ())
+                    | Some helperPath ->
+                        match resolveCommandProgram command with
+                        | Error error -> Error error
+                        | Ok resolvedProgram ->
+                            let effective = foldCpuTimeMax cpuTimeMax config.Rlimits
 
-                                yield "--"
-                                yield resolvedProgram
-                                yield! config.Args
-                            }
+                            let args =
+                                seq {
+                                    for limit in effective do
+                                        yield $"{rlimitOption limit.Resource}={limit.Soft}:{limit.Hard}"
 
-                        Ok(
-                            Command(
-                                { config with
-                                    Program = helperPath
-                                    Args = ImmutableList.CreateRange args
-                                    // Cleared for the same reason the CPU shim clears `Arg0`: the check above
-                                    // already refuses one, and a stale value must never reach the HELPER's own
-                                    // `argv[0]`. `Rlimits` is cleared because they are now encoded in the argv
-                                    // above — so the defensive second call every spawn entry point makes sees
-                                    // nothing left to apply and cannot wrap a second helper around this one.
-                                    Arg0 = None
-                                    Rlimits = ImmutableList<Rlimit>.Empty }
+                                    yield "--"
+                                    yield resolvedProgram
+                                    yield! config.Args
+                                }
+
+                            Ok(
+                                Command(
+                                    { config with
+                                        Program = helperPath
+                                        Args = ImmutableList.CreateRange args
+                                        // Cleared for the same reason the CPU shim clears `Arg0`: the check above
+                                        // already refuses one, and a stale value must never reach the HELPER's own
+                                        // `argv[0]`. `Rlimits` is cleared because they are now encoded in the argv
+                                        // above — so the defensive second call every spawn entry point makes sees
+                                        // nothing left to apply and cannot wrap a second helper around this one.
+                                        Arg0 = None
+                                        Rlimits = ImmutableList<Rlimit>.Empty }
+                                )
                             )
-                        )
+
+        match rewritten with
+        | Ok rewritten when not (Object.ReferenceEquals(command, rewritten)) ->
+            Ok(rememberDiagnosticProgram command rewritten)
+        | result -> result
 
     /// Rewrite a `setpriv`-helper `NotFound` into the same typed `ProcessError.Spawn` against the ORIGINAL
     /// program that an up-front trusted-resolution miss produces (`setprivHelperMissing`), so a caller who
@@ -5004,9 +5034,13 @@ module internal Posix =
     /// condition, reported the same way, rather than a second wording for it. Generic in the success
     /// payload: one remap serves the contained spawn (`Spawned`) and the detached launch (`DetachedSpawn`),
     /// which route a drop through the very same helper.
-    let private remapSetprivNotFound (command: Command) (result: Result<'spawn, ProcessError>) =
+    let private remapSetprivNotFound
+        (diagnosticProgram: string)
+        (command: Command)
+        (result: Result<'spawn, ProcessError>)
+        =
         match result with
-        | Error(ProcessError.NotFound _) -> Error(setprivHelperMissing command)
+        | Error(ProcessError.NotFound _) -> Error(setprivHelperMissing diagnosticProgram command)
         | other -> other
 
     /// The honest typed refusal for the Windows-only token-hardening knobs
@@ -5076,6 +5110,7 @@ module internal Posix =
     /// carrying none, and already spent when a backend folded a group `CpuTimeMax` into it beforehand.
     let private spawnPreparedPosix (command: Command) : Result<Spawned, ProcessError> =
         let config = command.Config
+        let diagnosticProgram = diagnosticProgram command
 
         // The Windows-only token knobs are refused first, before any other dispatch: a POSIX host has no
         // restricted token and no integrity label to honour them with. The Linux-only I/O priority is
@@ -5120,14 +5155,13 @@ module internal Posix =
                             // (see `spawnPosixPty`); an unsupported host is a typed `Unsupported`, never a silent pipe
                             // (D9). A `KillOnParentDeath` request is armed inside the ctty shim (`cttyShimCommand`,
                             // via `setpriv`).
-                            spawnPosixPty limited
+                            spawnPosixPty diagnosticProgram command limited
                         else
 
-                            // Both guards are asked about the ORIGINAL command: their verdicts depend only on
-                            // knobs the rlimit rewrite preserves, and both name `command.Program` in the error
-                            // they raise — which must stay the program the caller asked for, never the helper
-                            // that would have launched it.
-                            match groupsRequireDropError command with
+                            // Both guards inspect the original knobs and receive the preserved diagnostic
+                            // program explicitly, so a backend-applied rlimit rewrite cannot make either name
+                            // the helper that would have launched the requested program.
+                            match groupsRequireDropError diagnosticProgram command with
                             | Some error -> Error error
                             | None ->
                                 if needsSetpriv config then
@@ -5136,18 +5170,20 @@ module internal Posix =
                                     // requested.
                                     let precheck =
                                         if config.Uid.IsSome || config.Gid.IsSome then
-                                            privilegeDropPrecheck command
+                                            privilegeDropPrecheck diagnosticProgram command
                                         else
                                             None
 
                                     match precheck with
                                     | Some error -> Error error
                                     | None ->
-                                        match setprivCommand limited with
+                                        match setprivCommand diagnosticProgram limited with
                                         | Error error -> Error error
-                                        | Ok dropping -> spawnPosixViaSpawn dropping |> remapSetprivNotFound command
+                                        | Ok dropping ->
+                                            spawnPosixViaSpawn diagnosticProgram dropping
+                                            |> remapSetprivNotFound diagnosticProgram command
                                 else
-                                    spawnPosixViaSpawn limited
+                                    spawnPosixViaSpawn diagnosticProgram limited
 
     /// Resolve a changed effective child `PATH` before either the native launch or a helper chain can
     /// perform a bare-name lookup in the parent context. The prepared command otherwise follows the
@@ -5199,6 +5235,7 @@ module internal Posix =
     /// `preparePosixLaunch`'s executable-selection boundary.
     let private spawnPreparedPosixIntoCgroup (command: Command) (cgroupProcs: string) : Result<Spawned, ProcessError> =
         let config = command.Config
+        let diagnosticProgram = diagnosticProgram command
 
         // Build and spawn the `/bin/sh` migration launcher around an already-resolved inner argv (the
         // target, with any trusted-path `setpriv`/`setsid --ctty`/`prlimit` helper already pinned into it).
@@ -5227,7 +5264,7 @@ module internal Posix =
                     // way can never see it silently misapplied to the `/bin/sh` LAUNCHER's own `argv[0]`.
                     Arg0 = None }
 
-            match spawnPosixViaSpawn (Command launcherConfig) with
+            match spawnPosixViaSpawn diagnosticProgram (Command launcherConfig) with
             | Error(ProcessError.NotFound _) ->
                 // Only `/bin/sh` itself can be NotFound here (a missing target program instead makes the
                 // launcher's `exec` fail and the shell exit 127 — an honest non-zero run, not a spawn
@@ -5256,7 +5293,7 @@ module internal Posix =
                 // two do — the `exec` of an absolute path performs no `PATH` search, so nothing on `PATH`
                 // can interpose here either.
                 let innerArgv =
-                    match setprivWrappedArgv limited with
+                    match setprivWrappedArgv diagnosticProgram limited with
                     | Error error -> Error error
                     | Ok dropOrPlain ->
                         if config.Pty.IsSome then
@@ -5302,11 +5339,11 @@ module internal Posix =
         match unsupportedGate with
         | Some error -> Error error
         | None ->
-            match groupsRequireDropError command with
+            match groupsRequireDropError diagnosticProgram command with
             | Some error -> Error error
             | None ->
                 if config.Uid.IsSome || config.Gid.IsSome then
-                    match privilegeDropPrecheck command with
+                    match privilegeDropPrecheck diagnosticProgram command with
                     | Some error -> Error error
                     | None -> launch ()
                 else
@@ -5360,7 +5397,10 @@ module internal Posix =
     /// no socketpairs, no parent-kept ends, and therefore no stream wrapping. If preparation, post-spawn
     /// priority setup, or the reaper handoff fails, the fresh session is killed and its direct leader is
     /// synchronously reaped before the typed spawn error is returned.
-    let private spawnDetachedPosixCore (command: Command) : Result<DetachedSpawn, ProcessError> =
+    let private spawnDetachedPosixCore
+        (diagnosticProgram: string)
+        (command: Command)
+        : Result<DetachedSpawn, ProcessError> =
         let config = command.Config
         // The verb layer has already refused every feeder stdin source (there is no parent left to pump
         // one), so stdin is either the parent's own — `Command.InheritStdin` — or an immediate EOF.
@@ -5440,7 +5480,7 @@ module internal Posix =
             for fd in childSideFds do
                 closeFd fd
 
-            Error(ProcessError.Spawn(command.Program, message))
+            Error(ProcessError.Spawn(diagnosticProgram, message))
         | None ->
             // Native scratch for the opaque posix_spawn_file_actions_t / posix_spawnattr_t plus the
             // marshalled argv/envp, released by the `finally` below on every path — the same allocation
@@ -5492,7 +5532,7 @@ module internal Posix =
                             let rc = call ()
 
                             if rc <> 0 then
-                                err <- Some(ProcessError.Spawn(command.Program, $"{helper} failed (rc {rc})"))
+                                err <- Some(ProcessError.Spawn(diagnosticProgram, $"{helper} failed (rc {rc})"))
 
                     register "posix_spawn_file_actions_init" (fun () -> posix_spawn_file_actions_init fileActions)
 
@@ -5531,7 +5571,7 @@ module internal Posix =
                                 err <-
                                     Some(
                                         ProcessError.Spawn(
-                                            command.Program,
+                                            diagnosticProgram,
                                             $"posix_spawn_file_actions_addchdir_np failed for CurrentDir (rc {rc})"
                                         )
                                     )
@@ -5585,7 +5625,7 @@ module internal Posix =
                             | Error message ->
                                 Some(
                                     ProcessError.Spawn(
-                                        command.Program,
+                                        diagnosticProgram,
                                         $"could not prepare detached POSIX reaper: {message}"
                                     )
                                 )
@@ -5618,7 +5658,7 @@ module internal Posix =
                                 if rc = ENOENT then
                                     Error(notFoundFromSpawnFailure command)
                                 else
-                                    Error(ProcessError.Spawn(command.Program, $"posix_spawn failed ({rc})"))
+                                    Error(ProcessError.Spawn(diagnosticProgram, $"posix_spawn failed ({rc})"))
                             else
                                 // The child is running and detached. The ONLY thing that can still fail is the
                                 // post-spawn priority nudge; a refused one must not leave a detached child
@@ -5647,7 +5687,7 @@ module internal Posix =
 
                                     Error(
                                         ProcessError.Spawn(
-                                            command.Program,
+                                            diagnosticProgram,
                                             $"could not set process priority via setpriority (errno {errno}); raising priority may require privilege (CAP_SYS_NICE)"
                                         )
                                     )
@@ -5666,7 +5706,7 @@ module internal Posix =
 
                                         Error(
                                             ProcessError.Spawn(
-                                                command.Program,
+                                                diagnosticProgram,
                                                 $"could not hand off detached child to POSIX reaper: {message}"
                                             )
                                         )
@@ -5690,7 +5730,7 @@ module internal Posix =
                 // marshalling, a missing posix_spawn* entry point), so there is nothing to kill: close
                 // whatever fds are still open and report an honest Spawn error.
                 closeChildSideFds ()
-                Error(ProcessError.Spawn(command.Program, ex.Message))
+                Error(ProcessError.Spawn(diagnosticProgram, ex.Message))
 
     /// Launch `command` as a detached POSIX child (see the section comment above). A requested `Uid`/`Gid`
     /// drop rides the SAME `setpriv` helper as the contained path — it `exec`s the target in place, so the
@@ -5701,6 +5741,7 @@ module internal Posix =
     /// purpose is to outlive the parent is a contradiction, not a composition.
     let private spawnPreparedDetachedPosix (command: Command) : Result<DetachedSpawn, ProcessError> =
         let config = command.Config
+        let diagnosticProgram = diagnosticProgram command
 
         // The Windows-only token knobs are refused here too, before any launch work: a detached child gets
         // no weaker honesty guarantee than a contained one just because nothing tracks it afterwards.
@@ -5730,7 +5771,7 @@ module internal Posix =
             match arg0HelperConflict config with
             | Some error -> Error error
             | None ->
-                match groupsRequireDropError command with
+                match groupsRequireDropError diagnosticProgram command with
                 | Some error -> Error error
                 | None ->
                     // A detached child is unowned, never contained, and nobody watches it — which makes the
@@ -5741,14 +5782,16 @@ module internal Posix =
                     | Error error -> Error error
                     | Ok limited ->
                         if config.Uid.IsSome || config.Gid.IsSome then
-                            match privilegeDropPrecheck command with
+                            match privilegeDropPrecheck diagnosticProgram command with
                             | Some error -> Error error
                             | None ->
-                                match setprivCommand limited with
+                                match setprivCommand diagnosticProgram limited with
                                 | Error error -> Error error
-                                | Ok dropping -> spawnDetachedPosixCore dropping |> remapSetprivNotFound command
+                                | Ok dropping ->
+                                    spawnDetachedPosixCore diagnosticProgram dropping
+                                    |> remapSetprivNotFound diagnosticProgram command
                         else
-                            spawnDetachedPosixCore limited
+                            spawnDetachedPosixCore diagnosticProgram limited
 
     /// The detached entry point shares the same pre-spawn effective-child-PATH resolution as the ordinary
     /// POSIX path, before its independent native spawn and helper rewrites.

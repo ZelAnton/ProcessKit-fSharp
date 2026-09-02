@@ -26,6 +26,9 @@ module private NativeEnv =
     [<DllImport("libc", CharSet = CharSet.Ansi, SetLastError = true)>]
     extern int unsetenv(string name)
 
+    [<DllImport("libc", SetLastError = true)>]
+    extern int geteuid()
+
 /// Covers `Exec.which` / `CliClient.EnsureAvailableAsync` — the no-spawn preflight helper — and its
 /// contract with the real spawn path: both go through the SAME PATH/PATHEXT-aware resolution
 /// (`Common.resolveProgram`), so for the same program name they must always agree on
@@ -1332,6 +1335,14 @@ type TrustedHelperResolutionTests() =
         Environment.SetEnvironmentVariable("PATH", value)
         NativeEnv.setenv ("PATH", value, 1) |> ignore
 
+    let assertMissingSetpriv (label: string) (expectedProgram: string) (result: Result<'a, ProcessError>) =
+        match result with
+        | Error(ProcessError.Spawn(program, reason)) ->
+            Assert.That(program, Is.EqualTo expectedProgram, label)
+            Assert.That(reason, Does.Contain "setpriv", label)
+        | Error other -> Assert.Fail $"{label}: expected ProcessError.Spawn for the missing setpriv, got {other}"
+        | Ok _ -> Assert.Fail $"{label}: expected the missing setpriv to refuse the launch"
+
     [<Test>]
     member _.``setpriv is loaded only from a trusted system directory, never from PATH (T-317)``() : Task =
         task {
@@ -1396,6 +1407,92 @@ type TrustedHelperResolutionTests() =
                 Native.Posix.trustedHelperDirectoriesForTests <- None
                 setPath originalPath
                 Directory.Delete(pathDir, true)
+                Directory.Delete(trustedDir, true)
+        }
+        :> Task
+
+    [<Test>]
+    member _.``rlimit helper composition preserves the requested program in spawn errors``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: setpriv and the cgroup launch path are Linux mechanisms."
+
+            if not (File.Exists "/dev/ptmx") then
+                Assert.Ignore "This host has no POSIX pseudo-terminal device for the PTY launch path."
+
+            let trustedDir = freshDir "rlimit-diagnostic-program"
+            let prlimitMarker = Path.Combine(trustedDir, "prlimit.marker")
+            let setsidMarker = Path.Combine(trustedDir, "setsid.marker")
+            let prlimitPath = writeHelperShim trustedDir "prlimit" prlimitMarker
+            let setsidPath = writeHelperShim trustedDir "setsid" setsidMarker
+            let callerProgram = "/bin/sh"
+
+            try
+                Native.Posix.trustedHelperDirectoriesForTests <- Some [ trustedDir ]
+
+                Assert.That(
+                    Native.Posix.trustedHelperPathForTests "prlimit",
+                    Is.EqualTo(Some prlimitPath),
+                    "the rlimit rewrite must resolve before the missing setpriv is diagnosed"
+                )
+
+                Assert.That(
+                    Native.Posix.trustedHelperPathForTests "setsid",
+                    Is.EqualTo(Some setsidPath),
+                    "the PTY path must pass its controlling-terminal helper gate"
+                )
+
+                Assert.That(
+                    Native.Posix.trustedHelperPathForTests "setpriv",
+                    Is.EqualTo(None: string option),
+                    "setpriv must be deterministically unavailable in the trusted directories"
+                )
+
+                let limitedDrop =
+                    Command.create callerProgram
+                    |> Command.args [ "-c"; "exit 0" ]
+                    |> Command.rlimit RlimitResource.NoFile 64L 128L
+                    |> Command.killOnParentDeath
+
+                let! ordinary = limitedDrop.OutputStringAsync()
+                assertMissingSetpriv "ordinary spawn" callerProgram ordinary
+
+                let! pty = (limitedDrop |> Command.pty).OutputStringAsync()
+                assertMissingSetpriv "PTY spawn" callerProgram pty
+
+                let cgroupProcs = Path.Combine(trustedDir, "cgroup.procs")
+
+                Native.Posix.spawnPosixIntoCgroup limitedDrop cgroupProcs
+                |> assertMissingSetpriv "cgroup spawn" callerProgram
+
+                let limitedDetachedDrop =
+                    Command.create callerProgram
+                    |> Command.args [ "-c"; "exit 0" ]
+                    |> Command.rlimit RlimitResource.NoFile 64L 128L
+                    |> Command.uid (NativeEnv.geteuid ())
+
+                Native.Posix.spawnDetachedPosix limitedDetachedDrop
+                |> assertMissingSetpriv "detached spawn" callerProgram
+
+                let groupsWithoutDrop =
+                    Command.create callerProgram
+                    |> Command.args [ "-c"; "exit 0" ]
+                    |> Command.rlimit RlimitResource.NoFile 64L 128L
+                    |> Command.groups [ NativeEnv.geteuid () ]
+                    |> Command.pty
+
+                match! groupsWithoutDrop.OutputStringAsync() with
+                | Error(ProcessError.Spawn(program, reason)) ->
+                    Assert.That(program, Is.EqualTo callerProgram, "supplementary-groups refusal")
+                    Assert.That(reason, Does.Contain "Command.Groups")
+                | Error other ->
+                    Assert.Fail $"expected ProcessError.Spawn for supplementary groups without a drop, got {other}"
+                | Ok _ -> Assert.Fail "supplementary groups without a Uid/Gid drop must be refused"
+
+                Assert.That(File.Exists prlimitMarker, Is.False, "the pre-spawn refusal must not execute prlimit")
+                Assert.That(File.Exists setsidMarker, Is.False, "the pre-spawn refusal must not execute setsid")
+            finally
+                Native.Posix.trustedHelperDirectoriesForTests <- None
                 Directory.Delete(trustedDir, true)
         }
         :> Task
