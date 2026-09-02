@@ -15,6 +15,12 @@ this — it is a separate serializer you reach for explicitly, either through th
 methods or by passing one of `ReportJson`'s `JsonTypeInfo<'T>` properties to `JsonSerializer.Serialize`
 yourself.
 
+The two entry points deliberately differ for a null report reference. Passing null directly with any
+`ReportJson.*TypeInfo` writes the JSON literal `null`, as `System.Text.Json` normally does for a nullable
+reference. Calling a `ToReportJson()` extension on null instead rejects the missing receiver with
+`ArgumentNullException` naming that extension's parameter. Every non-null value uses the object shapes
+documented below through either entry point.
+
 - [The schema](#the-schema)
 - [Stable identifiers](#stable-identifiers)
 - [Secret hygiene](#secret-hygiene)

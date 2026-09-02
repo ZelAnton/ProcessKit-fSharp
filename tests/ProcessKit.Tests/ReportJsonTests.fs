@@ -2,6 +2,7 @@ namespace ProcessKit.Tests
 
 open System
 open System.Text.Json
+open System.Text.Json.Serialization.Metadata
 open NUnit.Framework
 open ProcessKit
 
@@ -17,6 +18,22 @@ type ReportJsonTests() =
           WriteBytes = 202L
           ReadOperations = 3L
           WriteOperations = 4L }
+
+    let assertSerializesNull (value: 'T) (typeInfo: JsonTypeInfo<'T>) =
+        Assert.That(JsonSerializer.Serialize(value, typeInfo), Is.EqualTo "null")
+
+    [<Test>]
+    member _.``raw ReportJson metadata serializes null through every public TypeInfo``() =
+        assertSerializesNull Unchecked.defaultof<Outcome> ReportJson.OutcomeTypeInfo
+
+        assertSerializesNull Unchecked.defaultof<ProcessResult<string>> ReportJson.ProcessResultStringTypeInfo
+
+        assertSerializesNull Unchecked.defaultof<ProcessResult<byte[]>> ReportJson.ProcessResultBytesTypeInfo
+
+        assertSerializesNull Unchecked.defaultof<ProcessGroupStats> ReportJson.ProcessGroupStatsTypeInfo
+        assertSerializesNull Unchecked.defaultof<RunProfile> ReportJson.RunProfileTypeInfo
+        assertSerializesNull Unchecked.defaultof<MemberInfo> ReportJson.MemberInfoTypeInfo
+        assertSerializesNull Unchecked.defaultof<LimitEvidence> ReportJson.LimitEvidenceTypeInfo
 
     // -----------------------------------------------------------------------------------------------
     // Outcome

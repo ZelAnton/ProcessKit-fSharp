@@ -226,6 +226,7 @@ health reporting, and test doubles.
 | [Scripting with F# Interactive](docs/scripting.md) | `.fsx` setup, one-off helpers, reusable CLI clients, Ctrl+C cleanup, and portable tool resolution |
 | [Running commands](docs/commands.md) | The full `Command` builder and every consuming verb, with error semantics |
 | [Process groups](docs/process-groups.md) | Containment, teardown, signals, suspend/resume, members, limits, stats |
+| [JSONL reports](docs/jsonl-reports.md) | AOT-safe report serialization, stable wire shapes, null handling, and secret hygiene |
 | [Streaming & interactive I/O](docs/streaming.md) | Line/Content-Length streaming, conversational stdin, readiness probes, `WaitAnyAsync`, profiling |
 | [Performance & scalability](docs/performance.md) | Event-driven waits, buffer/backpressure tuning, fleet sizing, benchmark interpretation |
 | [Pipelines](docs/pipelines.md) | Shell-free `a → b → c`, pipefail attribution, chain timeouts |

@@ -19,6 +19,14 @@ open System.Text.Json.Serialization.Metadata
 [<RequireQualifiedAccess>]
 module internal ReportJsonWrite =
 
+    /// Writes a top-level null report value before a converter attempts to inspect its shape.
+    let tryWriteNull (writer: Utf8JsonWriter) (value: obj) : bool =
+        if obj.ReferenceEquals(value, null) then
+            writer.WriteNullValue()
+            true
+        else
+            false
+
     /// Writes an `Outcome` as `{"kind": "<identifier>", "code": <int|null>, "signal_number": <int|null>,
     /// ["reason": "<string>"]}`. `kind` is the outcome's own stable identifier — `exited` / `signalled` /
     /// `timed_out` / `unobserved` — never a raw union-case ordinal or `.ToString()` spelling. It is read
@@ -87,7 +95,8 @@ type internal OutcomeJsonConverter() =
         )
 
     override _.Write(writer: Utf8JsonWriter, value: Outcome, _options: JsonSerializerOptions) : unit =
-        ReportJsonWrite.outcome writer value
+        if not (ReportJsonWrite.tryWriteNull writer value) then
+            ReportJsonWrite.outcome writer value
 
 /// Serializes a `ProcessResult<'T>` as one JSONL report line: `program`, its `outcome`, whether it
 /// `success`-ed under the command's own `ok_codes`, the run's `duration_secs`, whether the capture was
@@ -108,33 +117,34 @@ type internal ProcessResultJsonConverter<'T>() =
         )
 
     override _.Write(writer: Utf8JsonWriter, value: ProcessResult<'T>, _options: JsonSerializerOptions) : unit =
-        writer.WriteStartObject()
-        writer.WriteString("kind", "process_result")
-        writer.WriteString("program", value.Program)
-        writer.WritePropertyName "outcome"
-        ReportJsonWrite.outcome writer value.Outcome
-        writer.WriteBoolean("success", value.IsSuccess)
-        writer.WritePropertyName "ok_codes"
-        writer.WriteStartArray()
+        if not (ReportJsonWrite.tryWriteNull writer value) then
+            writer.WriteStartObject()
+            writer.WriteString("kind", "process_result")
+            writer.WriteString("program", value.Program)
+            writer.WritePropertyName "outcome"
+            ReportJsonWrite.outcome writer value.Outcome
+            writer.WriteBoolean("success", value.IsSuccess)
+            writer.WritePropertyName "ok_codes"
+            writer.WriteStartArray()
 
-        for code in value.AcceptedCodes do
-            writer.WriteNumberValue code
+            for code in value.AcceptedCodes do
+                writer.WriteNumberValue code
 
-        writer.WriteEndArray()
-        writer.WriteNumber("duration_secs", value.Duration.TotalSeconds)
-        writer.WriteBoolean("truncated", value.Truncated)
+            writer.WriteEndArray()
+            writer.WriteNumber("duration_secs", value.Duration.TotalSeconds)
+            writer.WriteBoolean("truncated", value.Truncated)
 
-        let totalLines, totalBytes = value.OverflowTotals
+            let totalLines, totalBytes = value.OverflowTotals
 
-        match totalLines with
-        | Some measured -> writer.WriteNumber("total_lines", measured)
-        | None -> writer.WriteNull "total_lines"
+            match totalLines with
+            | Some measured -> writer.WriteNumber("total_lines", measured)
+            | None -> writer.WriteNull "total_lines"
 
-        match totalBytes with
-        | Some measured -> writer.WriteNumber("total_bytes", measured)
-        | None -> writer.WriteNull "total_bytes"
+            match totalBytes with
+            | Some measured -> writer.WriteNumber("total_bytes", measured)
+            | None -> writer.WriteNull "total_bytes"
 
-        writer.WriteEndObject()
+            writer.WriteEndObject()
 
 /// Serializes a `ProcessGroupStats` snapshot: the live `active_process_count` (always known — it is the
 /// group's own membership count) plus every optional platform metric, each `null` on its own when the
@@ -152,17 +162,18 @@ type internal ProcessGroupStatsJsonConverter() =
         )
 
     override _.Write(writer: Utf8JsonWriter, value: ProcessGroupStats, _options: JsonSerializerOptions) : unit =
-        writer.WriteStartObject()
-        writer.WriteString("kind", "process_group_stats")
-        writer.WriteNumber("active_process_count", value.ActiveProcessCount)
-        ReportJsonWrite.optionalInt64 writer "peak_process_count" value.PeakProcessCount
-        ReportJsonWrite.optionalSeconds writer "total_cpu_time_secs" value.TotalCpuTime
-        ReportJsonWrite.optionalInt64 writer "peak_memory_bytes" value.PeakMemoryBytes
-        ReportJsonWrite.optionalInt64 writer "io_read_bytes" value.IoReadBytes
-        ReportJsonWrite.optionalInt64 writer "io_write_bytes" value.IoWriteBytes
-        ReportJsonWrite.optionalInt64 writer "io_read_operations" value.IoReadOperations
-        ReportJsonWrite.optionalInt64 writer "io_write_operations" value.IoWriteOperations
-        writer.WriteEndObject()
+        if not (ReportJsonWrite.tryWriteNull writer value) then
+            writer.WriteStartObject()
+            writer.WriteString("kind", "process_group_stats")
+            writer.WriteNumber("active_process_count", value.ActiveProcessCount)
+            ReportJsonWrite.optionalInt64 writer "peak_process_count" value.PeakProcessCount
+            ReportJsonWrite.optionalSeconds writer "total_cpu_time_secs" value.TotalCpuTime
+            ReportJsonWrite.optionalInt64 writer "peak_memory_bytes" value.PeakMemoryBytes
+            ReportJsonWrite.optionalInt64 writer "io_read_bytes" value.IoReadBytes
+            ReportJsonWrite.optionalInt64 writer "io_write_bytes" value.IoWriteBytes
+            ReportJsonWrite.optionalInt64 writer "io_read_operations" value.IoReadOperations
+            ReportJsonWrite.optionalInt64 writer "io_write_operations" value.IoWriteOperations
+            writer.WriteEndObject()
 
 /// Serializes a `RunProfile` — one finished run's resource summary from `RunningProcess.ProfileAsync`:
 /// its `outcome`, `duration_secs`, the optional CPU/memory/I/O telemetry (each `null` when the platform or
@@ -180,20 +191,21 @@ type internal RunProfileJsonConverter() =
         )
 
     override _.Write(writer: Utf8JsonWriter, value: RunProfile, _options: JsonSerializerOptions) : unit =
-        writer.WriteStartObject()
-        writer.WriteString("kind", "run_profile")
-        writer.WritePropertyName "outcome"
-        ReportJsonWrite.outcome writer value.Outcome
-        writer.WriteNumber("duration_secs", value.Duration.TotalSeconds)
-        ReportJsonWrite.optionalSeconds writer "cpu_time_secs" value.CpuTime
-        ReportJsonWrite.optionalInt64 writer "peak_memory_bytes" value.PeakMemoryBytes
-        ReportJsonWrite.optionalInt64 writer "io_read_bytes" value.IoReadBytes
-        ReportJsonWrite.optionalInt64 writer "io_write_bytes" value.IoWriteBytes
-        ReportJsonWrite.optionalInt64 writer "io_read_operations" value.IoReadOperations
-        ReportJsonWrite.optionalInt64 writer "io_write_operations" value.IoWriteOperations
-        writer.WriteNumber("samples", value.Samples)
-        ReportJsonWrite.optionalDouble writer "avg_cpu_cores" value.AvgCpuCores
-        writer.WriteEndObject()
+        if not (ReportJsonWrite.tryWriteNull writer value) then
+            writer.WriteStartObject()
+            writer.WriteString("kind", "run_profile")
+            writer.WritePropertyName "outcome"
+            ReportJsonWrite.outcome writer value.Outcome
+            writer.WriteNumber("duration_secs", value.Duration.TotalSeconds)
+            ReportJsonWrite.optionalSeconds writer "cpu_time_secs" value.CpuTime
+            ReportJsonWrite.optionalInt64 writer "peak_memory_bytes" value.PeakMemoryBytes
+            ReportJsonWrite.optionalInt64 writer "io_read_bytes" value.IoReadBytes
+            ReportJsonWrite.optionalInt64 writer "io_write_bytes" value.IoWriteBytes
+            ReportJsonWrite.optionalInt64 writer "io_read_operations" value.IoReadOperations
+            ReportJsonWrite.optionalInt64 writer "io_write_operations" value.IoWriteOperations
+            writer.WriteNumber("samples", value.Samples)
+            ReportJsonWrite.optionalDouble writer "avg_cpu_cores" value.AvgCpuCores
+            writer.WriteEndObject()
 
 /// Serializes a `MemberInfo` snapshot: the always-present `pid` plus `ppid` / `exe_name` / `start_time`,
 /// each `null` where the platform could not report it. There is deliberately no `args`/`cmdline`/`env`
@@ -212,23 +224,24 @@ type internal MemberInfoJsonConverter() =
         )
 
     override _.Write(writer: Utf8JsonWriter, value: MemberInfo, _options: JsonSerializerOptions) : unit =
-        writer.WriteStartObject()
-        writer.WriteString("kind", "member_info")
-        writer.WriteNumber("pid", value.Pid)
+        if not (ReportJsonWrite.tryWriteNull writer value) then
+            writer.WriteStartObject()
+            writer.WriteString("kind", "member_info")
+            writer.WriteNumber("pid", value.Pid)
 
-        match value.Ppid with
-        | Some ppid -> writer.WriteNumber("ppid", ppid)
-        | None -> writer.WriteNull "ppid"
+            match value.Ppid with
+            | Some ppid -> writer.WriteNumber("ppid", ppid)
+            | None -> writer.WriteNull "ppid"
 
-        match value.ExeName with
-        | Some exeName -> writer.WriteString("exe_name", exeName)
-        | None -> writer.WriteNull "exe_name"
+            match value.ExeName with
+            | Some exeName -> writer.WriteString("exe_name", exeName)
+            | None -> writer.WriteNull "exe_name"
 
-        match value.StartTime with
-        | Some startTime -> writer.WriteString("start_time", startTime)
-        | None -> writer.WriteNull "start_time"
+            match value.StartTime with
+            | Some startTime -> writer.WriteString("start_time", startTime)
+            | None -> writer.WriteNull "start_time"
 
-        writer.WriteEndObject()
+            writer.WriteEndObject()
 
 /// Serializes a `LimitEvidence` report: one `LimitVerdict` per axis (`memory`/`processes`/`cpu`), each
 /// written as its stable machine identifier — `"tripped"` / `"not_tripped"` / `"unknown"` — never a raw
@@ -248,12 +261,13 @@ type internal LimitEvidenceJsonConverter() =
         )
 
     override _.Write(writer: Utf8JsonWriter, value: LimitEvidence, _options: JsonSerializerOptions) : unit =
-        writer.WriteStartObject()
-        writer.WriteString("kind", "limit_evidence")
-        writer.WriteString("memory", StableIdentifiers.limitVerdict value.Memory)
-        writer.WriteString("processes", StableIdentifiers.limitVerdict value.Processes)
-        writer.WriteString("cpu", StableIdentifiers.limitVerdict value.Cpu)
-        writer.WriteEndObject()
+        if not (ReportJsonWrite.tryWriteNull writer value) then
+            writer.WriteStartObject()
+            writer.WriteString("kind", "limit_evidence")
+            writer.WriteString("memory", StableIdentifiers.limitVerdict value.Memory)
+            writer.WriteString("processes", StableIdentifiers.limitVerdict value.Processes)
+            writer.WriteString("cpu", StableIdentifiers.limitVerdict value.Cpu)
+            writer.WriteEndObject()
 
 /// AOT-safe `System.Text.Json` metadata for the opt-in JSONL report serializer: one self-describing JSON
 /// object per line for `Outcome`, `ProcessResult&lt;string&gt;`/`ProcessResult&lt;byte[]&gt;`,
@@ -266,6 +280,11 @@ type internal LimitEvidenceJsonConverter() =
 /// themselves changed — this is a separate serializer you reach for explicitly, via
 /// `JsonSerializer.Serialize(value, ReportJson.OutcomeTypeInfo)` or the `ToReportJson()` extension methods
 /// on `ReportJsonExtensions`.
+///
+/// A null value passed directly to `JsonSerializer.Serialize` with any metadata property below is written
+/// as the JSON literal `null`, following `System.Text.Json`'s reference-type contract. The convenience
+/// `ToReportJson()` extension methods instead reject a null receiver with `ArgumentNullException` naming
+/// that method's parameter.
 ///
 /// **Four rules, matching the source feature:**
 ///  1. **A tagged shape carries a `"kind"` identifier**, spelled as this schema's own stable, documented

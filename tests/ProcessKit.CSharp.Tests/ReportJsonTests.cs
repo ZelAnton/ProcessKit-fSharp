@@ -62,6 +62,18 @@ public class ReportJsonTests
     }
 
     [Test]
+    public void Raw_ReportJson_TypeInfo_overloads_serialize_null_as_JSON_null()
+    {
+        AssertSerializesNull(ReportJson.OutcomeTypeInfo);
+        AssertSerializesNull(ReportJson.ProcessResultStringTypeInfo);
+        AssertSerializesNull(ReportJson.ProcessResultBytesTypeInfo);
+        AssertSerializesNull(ReportJson.ProcessGroupStatsTypeInfo);
+        AssertSerializesNull(ReportJson.RunProfileTypeInfo);
+        AssertSerializesNull(ReportJson.MemberInfoTypeInfo);
+        AssertSerializesNull(ReportJson.LimitEvidenceTypeInfo);
+    }
+
+    [Test]
     public void Outcome_ToReportJson_rejects_null()
     {
         Assert.Throws<ArgumentNullException>(() => ((Outcome)null!).ToReportJson());
@@ -70,5 +82,10 @@ public class ReportJsonTests
     private static void AssertWriteOnly<T>(JsonTypeInfo<T> typeInfo)
     {
         Assert.Throws<NotSupportedException>(() => JsonSerializer.Deserialize("null", typeInfo));
+    }
+
+    private static void AssertSerializesNull<T>(JsonTypeInfo<T> typeInfo)
+    {
+        Assert.That(JsonSerializer.Serialize(default!, typeInfo), Is.EqualTo("null"));
     }
 }
