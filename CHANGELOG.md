@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `PtySession.ExpectAsync(Regex, ...)` now returns regex timeouts and other matcher failures as typed `ProcessError` values, while matching outside the shared output-window lock and conditionally consuming only a current snapshot so output remains responsive and concurrent waits cannot consume stale text.
 - `OutputBytesAsync` and its bytes-capture helpers now surface genuine raw-stdout read failures as `ProcessException` carrying `ProcessError.Io`, instead of leaking raw I/O or disposal exceptions.
 - `RotatingFileSink` now identifies itself in `ObjectDisposedException.ObjectName` when an operation is attempted after disposal, instead of reporting `System.String`.
 - `JsonRpcSession` now releases a peer request's response claim when response-body encoding throws, allowing a corrected `RespondAsync`, `RespondRawAsync`, or `RespondErrorAsync` attempt before any frame is written.

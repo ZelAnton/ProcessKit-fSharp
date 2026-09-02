@@ -201,20 +201,28 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
                 // never be lost (see `ExpectWindow.Changed`).
                 let changed = window.Changed
 
-                // One atomic look at the window decides all three cases. Asking "did it match?" and
-                // "has the output ended?" as two separate window operations would be a race: a child's
-                // final answer and the end of its terminal arrive back to back, so the pumps could
-                // append the match AND finish in between, leaving the second question to report a false
-                // end for a match already in the window (see `ExpectWindow.TryConsume`).
-                match window.TryConsume matcher with
-                | ExpectStep.Matched(before, matched) -> result <- ValueSome(Ok(ExpectMatch(before, matched)))
-                | ExpectStep.InvalidPattern -> result <- ValueSome invalidPatternError
+                // Matching runs over an immutable snapshot outside the window gate. The conditional
+                // consume below returns `None` when output or a competing waiter changed that snapshot;
+                // retrying is what keeps a stale match from consuming different text while letting the
+                // output pumps continue during an expensive regular expression.
+                let step =
+                    try
+                        Ok(window.TryConsume matcher)
+                    with
+                    | :? RegexMatchTimeoutException as ex -> Error(ProcessError.NotReady(program, ex.MatchTimeout))
+                    | ex -> Error(ProcessError.Io $"expect pattern matching failed: {ex.Message}")
+
+                match step with
+                | Error error -> result <- ValueSome(Error error)
+                | Ok None -> ()
+                | Ok(Some(ExpectStep.Matched(before, matched))) -> result <- ValueSome(Ok(ExpectMatch(before, matched)))
+                | Ok(Some ExpectStep.InvalidPattern) -> result <- ValueSome invalidPatternError
                 // The child's output has ended (it closed the terminal, or exited) and the pattern
                 // never arrived: report it now rather than burning the rest of the timeout on output
                 // that can no longer come.
-                | ExpectStep.Ended(Some fault) -> result <- ValueSome(readFaultError fault)
-                | ExpectStep.Ended None -> result <- ValueSome(Error(ProcessError.NotReady(program, armed)))
-                | ExpectStep.Waiting ->
+                | Ok(Some(ExpectStep.Ended(Some fault))) -> result <- ValueSome(readFaultError fault)
+                | Ok(Some(ExpectStep.Ended None)) -> result <- ValueSome(Error(ProcessError.NotReady(program, armed)))
+                | Ok(Some ExpectStep.Waiting) ->
                     try
                         do! changed.WaitAsync linked.Token
                     with :? OperationCanceledException ->
@@ -316,8 +324,12 @@ type PtySession private (running: RunningProcess, options: PtySessionOptions, fi
     ///
     /// Matching runs over the same sliding, unframed session view as the string overload, so `^`/`$`
     /// anchor against the window's bounds rather than the child's line structure unless you pass
-    /// `RegexOptions.Multiline`. A zero-width match is rejected with a typed `Unsupported` result,
-    /// because it cannot advance the session window.
+    /// `RegexOptions.Multiline`. Matching runs over an immutable window snapshot without blocking new
+    /// output. The snapshot is consumed only if it is still current, so concurrent expects cannot both
+    /// consume one match. A `RegexMatchTimeoutException` becomes `NotReady` with the regex's own
+    /// `MatchTimeout`, and any other matcher exception becomes `Io`; neither faults the returned task.
+    /// A zero-width match is rejected with a typed `Unsupported` result, because it cannot advance the
+    /// session window.
     member _.ExpectAsync
         (pattern: Regex, timeout: TimeSpan, [<Optional>] cancellationToken: CancellationToken)
         : Task<Result<ExpectMatch, ProcessError>> =

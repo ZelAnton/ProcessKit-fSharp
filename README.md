@@ -951,7 +951,13 @@ that leader to ProcessKit's directed CTRL+BREAK API.
 For an expect-style `PtySession`, construction claims the interactive writer without waiting for a
 `Stdin(source)` feeder to finish. `SendAsync`, `SendLineAsync`, and `CloseStdinAsync` wait for that
 feeder before writing or closing, so a slow source or a child that is not currently reading stdin
-cannot block session construction or let two writers use the pipe at once. The close verbs on all
+cannot block session construction or let two writers use the pipe at once. Its regex `ExpectAsync`
+overload matches an immutable output snapshot without holding the session's shared window lock, so a
+costly regex does not block incoming output or another window operation. Consumption is conditional
+on that snapshot still being current, preventing stale or concurrent matches from consuming different
+text or the same text twice. A regex `MatchTimeout` is returned as `ProcessError.NotReady` with that
+match budget; another matcher exception is returned as `ProcessError.Io`, rather than faulting the
+returned task. The close verbs on all
 interactive sessions — `PtySession.CloseStdinAsync(cancellationToken)`,
 `ContentLengthSession.FinishInputAsync(cancellationToken)`, and
 `JsonRpcSession.FinishInputAsync(cancellationToken)` — return

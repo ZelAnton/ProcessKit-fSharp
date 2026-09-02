@@ -122,6 +122,14 @@ type PtySessionTests() =
         | -1 -> None
         | index -> Some(index, pattern.Length)
 
+    let consumeWindow (window: ExpectWindow) matcher =
+        let rec consumeCurrent () =
+            match window.TryConsume matcher with
+            | Some step -> step
+            | None -> consumeCurrent ()
+
+        consumeCurrent ()
+
     let filterAnsi (text: string) (chunkSizes: int list) =
         let filter = AnsiEscapeFilter()
         let output = StringBuilder()
@@ -199,6 +207,33 @@ type PtySessionTests() =
             match! session.ExpectAsync("answer=42", TimeSpan.FromSeconds 10.0) with
             | Ok matched -> Assert.That(matched.Text, Is.EqualTo "answer=42")
             | Error error -> Assert.Fail $"the text after the regex match should still be pending: {error}"
+        }
+
+    [<Test>]
+    member _.``a Regex match timeout is a typed NotReady result and leaves the window untouched``() : Task =
+        task {
+            let output = String('a', 100_000) + "!"
+            let matchTimeout = TimeSpan.FromMilliseconds 1.0
+            let pattern = Regex("^(a+)+b$", RegexOptions.None, matchTimeout)
+            let fake = FakeProcess.Create("slow-regex").WithPty().WithStdout(output)
+            use running = fake.Build()
+
+            let session =
+                PtySession(
+                    running,
+                    { PtySessionOptions.Default with
+                        WindowChars = output.Length }
+                )
+
+            match! session.ExpectAsync(pattern, TimeSpan.FromSeconds 10.0) with
+            | Error(ProcessError.NotReady(program, reportedTimeout)) ->
+                Assert.That(program, Is.EqualTo "slow-regex")
+                Assert.That(reportedTimeout, Is.EqualTo matchTimeout)
+            | Error error -> Assert.Fail $"the regex timeout should be a typed NotReady result, got {error}"
+            | Ok matched -> Assert.Fail $"the deliberately failing regex must not match, got '{matched.Text}'"
+
+            let! _ = session.WaitForExitAsync()
+            Assert.That(session.Pending, Is.EqualTo output, "a matcher exception must not consume output")
         }
 
     [<Test>]
@@ -634,7 +669,7 @@ type PtySessionTests() =
         window.Append "answer=42"
         window.Complete None
 
-        match window.TryConsume(literal "answer=42") with
+        match consumeWindow window (literal "answer=42") with
         | ExpectStep.Matched(before, text) ->
             Assert.That(text, Is.EqualTo "answer=42")
             Assert.That(before, Is.Empty)
@@ -642,7 +677,7 @@ type PtySessionTests() =
 
         // Only once the pattern is genuinely absent does the ended window say so — promptly, so a wait
         // does not burn its whole deadline on output that can no longer come.
-        match window.TryConsume(literal "answer=42") with
+        match consumeWindow window (literal "answer=42") with
         | ExpectStep.Ended None -> ()
         | other -> Assert.Fail $"an ended window with nothing left to match must report Ended, got {other}"
 
@@ -652,14 +687,14 @@ type PtySessionTests() =
         let zeroWidth _ = Some(0, 0)
         window.Append "ready"
 
-        match window.TryConsume zeroWidth with
+        match consumeWindow window zeroWidth with
         | ExpectStep.InvalidPattern -> ()
         | other -> Assert.Fail $"a zero-length match on a live window must be rejected, got {other}"
 
         Assert.That(window.Pending, Is.EqualTo "ready")
         window.Complete None
 
-        match window.TryConsume zeroWidth with
+        match consumeWindow window zeroWidth with
         | ExpectStep.InvalidPattern -> ()
         | other -> Assert.Fail $"a zero-length match after completion must be rejected, got {other}"
 
@@ -674,11 +709,11 @@ type PtySessionTests() =
         window.Append "LEN=7"
         window.Complete(Some fault)
 
-        match window.TryConsume(literal "LEN=7") with
+        match consumeWindow window (literal "LEN=7") with
         | ExpectStep.Matched(_, text) -> Assert.That(text, Is.EqualTo "LEN=7")
         | other -> Assert.Fail $"the delivered output must be matchable before the fault is reported, got {other}"
 
-        match window.TryConsume(literal "LEN=7") with
+        match consumeWindow window (literal "LEN=7") with
         | ExpectStep.Ended(Some reported) -> Assert.That(reported, Is.SameAs fault)
         | other -> Assert.Fail $"the fault that ended the output must reach the waiter, got {other}"
 
@@ -687,9 +722,96 @@ type PtySessionTests() =
         let window = ExpectWindow(1024, None)
         window.Append "Passwo"
 
-        match window.TryConsume(literal "Password: ") with
+        match consumeWindow window (literal "Password: ") with
         | ExpectStep.Waiting -> ()
         | other -> Assert.Fail $"a partially arrived prompt is neither a match nor an end, got {other}"
+
+    [<Test>]
+    member _.``window matching leaves the gate free and rejects a stale result``() =
+        let window = ExpectWindow(1024, None)
+        use matcherStarted = new ManualResetEventSlim(false)
+        use releaseMatcher = new ManualResetEventSlim(false)
+        window.Append "ready"
+
+        let attempt =
+            Task.Run(fun () ->
+                window.TryConsume(fun text ->
+                    matcherStarted.Set()
+                    releaseMatcher.Wait()
+                    literal "ready" text))
+
+        try
+            Assert.That(matcherStarted.Wait(TimeSpan.FromSeconds 2.0), Is.True, "matcher did not start")
+            let append = Task.Run(fun () -> window.Append "tail")
+
+            Assert.That(
+                append.Wait(TimeSpan.FromSeconds 2.0),
+                Is.True,
+                "appending output must not wait for a matcher running over a snapshot"
+            )
+
+            match consumeWindow window (literal "ready") with
+            | ExpectStep.Matched(_, text) -> Assert.That(text, Is.EqualTo "ready")
+            | other -> Assert.Fail $"a competing waiter should consume the original text, got {other}"
+
+            window.Append "other"
+        finally
+            releaseMatcher.Set()
+
+        match attempt.GetAwaiter().GetResult() with
+        | None -> ()
+        | Some step -> Assert.Fail $"a result from the pre-append snapshot must be rejected, got {step}"
+
+        Assert.That(window.Pending, Is.EqualTo "tailother", "the stale result must not consume replacement text")
+
+        match consumeWindow window (literal "tail") with
+        | ExpectStep.Matched(before, text) ->
+            Assert.That(before, Is.Empty)
+            Assert.That(text, Is.EqualTo "tail")
+        | other -> Assert.Fail $"a fresh retry should consume the current match, got {other}"
+
+        Assert.That(window.Pending, Is.EqualTo "other")
+
+    [<Test>]
+    member _.``two matching snapshots can consume the same fragment only once``() =
+        let window = ExpectWindow(1024, None)
+        use bothMatching = new CountdownEvent(2)
+        use releaseMatchers = new ManualResetEventSlim(false)
+        window.Append "token"
+
+        let attempt () =
+            Task.Run(fun () ->
+                window.TryConsume(fun text ->
+                    bothMatching.Signal() |> ignore
+                    releaseMatchers.Wait()
+                    literal "token" text))
+
+        let first = attempt ()
+        let second = attempt ()
+
+        try
+            Assert.That(
+                bothMatching.Wait(TimeSpan.FromSeconds 2.0),
+                Is.True,
+                "both waiters must match the same snapshot before either consumes it"
+            )
+        finally
+            releaseMatchers.Set()
+
+        Task.WaitAll [| first :> Task; second :> Task |]
+        let outcomes = [ first.Result; second.Result ]
+
+        Assert.That(
+            outcomes
+            |> List.filter (function
+                | Some(ExpectStep.Matched(_, "token")) -> true
+                | _ -> false)
+            |> List.length,
+            Is.EqualTo 1
+        )
+
+        Assert.That(outcomes |> List.filter Option.isNone |> List.length, Is.EqualTo 1)
+        Assert.That(window.Pending, Is.Empty)
 
     [<Test>]
     member _.``a pattern printed just before the child exits is matched, never a false NotReady``() : Task =

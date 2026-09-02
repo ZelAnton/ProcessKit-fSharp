@@ -121,11 +121,12 @@ type internal AnsiEscapeFilter() =
 /// so the line pumps' framing is exactly what a pattern waiter must NOT go through.
 ///
 /// Filled by the session's raw pumps (`Pump.readTextUntilDone`, one per piped stream) and drained by
-/// `TryConsume` on the caller's thread, so every operation runs under one `gate` — including a
-/// waiter's whole verdict, which `TryConsume` answers as a single `ExpectStep` rather than as
-/// separately locked questions a producer could slip between. Waiters are woken
-/// through `Changed`, a `TaskCompletionSource` replaced on every publish: capture it BEFORE testing
-/// the window, and an append landing between the capture and the test either shows up in that test or
+/// `TryConsume` on the caller's thread. A waiter snapshots the window under `gate`, runs its potentially
+/// expensive matcher over that immutable text without holding the gate, then conditionally consumes
+/// the match only if no producer or competing waiter changed the window in the meantime. Match and
+/// end-of-output still form one atomic verdict for a current snapshot. Waiters are woken through
+/// `Changed`, a `TaskCompletionSource` replaced on every window change: capture it BEFORE testing the
+/// window, and a change landing between the capture and the test either shows up in that test or
 /// completes the captured task, so a wake-up can never be lost. Continuations run asynchronously, so
 /// no waiter's continuation executes while `gate` is held.
 ///
@@ -143,20 +144,25 @@ type internal ExpectWindow(maxWindowChars: int, maxTranscriptChars: int option) 
     let mutable windowTruncated = false
     let mutable completed = false
     let mutable readFault: exn option = None
+    let mutable version = 0L
 
-    // Completed (and replaced) on every append and once the readers finish. `RunContinuationsAsynchronously`
-    // keeps a woken waiter's continuation off this thread, so it never runs while `gate` is held below.
+    // Completed (and replaced) on every window change. `RunContinuationsAsynchronously` keeps a woken
+    // waiter's continuation off this thread, so it never runs while `gate` is held below.
     let mutable changed =
         TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
 
     // Callers hold `gate`.
     let publish () =
+        version <- version + 1L
         let current = changed
         changed <- TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
         current.TrySetResult() |> ignore
 
-    /// Completes the next time the window changes — an append, or the readers finishing. Capture this
-    /// BEFORE testing the window, then await it, so no change is missed between the two.
+    let snapshot () =
+        lock gate (fun () -> version, window.ToString())
+
+    /// Completes the next time the window changes — an append, a consumption, or the readers finishing.
+    /// Capture this BEFORE testing the window, then await it, so no change is missed between the two.
     member _.Changed: Task = lock gate (fun () -> changed.Task)
 
     /// Append freshly decoded child output, evicting the oldest text past either cap.
@@ -215,33 +221,41 @@ type internal ExpectWindow(maxWindowChars: int, maxTranscriptChars: int option) 
                 readFault <- fault
                 publish ())
 
-    /// The one step a pattern waiter takes: test `matcher` against the whole current window and, on a
-    /// match, CONSUME everything up to and including it (so the next wait starts after this match, and a
-    /// prompt is never matched twice), reporting `Matched(before, text)`. `before` is the output that
-    /// preceded the match, which the sliding window may already have truncated (see `WindowTruncated`).
-    /// With no match, the same step reports whether more output can still come (`Waiting`) or the
-    /// readers have already finished (`Ended`, carrying any genuine read fault).
+    /// Test `matcher` against one immutable snapshot outside the shared gate and, if that version is
+    /// still current, CONSUME everything up to and including its match (so the next wait starts after
+    /// this match, and a prompt is never matched twice), reporting `Matched(before, text)`. `before` is
+    /// the output that preceded the match, which the sliding window may already have truncated (see
+    /// `WindowTruncated`). With no match, the same step reports whether more output can still come
+    /// (`Waiting`) or the readers have already finished (`Ended`, carrying any genuine read fault).
+    /// `None` means a producer or competing waiter changed the window after the snapshot; the caller
+    /// must retry against a fresh view and must not act on the stale match result.
     ///
-    /// Match and end-of-output are decided under ONE `gate` acquisition, and that is load-bearing: the
-    /// last chunk of a conversation and the readers finishing arrive back to back (a child prints its
-    /// final answer, then closes the terminal), so a waiter that asked the two questions separately
-    /// could be preempted between them and report "ended, no match" for a match already sitting in the
-    /// window. A match always wins over the end that came with it — including over a read fault, since
-    /// output the child did produce is still honest output.
-    member _.TryConsume(matcher: string -> (int * int) option) : ExpectStep =
-        lock gate (fun () ->
-            let text = window.ToString()
+    /// The version check and final match/end verdict share ONE `gate` acquisition, and that is
+    /// load-bearing: the last chunk of a conversation and the readers finishing arrive back to back (a
+    /// child prints its final answer, then closes the terminal), so a waiter must retry rather than
+    /// report "ended, no match" from an obsolete view. A current match always wins over the end that
+    /// came with it — including over a read fault, since output the child did produce is still honest
+    /// output.
+    member _.TryConsume(matcher: string -> (int * int) option) : ExpectStep option =
+        let snapshotVersion, snapshotText = snapshot ()
+        let matched = matcher snapshotText
 
-            match matcher text with
-            | Some(start, length) when length > 0 ->
-                window.Remove(0, start + length) |> ignore
-                ExpectStep.Matched(text.Substring(0, start), text.Substring(start, length))
-            | Some(_, _) ->
-                // A zero-length match cannot advance the window, so treating it as successful would let
-                // the same expect pattern succeed repeatedly without consuming any child output.
-                ExpectStep.InvalidPattern
-            | None when completed -> ExpectStep.Ended readFault
-            | None -> ExpectStep.Waiting)
+        lock gate (fun () ->
+            if snapshotVersion <> version then
+                None
+            else
+                match matched with
+                | Some(start, length) when length > 0 ->
+                    window.Remove(0, start + length) |> ignore
+                    publish ()
+
+                    Some(ExpectStep.Matched(snapshotText.Substring(0, start), snapshotText.Substring(start, length)))
+                | Some(_, _) ->
+                    // A zero-length match cannot advance the window, so treating it as successful would
+                    // let the same expect pattern succeed repeatedly without consuming any child output.
+                    Some ExpectStep.InvalidPattern
+                | None when completed -> Some(ExpectStep.Ended readFault)
+                | None -> Some ExpectStep.Waiting)
 
     /// The buffered output no pattern has consumed yet.
     member _.Pending = lock gate (fun () -> window.ToString())
