@@ -857,12 +857,24 @@ type JsonRpcSession
                 )
             | None ->
                 let payload =
-                    this.Encode(fun writer ->
-                        writer.WritePropertyName "id"
-                        // Already-valid JSON: it came verbatim from the peer's own frame, so it is echoed
-                        // without re-validating (a string id keeps its quotes, a numeric one its shape).
-                        writer.WriteRawValue(id, true)
-                        writeBody writer)
+                    let mutable encoded = false
+
+                    try
+                        let result =
+                            this.Encode(fun writer ->
+                                writer.WritePropertyName "id"
+                                // Already-valid JSON: it came verbatim from the peer's own frame, so it is echoed
+                                // without re-validating (a string id keeps its quotes, a numeric one its shape).
+                                writer.WriteRawValue(id, true)
+                                writeBody writer)
+
+                        encoded <- true
+                        result
+                    finally
+                        if not encoded then
+                            // Body encoding is still before the framed transport's first-write boundary, so the
+                            // peer observed nothing and the exact same request remains eligible for a response.
+                            request.ReleaseResponseClaim()
 
                 task {
                     match! this.SendFramedStaged(payload, cancellationToken, noDeadline) with

@@ -882,7 +882,9 @@ boolean, object, or array likewise ends the session with `ProcessError.Parse`; a
 number, or `null` that does not identify a pending request is still discarded as an unknown or late
 response. Its decoded-message backlog may drop old notifications, counted by `DroppedMessages`;
 evicting a peer request ends the session with `ProcessError.OutputTooLarge`, whose totals are zero
-because this backlog does not count total messages or bytes.
+because this backlog does not count total messages or bytes. A peer request accepts one response that
+starts writing; if response-body encoding throws before that point, the same `JsonRpcMessage` can be
+retried, while any attempt after frame writing starts remains rejected.
 
 ### Interactive stdin — write requests, read responses
 

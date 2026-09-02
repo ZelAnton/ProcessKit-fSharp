@@ -5,6 +5,7 @@ open System.Diagnostics
 open System.IO
 open System.Text
 open System.Text.Json
+open System.Text.Json.Serialization
 open System.Text.Json.Serialization.Metadata
 open System.Threading
 open System.Threading.Channels
@@ -18,6 +19,13 @@ open ProcessKit.Testing
 type RpcHoverParams = { File: string; Line: int }
 
 type RpcHoverResult = { Contents: string }
+
+type private ThrowingHoverResultConverter(failure: InvalidOperationException) =
+    inherit JsonConverter<RpcHoverResult>()
+
+    override _.Read(_reader, _typeToConvert, _options) : RpcHoverResult = raise (NotSupportedException())
+
+    override _.Write(_writer, _value, _options) = raise failure
 
 /// The child's stdout, driven by the test's fake peer: each `Emit` is bytes the peer wrote, and
 /// `Complete` is the peer closing its output (EOF).
@@ -1406,6 +1414,45 @@ type JsonRpcSessionTests() =
                 sent.RootElement.GetProperty("result").GetProperty("Contents").GetString(),
                 Is.EqualTo "settings"
             )
+
+            do! messages.DisposeAsync()
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a response body encoding failure can be retried as an error response``() : Task =
+        task {
+            let peer = peerHandle ()
+            use running = peer.Running
+            let session = JsonRpcSession(running)
+            let messages = session.MessagesAsync().GetAsyncEnumerator()
+
+            peer.Stdout.Emit(framed "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"workspace/configuration\"}")
+
+            let! received = messages.MoveNextAsync()
+            Assert.That(received, Is.True)
+            let request = messages.Current
+            let failure = InvalidOperationException "response encoding failed"
+            let options = JsonSerializerOptions()
+            options.Converters.Add(ThrowingHoverResultConverter failure)
+
+            match
+                Assert.Throws<InvalidOperationException>(
+                    Action(fun () -> session.RespondAsync(request, { Contents = "unencodable" }, options) |> ignore)
+                )
+            with
+            | null -> Assert.Fail "expected response encoding to throw"
+            | thrown -> Assert.That(thrown, Is.SameAs failure)
+
+            match! session.RespondErrorAsync(request, -32603, "Response encoding failed") with
+            | Ok() -> ()
+            | Error error -> Assert.Fail $"expected the error response retry to be sent, got {error}"
+
+            use! sent = nextFrame peer.Stdin
+            Assert.That(rawId sent, Is.EqualTo "19")
+            let error = sent.RootElement.GetProperty("error")
+            Assert.That(error.GetProperty("code").GetInt32(), Is.EqualTo -32603)
+            Assert.That(error.GetProperty("message").GetString(), Is.EqualTo "Response encoding failed")
 
             do! messages.DisposeAsync()
         }
