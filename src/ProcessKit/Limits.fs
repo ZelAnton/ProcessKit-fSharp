@@ -385,12 +385,14 @@ type ResourceLimits
     /// **Needs a limit-capable mechanism**, like every other cap here: the Windows Job Object's affinity
     /// mask (`JOB_OBJECT_LIMIT_AFFINITY`) or the Linux cgroup v2 `cpuset` controller (`cpuset.cpus`). On
     /// macOS and the Linux process-group fallback there is no whole-tree primitive to pin with, so the
-    /// group fails with `ProcessError.ResourceLimit` rather than running everywhere unpinned. Two
-    /// platform limits are reported the same honest way at apply time rather than guessed at here (the
-    /// machine that builds the limit set need not be the one it runs on): the Windows mask is a single
-    /// pointer-sized word covering one processor group, so an index at or beyond its width (64 on x64)
-    /// has no representation; and every requested core must actually exist on the host and be available
-    /// to this process.
+    /// group fails with `ProcessError.ResourceLimit` rather than running everywhere unpinned. On Linux,
+    /// `ProcessGroup.Create` reports `ProcessError.Unsupported` before creating a group when the selected
+    /// cgroup v2 hierarchy does not advertise `cpuset`; a live update's later controller-enablement or
+    /// limit-file failure remains `ProcessError.ResourceLimit`. Two platform limits are reported the same
+    /// honest way at apply time rather than guessed at here (the machine that builds the limit set need
+    /// not be the one it runs on): the Windows mask is a single pointer-sized word covering one processor
+    /// group, so an index at or beyond its width (64 on x64) has no representation; and every requested
+    /// core must actually exist on the host and be available to this process.
     member _.WithCpuAffinity(cores: seq<int>) =
         ArgumentNullException.ThrowIfNull(cores, nameof cores)
         let requested = List.ofSeq cores
@@ -790,7 +792,9 @@ type ProcessGroupOptions internal (shutdownTimeout: TimeSpan, stopSignal: Signal
     /// A copy pinning the tree to `cores` — the CPU cores its processes may be scheduled on (the Windows
     /// Job Object affinity mask, the Linux cgroup v2 `cpuset.cpus`). Needs a limit-capable mechanism:
     /// elsewhere `ProcessGroup.Create` fails with `ProcessError.ResourceLimit` rather than silently
-    /// running the tree on every core. See `ResourceLimits.WithCpuAffinity`.
+    /// running the tree on every core. A Linux cgroup v2 hierarchy that exists but does not advertise
+    /// `cpuset` is the distinct early-prerequisite case and returns `ProcessError.Unsupported`. See
+    /// `ResourceLimits.WithCpuAffinity`.
     member _.WithCpuAffinity(cores: seq<int>) =
         ProcessGroupOptions(shutdownTimeout, stopSignal, limits.WithCpuAffinity cores)
 

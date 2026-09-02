@@ -1024,15 +1024,17 @@ accounting, so it refuses a whole-tree cap exactly as the process group does.
 | [Disk I/O rate](#disk-io-rate-limits) | ✅ per-volume aggregate | ✅ per-device (`io.max`) | ❌ `Unsupported` |
 | [UI restrictions](#windows-ui-restrictions) | ✅ clipboard/desktop/exit-Windows | ❌ `Unsupported` | ❌ `Unsupported` |
 
-Where a requested cap can't be enforced, `Create` **fails fast** with
+Where a requested cap has no limit-capable container, `Create` **fails fast** with
 `ProcessError.ResourceLimit` rather than handing back a silently-unbounded group —
 so a limit is a guarantee, not a hint. That covers macOS / BSD and the Linux
 process-group fallback (no whole-tree primitive at all), and a Linux host where
-cgroup v2 isn't mounted. On Linux, enforcing limits also requires the process to
-run at the **real cgroup v2 root** (cgroup v2's "no internal processes" rule lets
-the controllers be enabled only there) — so an ordinary container or a
-systemd-managed process fails too. The prerequisites are spelled out in
-[platform-support.md](platform-support.md).
+cgroup v2 isn't mounted. A missing capability-specific prerequisite can instead be
+`ProcessError.Unsupported`: on Linux that includes the `io` controller for `IoMax`
+and the `cpuset` controller for CPU affinity. On Linux, applying limits also
+requires the process to run at the **real cgroup v2 root** (cgroup v2's "no
+internal processes" rule lets the controllers be enabled only there) — so an
+ordinary container or a systemd-managed process fails too. The prerequisites are
+spelled out in [platform-support.md](platform-support.md).
 
 ### Per-process limits on a command
 
@@ -1183,16 +1185,21 @@ On Linux, `cpuset` is a **separate cgroup v2 controller**, so the pin needs it
 enabled in the parent's `cgroup.subtree_control` — which ProcessKit does for you, on
 the same terms as `memory`/`pids`/`cpu` (see [Resource limits](#resource-limits)
 for the real-cgroup-root prerequisite). A hierarchy whose `cgroup.controllers` does
-not carry `cpuset` at all cannot host a pin, and says so with
-`ProcessError.ResourceLimit`. macOS, BSD, and the Linux process-group fallback have
-no whole-tree affinity primitive at all, so a pin fails fast there for the same
-reason every other cap does.
+not carry `cpuset` at all cannot host a pin. `ProcessGroup.Create` detects that
+missing prerequisite during mechanism selection and returns
+`ProcessError.Unsupported` before creating the group; `ProcessGroup.Capabilities`
+reports the same missing `cpuset.cpus` prerequisite and no selected mechanism.
+macOS, BSD, and the Linux process-group fallback have no whole-tree affinity
+primitive at all, so a pin fails fast there with `ProcessError.ResourceLimit`.
 
 The pin is live-updatable through [`UpdateLimits`](#updating-limits-on-a-live-group)
 with the same replace semantics as every other dimension: passing a limit set
 *without* a pin lifts it (the tree may use every core again) rather than leaving the
 previous mask in force, and `group.Options.Limits.CpuAffinity` follows only what
-actually got applied.
+actually got applied. An update runs against the already-selected cgroup backend;
+if enabling `cpuset` or applying `cpuset.cpus` then fails, it returns
+`ProcessError.ResourceLimit` and restores any earlier limit-file writes from that
+update.
 
 ### Windows UI restrictions
 

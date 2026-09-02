@@ -480,14 +480,16 @@ unavailable controller file yields `None` rather than a fabricated zero or a sam
 | `WithMaxProcesses` | ✅ | ✅ | ❌ `ProcessError.ResourceLimit` |
 | `WithCpuQuota` | 🟡 approximate | ✅ | ❌ `ProcessError.ResourceLimit` |
 | `WithCpuTimeMax` | ✅ Job aggregate | ✅ per child `RLIMIT_CPU` | ✅ per child `RLIMIT_CPU` |
-| `WithCpuAffinity` (pin the tree to cores) | 🟡 `JOB_OBJECT_LIMIT_AFFINITY`, cores 0–63 only | ✅ `cpuset.cpus` (needs the `cpuset` controller) | ❌ `ProcessError.ResourceLimit` |
+| `WithCpuAffinity` (pin the tree to cores) | 🟡 `JOB_OBJECT_LIMIT_AFFINITY`, cores 0–63 only | ✅ `cpuset.cpus` (`Create`: missing `cpuset` → `ProcessError.Unsupported`) | ❌ `ProcessError.ResourceLimit` |
 | `WithUiRestrictions` (clipboard/desktop/exit-Windows) | ✅ `JOBOBJECT_BASIC_UI_RESTRICTIONS` | ❌ `ProcessError.Unsupported` | ❌ `ProcessError.Unsupported` |
 
 `WithCpuQuota` is a fraction of a single core (`0.5` = half a core, `2.0` = two cores). On Windows
 it is converted against the host's CPU count and is approximate. Whole-tree limits need a real
 limit-capable container; the POSIX process-group mechanism supports only the per-child CPU-time
-rlimit. Any unsupported request fails at creation with `ProcessError.ResourceLimit` rather than
-returning a silently-unbounded group.
+rlimit. A missing limit-capable container fails at creation with `ProcessError.ResourceLimit`
+rather than returning a silently-unbounded group. Capability-specific prerequisites can use
+`ProcessError.Unsupported`, including a missing Linux cgroup v2 `cpuset` controller for CPU
+affinity.
 
 **Per-process resource limits (`Command.Rlimit`)**
 
@@ -510,17 +512,20 @@ the group's `WithCpuTimeMax`, the stricter of the two values is what the child g
 (see [Resource limits](process-groups.md#per-process-limits-on-a-command)).
 
 `WithCpuAffinity` pins the tree to a set of zero-based core indices and carries two platform ceilings,
-both reported as a typed `ProcessError.ResourceLimit` at creation/update rather than as a silently
-dropped pin. **Windows:** `JOBOBJECT_BASIC_LIMIT_INFORMATION.Affinity` is one pointer-sized mask
+reported as a typed error rather than as a silently dropped pin. **Windows:**
+`JOBOBJECT_BASIC_LIMIT_INFORMATION.Affinity` is one pointer-sized mask
 covering a single [processor group](https://learn.microsoft.com/en-us/windows/win32/procthread/processor-groups),
 so only cores `0`–`63` are nameable on x64 (`0`–`31` on x86); a host with more logical processors
 splits them across groups the mask cannot reach. **Linux:** `cpuset` is a controller a hierarchy may
 simply not carry, and unlike `memory`/`pids`/`cpu` its absence is not implied by cgroup v2 being
-mounted — where `cgroup.controllers` omits it, no pin can be enforced. On both, every requested core
-must exist on the host and be available to the caller: a Job's affinity mask must be a subset of the
-creating process's own, and a cgroup's `cpuset.cpus` a subset of the parent's effective cores. macOS
-and BSD have no whole-tree affinity primitive at all (nor even a per-process one comparable to
-`sched_setaffinity`), so the refusal there is unconditional.
+mounted — where `cgroup.controllers` omits it, `ProcessGroup.Create` returns
+`ProcessError.Unsupported` before creating a group, matching the capability probe's missing
+`cpuset.cpus` prerequisite. On both platforms, every requested core must exist on the host and be
+available to the caller: a Job's affinity mask must be a subset of the creating process's own, and a
+cgroup's `cpuset.cpus` a subset of the parent's effective cores; those apply-time failures remain
+`ProcessError.ResourceLimit`. macOS and BSD have no whole-tree affinity primitive at all (nor even a
+per-process one comparable to `sched_setaffinity`), so creation is refused with
+`ProcessError.ResourceLimit`.
 
 `WithUiRestrictions` is the one dimension that is **Windows-only rather than
 limit-capable-container-only**: it restricts what the contained tree may do to the interactive desktop
@@ -535,8 +540,9 @@ an optional runtime operation that re-applies a full replacement cap set without
 group or restarting its children. It follows the same platform matrix as creation: the Windows Job
 Object re-applies via `SetInformationJobObject` (the caps, the affinity mask, **and** the UI
 restrictions), the Linux cgroup v2 mechanism rewrites `memory.max` / `pids.max` / `cpu.max` /
-`cpuset.cpus` (and refuses a set carrying UI
-restrictions with `ProcessError.Unsupported`, leaving the previous caps untouched), and the POSIX
+`cpuset.cpus` (a controller-enablement or limit-file failure, including for `cpuset`, returns
+`ProcessError.ResourceLimit` and rolls back earlier writes; a set carrying UI restrictions is refused
+with `ProcessError.Unsupported` before applying it), and the POSIX
 process-group mechanism (macOS/BSD, or Linux without cgroup v2) returns
 `ProcessError.ResourceLimit` — never a silent no-op. See
 [process-groups.md](process-groups.md) for the API and semantics.
