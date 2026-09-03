@@ -1411,22 +1411,24 @@ type TimeoutTests() =
     [<Test>]
     member _.``a child that finished inside its deadline is not timed out for a sliver of budget (T-356)``() : Task =
         task {
-            // The same honest result, but with the budget only ALMOST spent: 1.9s of a 2s deadline gone
-            // when the collecting verb arrives, so the exit wait is armed for the ~0.1s remainder — less
+            // The same honest result, but with the budget only ALMOST spent: 1.99s of a 2s deadline gone
+            // when the collecting verb arrives, so the exit wait is armed for the ~10 ms remainder — less
             // than the settle window, and so no more able to surface an exit the child had already made
             // than no budget at all would be. The status arrives on a kernel callback and a thread-pool
-            // hop, modelled here by publishing it 160 ms after the wait starts: comfortably after the
+            // hop, modelled here by publishing it 50 ms after the wait starts: comfortably after the
             // remainder runs out (without the settle window the `Task.Delay` wins, a tree that is already
             // gone is killed, and a run that exceeded nothing is reported as `TimedOut`) and comfortably
-            // inside the settle window that must now cover it. A remainder of single-digit milliseconds
-            // — the shape a caller would actually hit — is the same case, and is left to the clock-free
-            // arithmetic tests above, where scheduling jitter cannot blunt it.
+            // inside the settle window that must now cover it. Keep the remainder in the single digits
+            // after setup overhead and publish after 50 ms: that preserves the ordering under test while
+            // leaving 200 ms of scheduler headroom inside the settle window on loaded CI runners. The
+            // exact boundary arithmetic is left to the clock-free tests above, where scheduling jitter
+            // cannot blunt it.
             let running, calls =
                 backdatedProcessPublishing
                     twoSecondTimeout
-                    (TimeSpan.FromMilliseconds 1_900.0)
+                    (TimeSpan.FromMilliseconds 1_990.0)
                     true
-                    (TimeSpan.FromMilliseconds 160.0)
+                    (TimeSpan.FromMilliseconds 50.0)
                     (Outcome.Exited 0)
 
             use _ = running
