@@ -291,7 +291,7 @@ task {
         use group = group
         let! _job = group.StartAsync(Command.create "untrusted-tool")
         () // ... work ...
-    | Error err -> eprintfn $"limits unavailable: {err.Message}" // ProcessError.ResourceLimit
+    | Error err -> eprintfn $"limits unavailable: {err.Message}"
 }
 ```
 
@@ -307,7 +307,7 @@ var options = new ProcessGroupOptions()
 var created = ProcessGroup.Create(options);
 if (created is { IsOk: false, ErrorValue: var limitErr })
 {
-    Console.Error.WriteLine($"limits unavailable: {limitErr.Message}"); // ProcessError.ResourceLimit
+    Console.Error.WriteLine($"limits unavailable: {limitErr.Message}");
     return;
 }
 
@@ -317,10 +317,13 @@ await group.StartAsync(new Command("untrusted-tool"));
 ```
 
 `WithCpuQuota` is a fraction of a **single** core (`0.5` = half a core, `2.0` = two cores); on
-Windows it is converted against the host's CPU count and is approximate. Limits need a real
-container — a **Windows Job Object** or a **Linux cgroup v2** — so there is no whole-tree limit on
-macOS/BSD or the Linux process-group fallback. When a requested limit can't be enforced,
-`Create` returns `ProcessError.ResourceLimit` instead of a silently-unbounded group.
+Windows it is converted against the host's CPU count and is approximate. Memory, process-count,
+CPU-quota, and CPU-affinity limits need a real container — a **Windows Job Object** or a **Linux
+cgroup v2**. Without one, `Create` returns `ProcessError.ResourceLimit` instead of a
+silently-unbounded group. On Linux cgroup v2, CPU affinity additionally requires the selected
+hierarchy to advertise the `cpuset` controller (`cpuset.cpus`); if it does not, `Create` returns
+`ProcessError.Unsupported` before creating a group. Later failures enabling or writing `cpuset`
+during cgroup creation or `UpdateLimits` remain `ProcessError.ResourceLimit`.
 `WithCpuTimeMax` is the exception to that container rule: Windows applies it to the Job as a whole,
 while POSIX applies `RLIMIT_CPU` to each spawned run before `exec`, so it also works on macOS/BSD and
 the Linux process-group fallback. Its live value cannot be changed for already-running POSIX children.
