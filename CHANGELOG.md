@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Detached POSIX launches now use the shared pidfd/epoll, kqueue, or SIGCHLD exit reaper instead of probing every live detached leader every 10 ms; a native registration failure falls back to one blocking wait without polling.
 - `AddProcessKitClient` now rejects empty and whitespace-only programs during registration with `ArgumentException` naming `program`, instead of deferring the configuration error until the keyed client is first resolved.
 - `ProcessKitOptions.DefaultWorkingDirectory` now rejects embedded NUL characters during assignment with `ArgumentException` naming `DefaultWorkingDirectory`, instead of throwing later when a DI-resolved runner applies the default.
 - Linux `ProcessGroup.Create` now rejects `CpuAffinity` before creating a group with `ProcessError.Unsupported` when the cgroup v2 hierarchy lacks the `cpuset` controller; `ProcessGroup.Capabilities(options)` reports the same missing `cpuset.cpus` prerequisite and no selected mechanism.

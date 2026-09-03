@@ -11,8 +11,10 @@ open ProcessKit
 /// POSIX-only: the event-driven replacement for `Native.Posix.waitPosix`'s old `Task.Run` + blocking
 /// `waitpid` (a shared SIGCHLD registration + pid -> `TaskCompletionSource` registry — see
 /// `Native.Posix.fs`). Verifies the observable contract holds under this native change: no fd leak under
-/// load, and the thread-pool no longer parking one thread per live POSIX child.
+/// load, and the thread-pool no longer parking one thread per live POSIX child. The fixture is explicitly
+/// non-parallel because its narrow fault-injection seams belong to the process-wide reaper.
 [<TestFixture>]
+[<NonParallelizable>]
 type PosixEventDrivenWaitTests() =
 
     let isWindows = RuntimeInformation.IsOSPlatform OSPlatform.Windows
@@ -30,6 +32,27 @@ type PosixEventDrivenWaitTests() =
             Assert.That(obj.ReferenceEquals(winner, work), Is.True, "timed out waiting for the task to complete")
             return! work
         }
+
+    let waitUntil (deadlineMs: int) (condition: unit -> bool) =
+        let deadline = DateTime.UtcNow.AddMilliseconds(float deadlineMs)
+        let mutable satisfied = condition ()
+
+        while not satisfied && DateTime.UtcNow < deadline do
+            Thread.Sleep 1
+            satisfied <- condition ()
+
+        satisfied
+
+    let processIsZombie (pid: int) =
+        try
+            let stat = File.ReadAllText $"/proc/{pid}/stat"
+            let closeParen = stat.LastIndexOf ')'
+
+            closeParen >= 0
+            && stat.Substring(closeParen + 1).Split([| ' ' |], StringSplitOptions.RemoveEmptyEntries)[0] = "Z"
+        with
+        | :? IOException
+        | :? UnauthorizedAccessException -> false
 
     // Spawn a short-lived child directly through `Native.Posix.spawnPosix` (bypassing the containment/verb
     // layer entirely) and call `Native.Posix.waitPosix` on its pid TWICE — the exact double-registration
@@ -78,6 +101,837 @@ type PosixEventDrivenWaitTests() =
             match firstOutcome with
             | Outcome.Exited 0 -> ()
             | other -> Assert.Fail $"expected a clean exit, got {other}"
+
+    [<Test>]
+    member _.``a shared reaper descriptor is not published until its worker starts successfully``() =
+        let initializationLock = obj ()
+        let mutable descriptor = -1
+        let mutable createCount = 0
+        let mutable closeCount = 0
+        let mutable firstStarterThreadId = -1
+        let mutable contenderReadIntercepted = 0
+        use firstStartEntered = new ManualResetEventSlim(false)
+        use releaseFirstStart = new ManualResetEventSlim(false)
+        use contenderReadEntered = new ManualResetEventSlim(false)
+        use releaseContenderRead = new ManualResetEventSlim(false)
+        use contenderReadReturned = new ManualResetEventSlim(false)
+
+        let readDescriptor () =
+            let starterThread = Volatile.Read(&firstStarterThreadId)
+
+            if
+                firstStartEntered.IsSet
+                && Thread.CurrentThread.ManagedThreadId <> starterThread
+                && Interlocked.CompareExchange(&contenderReadIntercepted, 1, 0) = 0
+            then
+                contenderReadEntered.Set()
+                releaseContenderRead.Wait()
+                let value = Volatile.Read(&descriptor)
+                contenderReadReturned.Set()
+                value
+            else
+                Volatile.Read(&descriptor)
+
+        let publishDescriptor value = Volatile.Write(&descriptor, value)
+
+        let createDescriptor () =
+            100 + Interlocked.Increment(&createCount)
+
+        let closeDescriptor _ =
+            Interlocked.Increment(&closeCount) |> ignore
+
+        let startWorker value =
+            if value = 101 then
+                Volatile.Write(&firstStarterThreadId, Thread.CurrentThread.ManagedThreadId)
+                firstStartEntered.Set()
+                releaseFirstStart.Wait()
+                invalidOp "injected worker start failure"
+
+        let ensureDescriptor () =
+            Native.Posix.ensureReaperDescriptorForTests
+                readDescriptor
+                publishDescriptor
+                initializationLock
+                createDescriptor
+                closeDescriptor
+                startWorker
+
+        let first =
+            Task.Run(fun () ->
+                try
+                    ensureDescriptor ()
+                with :? InvalidOperationException ->
+                    -1)
+
+        let mutable contender: Task<int> option = None
+
+        try
+            Assert.That(firstStartEntered.Wait 5000, Is.True, "the failing worker start did not reach its gate")
+
+            let concurrent = Task.Run(fun () -> ensureDescriptor ())
+            contender <- Some concurrent
+
+            Assert.That(
+                contenderReadEntered.Wait 5000,
+                Is.True,
+                "the concurrent initialization did not reach the descriptor read"
+            )
+
+            Assert.That(
+                Volatile.Read(&descriptor),
+                Is.EqualTo(-1),
+                "a descriptor whose worker had not started was visible to a concurrent handoff"
+            )
+
+            releaseContenderRead.Set()
+
+            Assert.That(contenderReadReturned.Wait 5000, Is.True, "the concurrent descriptor read did not return")
+
+            Assert.That(
+                concurrent.IsCompleted,
+                Is.False,
+                "the concurrent initialization bypassed the in-progress failing startup"
+            )
+
+            releaseFirstStart.Set()
+            let firstResult = first.GetAwaiter().GetResult()
+            let concurrentResult = concurrent.GetAwaiter().GetResult()
+
+            Assert.That(firstResult, Is.EqualTo(-1), "the injected startup failure was not observed")
+            Assert.That(concurrentResult, Is.EqualTo(102), "the concurrent caller did not recover with a new worker")
+            Assert.That(Volatile.Read(&descriptor), Is.EqualTo 102)
+            Assert.That(createCount, Is.EqualTo 2)
+            Assert.That(closeCount, Is.EqualTo 1, "the unpublished failed descriptor was not closed exactly once")
+        finally
+            releaseContenderRead.Set()
+            releaseFirstStart.Set()
+
+            match contender with
+            | Some concurrent when not concurrent.IsCompleted -> concurrent.Wait 5000 |> ignore
+            | _ -> ()
+
+    [<Test>]
+    member _.``a readable Linux pidfd transfers once when its replacement thread cannot start``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: exercises consumed pidfd readiness on the shared epoll worker"
+
+            if not Native.Posix.pidfdActive then
+                Assert.Ignore "Linux pidfd support is unavailable on this host"
+
+            match Native.Posix.spawnPosix (shell "read _; exit 37" |> Command.keepStdinOpen) with
+            | Error error -> Assert.Fail $"spawn failed: {error.Message}"
+            | Ok spawned ->
+                let pid = int spawned.Handle
+                let mutable pidfdCalls = 0
+                let mutable nonBlockingCalls = 0
+                let mutable blockingCalls = 0
+                let mutable failedStarts = 0
+                let mutable completed = false
+                use pidfdProbe = new ManualResetEventSlim(false)
+                use blockingProbe = new ManualResetEventSlim(false)
+                use parked = new ManualResetEventSlim(false)
+
+                try
+                    Native.Posix.blockingReapParkedForTests <-
+                        Some(fun candidatePid ->
+                            if candidatePid = pid then
+                                parked.Set())
+
+                    Native.Posix.blockingReapThreadStartFailureForTests <-
+                        Some(fun candidatePid ->
+                            if candidatePid = pid && pidfdProbe.IsSet then
+                                Interlocked.Increment(&failedStarts) |> ignore
+                                true
+                            else
+                                false)
+
+                    Native.Posix.exitWaitFaultForTests <-
+                        Some(fun operation candidatePid ->
+                            if candidatePid <> pid then
+                                None
+                            else
+                                match operation with
+                                | Native.Posix.ExitWaitOperationForTests.PidfdWaitId ->
+                                    Interlocked.Increment(&pidfdCalls) |> ignore
+                                    pidfdProbe.Set()
+                                    Some Native.Posix.transientExitWaitErrnoForTests
+                                | Native.Posix.ExitWaitOperationForTests.NonBlockingWaitPid ->
+                                    Interlocked.Increment(&nonBlockingCalls) |> ignore
+                                    pidfdProbe.Wait 5000 |> ignore
+                                    blockingProbe.Wait 5000 |> ignore
+                                    Some Native.Posix.transientExitWaitErrnoForTests
+                                | Native.Posix.ExitWaitOperationForTests.BlockingWaitPid ->
+                                    blockingProbe.Set()
+
+                                    if Interlocked.Increment(&blockingCalls) <= 3 then
+                                        Some Native.Posix.transientExitWaitErrnoForTests
+                                    else
+                                        None
+                                | Native.Posix.ExitWaitOperationForTests.KqueueWaitPid -> None)
+
+                    let outcomeTask = Native.Posix.waitPosix spawned.Handle
+                    Assert.That(outcomeTask.IsCompleted, Is.False, "the live child completed during pidfd handoff")
+
+                    match spawned.Stdin with
+                    | Some input ->
+                        input.WriteByte(byte '\n')
+                        input.Flush()
+                    | None -> Assert.Fail "spawn did not retain the stdin pipe needed to release the child"
+
+                    Assert.That(pidfdProbe.Wait 5000, Is.True, "the readable pidfd did not reach its reap probe")
+                    let! outcome = withDeadline 5000 outcomeTask
+                    completed <- true
+
+                    Assert.That(outcome, Is.EqualTo(Outcome.Exited 37))
+                    Assert.That(pidfdCalls, Is.EqualTo 1, "the level-ready pidfd was dispatched more than once")
+                    Assert.That(failedStarts, Is.EqualTo 1, "the pidfd path retried replacement thread startup")
+
+                    Assert.That(
+                        blockingCalls,
+                        Is.EqualTo 4,
+                        "the retained epoll worker did not survive three temporary blocking failures"
+                    )
+
+                    Assert.That(nonBlockingCalls, Is.LessThanOrEqualTo 1)
+                    Assert.That(parked.IsSet, Is.False, "the pidfd owner waited for a synthetic signal generation")
+                    Native.Posix.exitWaitFaultForTests <- None
+
+                    Assert.That(
+                        Native.Posix.reapLeader pid,
+                        Is.EqualTo LeaderReap.Gone,
+                        "the pidfd-owned child retained a second reapable status"
+                    )
+                finally
+                    Native.Posix.blockingReapParkedForTests <- None
+                    Native.Posix.blockingReapThreadStartFailureForTests <- None
+                    Native.Posix.exitWaitFaultForTests <- None
+                    spawned.Stdout |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stderr |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stdin |> Option.iter (fun stream -> stream.Dispose())
+
+                    if not completed then
+                        Native.Posix.killProcess pid
+                        Native.Posix.reapLeader pid |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``one SIGCHLD permits a bounded post-event EAGAIN retry and retains one owner``() : Task =
+        task {
+            if isWindows then
+                Assert.Ignore "POSIX-only: exercises the shared SIGCHLD fallback"
+
+            match Native.Posix.spawnPosix (shell "read _; exit 23" |> Command.keepStdinOpen) with
+            | Error error -> Assert.Fail $"spawn failed: {error.Message}"
+            | Ok spawned ->
+                let pid = int spawned.Handle
+                let mutable nonBlockingCalls = 0
+                let mutable blockingCalls = 0
+                let mutable holdEagain = 1
+                let mutable childReleased = 0
+                let mutable completed = false
+                use parked = new ManualResetEventSlim(false)
+                use exitSignalScanned = new ManualResetEventSlim(false)
+                use postEventEagain = new ManualResetEventSlim(false)
+
+                try
+                    Native.Posix.blockingReapParkedForTests <-
+                        Some(fun candidatePid ->
+                            if candidatePid = pid then
+                                parked.Set())
+
+                    Native.Posix.exitWaitFaultForTests <-
+                        Some(fun operation candidatePid ->
+                            if candidatePid <> pid then
+                                None
+                            else
+                                match operation with
+                                | Native.Posix.ExitWaitOperationForTests.PidfdWaitId -> None
+                                | Native.Posix.ExitWaitOperationForTests.BlockingWaitPid ->
+                                    let call = Interlocked.Increment(&blockingCalls)
+
+                                    if call <= 2 then
+                                        Some Native.Posix.transientExitWaitErrnoForTests
+                                    elif call = 3 then
+                                        // The SIGCHLD callback pulses the blocking owner before scanning
+                                        // pending pids. Wait for that same callback's targeted probe so
+                                        // this is deterministically the first retry after the real child
+                                        // exit, then clear EAGAIN without generating a second event.
+                                        exitSignalScanned.Wait 5000 |> ignore
+                                        postEventEagain.Set()
+                                        Volatile.Write(&holdEagain, 0)
+                                        Some Native.Posix.transientExitWaitErrnoForTests
+                                    elif Volatile.Read(&holdEagain) <> 0 then
+                                        Some Native.Posix.transientExitWaitErrnoForTests
+                                    else
+                                        None
+                                | Native.Posix.ExitWaitOperationForTests.NonBlockingWaitPid ->
+                                    Interlocked.Increment(&nonBlockingCalls) |> ignore
+
+                                    if Volatile.Read(&childReleased) <> 0 then
+                                        exitSignalScanned.Set()
+
+                                    // Keep the portable scan from consuming the status: this test is
+                                    // specifically proving the dedicated owner's bounded follow-up.
+                                    Some Native.Posix.transientExitWaitErrnoForTests
+                                | Native.Posix.ExitWaitOperationForTests.KqueueWaitPid -> None)
+
+                    let first = Native.Posix.waitPosixViaSigchldForTests spawned.Handle
+                    let second = Native.Posix.waitPosixViaSigchldForTests spawned.Handle
+
+                    Assert.That(parked.Wait 5000, Is.True, "the repeated EAGAIN path did not reach its event gate")
+
+                    Assert.That(
+                        blockingCalls,
+                        Is.EqualTo 2,
+                        "the blocking owner made another native probe while EAGAIN remained active"
+                    )
+
+                    Assert.That(first.IsCompleted, Is.False, "the unreaped child wait completed before retry release")
+                    Assert.That(second.IsCompleted, Is.False, "the shared waiter completed before retry release")
+
+                    Volatile.Write(&childReleased, 1)
+
+                    match spawned.Stdin with
+                    | Some input ->
+                        input.WriteByte(byte '\n')
+                        input.Flush()
+                    | None -> Assert.Fail "spawn did not retain the stdin pipe needed to release the child"
+
+                    Assert.That(
+                        exitSignalScanned.Wait 5000,
+                        Is.True,
+                        "the child's real SIGCHLD did not trigger the targeted portable scan"
+                    )
+
+                    Assert.That(
+                        postEventEagain.Wait 5000,
+                        Is.True,
+                        "the first blocking retry after the real SIGCHLD did not retain EAGAIN"
+                    )
+
+                    let! firstOutcome = withDeadline 5000 first
+                    let! secondOutcome = withDeadline 5000 second
+                    completed <- true
+
+                    Assert.That(firstOutcome, Is.EqualTo(Outcome.Exited 23))
+                    Assert.That(secondOutcome, Is.EqualTo firstOutcome, "duplicate waiters did not share the one reap")
+
+                    Assert.That(
+                        blockingCalls,
+                        Is.EqualTo 4,
+                        "the owner did not make exactly one bounded follow-up after the post-event EAGAIN"
+                    )
+
+                    Assert.That(nonBlockingCalls, Is.GreaterThanOrEqualTo 2)
+
+                    Native.Posix.exitWaitFaultForTests <- None
+
+                    Assert.That(
+                        Native.Posix.reapLeader pid,
+                        Is.EqualTo LeaderReap.Gone,
+                        "the child still had a second reapable status after both waiters completed"
+                    )
+                finally
+                    Volatile.Write(&holdEagain, 0)
+                    Native.Posix.notifyExitSignalForTests ()
+                    Native.Posix.blockingReapParkedForTests <- None
+                    Native.Posix.exitWaitFaultForTests <- None
+                    spawned.Stdout |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stderr |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stdin |> Option.iter (fun stream -> stream.Dispose())
+
+                    if not completed then
+                        Native.Posix.killProcess pid
+                        Native.Posix.reapLeader pid |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a pre-handoff SIGCHLD gives an already-exited detached child a bounded recovery probe``() =
+        if not isLinux then
+            Assert.Ignore "Linux-only: /proc makes the consumed pre-handoff SIGCHLD deterministic"
+
+        let mutable pid = 0
+        let mutable nonBlockingCalls = 0
+        let mutable blockingCalls = 0
+        let mutable signalConsumedBeforeHandoff = false
+        let mutable completed = false
+        use parked = new ManualResetEventSlim(false)
+
+        try
+            Native.Posix.detachedReaperUseFastPathForTests <- Some false
+
+            Native.Posix.blockingReapParkedForTests <-
+                Some(fun candidatePid ->
+                    if candidatePid = pid then
+                        parked.Set())
+
+            Native.Posix.exitWaitFaultForTests <-
+                Some(fun operation candidatePid ->
+                    if candidatePid <> pid then
+                        None
+                    else
+                        match operation with
+                        | Native.Posix.ExitWaitOperationForTests.NonBlockingWaitPid ->
+                            Interlocked.Increment(&nonBlockingCalls) |> ignore
+                            Some Native.Posix.transientExitWaitErrnoForTests
+                        | Native.Posix.ExitWaitOperationForTests.BlockingWaitPid ->
+                            if Interlocked.Increment(&blockingCalls) <= 3 then
+                                Some Native.Posix.transientExitWaitErrnoForTests
+                            else
+                                None
+                        | Native.Posix.ExitWaitOperationForTests.KqueueWaitPid
+                        | Native.Posix.ExitWaitOperationForTests.PidfdWaitId -> None)
+
+            Native.Posix.detachedReaperHandoffForTests <-
+                Some(fun candidatePid ->
+                    pid <- candidatePid
+                    let generationBeforeExit = Native.Posix.exitSignalGenerationForTests ()
+                    Native.Posix.killProcess candidatePid
+
+                    let becameZombie = waitUntil 5000 (fun () -> processIsZombie candidatePid)
+
+                    signalConsumedBeforeHandoff <-
+                        becameZombie
+                        && waitUntil 5000 (fun () ->
+                            Native.Posix.exitSignalGenerationForTests () > generationBeforeExit)
+
+                    Ok())
+
+            match Native.Posix.spawnDetachedPosix (shell "sleep 60") with
+            | Error error -> Assert.Fail $"detached spawn failed: {error.Message}"
+            | Ok spawned ->
+                pid <- spawned.Pid
+
+                Assert.That(
+                    signalConsumedBeforeHandoff,
+                    Is.True,
+                    "the child's real SIGCHLD was not consumed before its pid entered the wait registry"
+                )
+
+                Assert.That(
+                    waitUntil 5000 (fun () -> not (File.Exists $"/proc/{pid}/stat")),
+                    Is.True,
+                    "the already-exited detached child was not eventually reaped"
+                )
+
+                Assert.That(nonBlockingCalls, Is.EqualTo 1, "initial handoff did not make exactly one eager probe")
+
+                Assert.That(
+                    blockingCalls,
+                    Is.EqualTo 4,
+                    "the consumed signal did not survive three temporary failures before the real reap"
+                )
+
+                Assert.That(parked.IsSet, Is.False, "the recovery owner parked on the already-consumed signal")
+                Native.Posix.exitWaitFaultForTests <- None
+
+                Assert.That(
+                    Native.Posix.reapLeader pid,
+                    Is.EqualTo LeaderReap.Gone,
+                    "the detached child retained a second reapable status after recovery"
+                )
+
+                completed <- true
+        finally
+            Native.Posix.detachedReaperHandoffForTests <- None
+            Native.Posix.detachedReaperUseFastPathForTests <- None
+            Native.Posix.blockingReapParkedForTests <- None
+            Native.Posix.exitWaitFaultForTests <- None
+
+            if pid <> 0 && not completed then
+                Native.Posix.killProcess pid
+                Native.Posix.reapLeader pid |> ignore
+                Native.Posix.notifyExitSignalForTests ()
+
+    [<Test>]
+    member _.``a failed Linux fast-path registration retains a pre-handoff exit event``() =
+        if not isLinux then
+            Assert.Ignore "Linux-only: exercises the pidfd registration-failure fallback"
+
+        if not Native.Posix.pidfdActive then
+            Assert.Ignore "Linux pidfd support is unavailable on this host"
+
+        let mutable pid = 0
+        let mutable registrationFailures = 0
+        let mutable nonBlockingCalls = 0
+        let mutable blockingCalls = 0
+        let mutable signalConsumedBeforeHandoff = false
+        let mutable completed = false
+        use parked = new ManualResetEventSlim(false)
+
+        try
+            Native.Posix.detachedReaperUseFastPathForTests <- Some true
+
+            Native.Posix.pidfdRegistrationFailureForTests <-
+                Some(fun candidatePid ->
+                    if candidatePid = pid then
+                        Interlocked.Increment(&registrationFailures) |> ignore
+                        true
+                    else
+                        false)
+
+            Native.Posix.blockingReapParkedForTests <-
+                Some(fun candidatePid ->
+                    if candidatePid = pid then
+                        parked.Set())
+
+            Native.Posix.exitWaitFaultForTests <-
+                Some(fun operation candidatePid ->
+                    if candidatePid <> pid then
+                        None
+                    else
+                        match operation with
+                        | Native.Posix.ExitWaitOperationForTests.NonBlockingWaitPid ->
+                            Interlocked.Increment(&nonBlockingCalls) |> ignore
+                            Some Native.Posix.transientExitWaitErrnoForTests
+                        | Native.Posix.ExitWaitOperationForTests.BlockingWaitPid ->
+                            if Interlocked.Increment(&blockingCalls) <= 3 then
+                                Some Native.Posix.transientExitWaitErrnoForTests
+                            else
+                                None
+                        | Native.Posix.ExitWaitOperationForTests.KqueueWaitPid
+                        | Native.Posix.ExitWaitOperationForTests.PidfdWaitId -> None)
+
+            Native.Posix.detachedReaperHandoffForTests <-
+                Some(fun candidatePid ->
+                    pid <- candidatePid
+                    let generationBeforeExit = Native.Posix.exitSignalGenerationForTests ()
+                    Native.Posix.killProcess candidatePid
+
+                    let becameZombie = waitUntil 5000 (fun () -> processIsZombie candidatePid)
+
+                    signalConsumedBeforeHandoff <-
+                        becameZombie
+                        && waitUntil 5000 (fun () ->
+                            Native.Posix.exitSignalGenerationForTests () > generationBeforeExit)
+
+                    Ok())
+
+            match Native.Posix.spawnDetachedPosix (shell "sleep 60") with
+            | Error error -> Assert.Fail $"detached spawn failed: {error.Message}"
+            | Ok spawned ->
+                pid <- spawned.Pid
+
+                Assert.That(
+                    signalConsumedBeforeHandoff,
+                    Is.True,
+                    "the child's real SIGCHLD was not observed before its fast-path registration"
+                )
+
+                Assert.That(
+                    waitUntil 5000 (fun () -> not (File.Exists $"/proc/{pid}/stat")),
+                    Is.True,
+                    "the fast-path registration fallback did not reap the already-exited child"
+                )
+
+                Assert.That(registrationFailures, Is.EqualTo 1, "the per-child pidfd registration did not fail once")
+
+                Assert.That(
+                    blockingCalls,
+                    Is.EqualTo 4,
+                    "the pre-spawn event boundary did not survive three temporary waits before the real reap"
+                )
+
+                Assert.That(
+                    nonBlockingCalls,
+                    Is.LessThanOrEqualTo 1,
+                    "the already-consumed exit caused repeated portable reap probes"
+                )
+
+                Assert.That(parked.IsSet, Is.False, "the fallback parked on the already-consumed exit event")
+                Native.Posix.exitWaitFaultForTests <- None
+
+                Assert.That(
+                    Native.Posix.reapLeader pid,
+                    Is.EqualTo LeaderReap.Gone,
+                    "the detached child retained a second reapable status after fast-path recovery"
+                )
+
+                completed <- true
+        finally
+            Native.Posix.detachedReaperHandoffForTests <- None
+            Native.Posix.detachedReaperUseFastPathForTests <- None
+            Native.Posix.pidfdRegistrationFailureForTests <- None
+            Native.Posix.blockingReapParkedForTests <- None
+            Native.Posix.exitWaitFaultForTests <- None
+
+            if pid <> 0 && not completed then
+                Native.Posix.killProcess pid
+                Native.Posix.reapLeader pid |> ignore
+                Native.Posix.notifyExitSignalForTests ()
+
+    [<Test>]
+    member _.``a consumed SIGCHLD callback retains the child when its replacement thread cannot start``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: /proc attributes the injected callback probe to the exited child"
+
+            match Native.Posix.spawnPosix (shell "read _; exit 31" |> Command.keepStdinOpen) with
+            | Error error -> Assert.Fail $"spawn failed: {error.Message}"
+            | Ok spawned ->
+                let pid = int spawned.Handle
+                let mutable childReleased = 0
+                let mutable nonBlockingCalls = 0
+                let mutable blockingCalls = 0
+                let mutable failedStarts = 0
+                let mutable completed = false
+                use callbackProbe = new ManualResetEventSlim(false)
+                use parked = new ManualResetEventSlim(false)
+
+                try
+                    Native.Posix.blockingReapParkedForTests <-
+                        Some(fun candidatePid ->
+                            if candidatePid = pid then
+                                parked.Set())
+
+                    Native.Posix.blockingReapThreadStartFailureForTests <-
+                        Some(fun candidatePid ->
+                            if candidatePid = pid && callbackProbe.IsSet then
+                                Interlocked.Increment(&failedStarts) |> ignore
+                                true
+                            else
+                                false)
+
+                    Native.Posix.exitWaitFaultForTests <-
+                        Some(fun operation candidatePid ->
+                            if candidatePid <> pid then
+                                None
+                            else
+                                match operation with
+                                | Native.Posix.ExitWaitOperationForTests.NonBlockingWaitPid ->
+                                    Interlocked.Increment(&nonBlockingCalls) |> ignore
+
+                                    if Volatile.Read(&childReleased) <> 0 && processIsZombie candidatePid then
+                                        callbackProbe.Set()
+                                        Some Native.Posix.transientExitWaitErrnoForTests
+                                    else
+                                        None
+                                | Native.Posix.ExitWaitOperationForTests.BlockingWaitPid ->
+                                    if Interlocked.Increment(&blockingCalls) <= 3 then
+                                        Some Native.Posix.transientExitWaitErrnoForTests
+                                    else
+                                        None
+                                | Native.Posix.ExitWaitOperationForTests.KqueueWaitPid
+                                | Native.Posix.ExitWaitOperationForTests.PidfdWaitId -> None)
+
+                    let first = Native.Posix.waitPosixViaSigchldForTests spawned.Handle
+                    let second = Native.Posix.waitPosixViaSigchldForTests spawned.Handle
+
+                    Assert.That(first.IsCompleted, Is.False, "the live child completed during initial handoff")
+                    Assert.That(second.IsCompleted, Is.False, "the shared waiter completed before child exit")
+                    Assert.That(nonBlockingCalls, Is.EqualTo 1, "handoff did not make exactly one live-child probe")
+
+                    Volatile.Write(&childReleased, 1)
+
+                    match spawned.Stdin with
+                    | Some input ->
+                        input.WriteByte(byte '\n')
+                        input.Flush()
+                    | None -> Assert.Fail "spawn did not retain the stdin pipe needed to release the child"
+
+                    Assert.That(
+                        callbackProbe.Wait 5000,
+                        Is.True,
+                        "the child's real SIGCHLD did not reach the injected temporary callback probe"
+                    )
+
+                    let! firstOutcome = withDeadline 5000 first
+                    let! secondOutcome = withDeadline 5000 second
+                    completed <- true
+
+                    Assert.That(firstOutcome, Is.EqualTo(Outcome.Exited 31))
+                    Assert.That(secondOutcome, Is.EqualTo firstOutcome, "duplicate waiters did not share the one reap")
+                    Assert.That(failedStarts, Is.EqualTo 1, "the callback did not observe one failed replacement start")
+
+                    Assert.That(
+                        blockingCalls,
+                        Is.EqualTo 4,
+                        "the consumed-event credit did not survive three temporary waits before the real reap"
+                    )
+
+                    Assert.That(parked.IsSet, Is.False, "the callback parked on the SIGCHLD it had already consumed")
+                    Assert.That(nonBlockingCalls, Is.EqualTo 2, "the exit callback did not make one targeted probe")
+                    Native.Posix.exitWaitFaultForTests <- None
+
+                    Assert.That(
+                        Native.Posix.reapLeader pid,
+                        Is.EqualTo LeaderReap.Gone,
+                        "the child retained a second reapable status after both waiters completed"
+                    )
+                finally
+                    Native.Posix.notifyExitSignalForTests ()
+                    Native.Posix.blockingReapParkedForTests <- None
+                    Native.Posix.blockingReapThreadStartFailureForTests <- None
+                    Native.Posix.exitWaitFaultForTests <- None
+                    spawned.Stdout |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stderr |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stdin |> Option.iter (fun stream -> stream.Dispose())
+
+                    if not completed then
+                        Native.Posix.killProcess pid
+                        Native.Posix.reapLeader pid |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a consumed macOS kqueue event transfers once when its replacement thread cannot start``() : Task =
+        task {
+            if not isMacOs then
+                Assert.Ignore "macOS-only: exercises failed replacement ownership after a consumed EV_ONESHOT event"
+
+            match Native.Posix.spawnPosix (shell "sleep 0.2; exit 29") with
+            | Error error -> Assert.Fail $"spawn failed: {error.Message}"
+            | Ok spawned ->
+                let pid = int spawned.Handle
+                let mutable kqueueCalls = 0
+                let mutable armCalls = 0
+                let mutable nonBlockingCalls = 0
+                let mutable blockingCalls = 0
+                let mutable failedStarts = 0
+                let mutable completed = false
+                use kqueueProbe = new ManualResetEventSlim(false)
+                use blockingProbe = new ManualResetEventSlim(false)
+                use parked = new ManualResetEventSlim(false)
+
+                try
+                    Native.Posix.blockingReapParkedForTests <-
+                        Some(fun candidatePid ->
+                            if candidatePid = pid then
+                                parked.Set())
+
+                    Native.Posix.blockingReapThreadStartFailureForTests <-
+                        Some(fun candidatePid ->
+                            if candidatePid = pid && kqueueProbe.IsSet then
+                                Interlocked.Increment(&failedStarts) |> ignore
+                                true
+                            else
+                                false)
+
+                    Native.Posix.kqueueRegistrationFailureForTests <-
+                        Some(fun candidatePid ->
+                            if candidatePid = pid then
+                                Interlocked.Increment(&armCalls) |> ignore
+
+                            false)
+
+                    Native.Posix.exitWaitFaultForTests <-
+                        Some(fun operation candidatePid ->
+                            if candidatePid <> pid then
+                                None
+                            else
+                                match operation with
+                                | Native.Posix.ExitWaitOperationForTests.KqueueWaitPid ->
+                                    if Interlocked.Increment(&kqueueCalls) = 2 then
+                                        kqueueProbe.Set()
+                                        Some Native.Posix.transientExitWaitErrnoForTests
+                                    else
+                                        None
+                                | Native.Posix.ExitWaitOperationForTests.NonBlockingWaitPid ->
+                                    Interlocked.Increment(&nonBlockingCalls) |> ignore
+                                    kqueueProbe.Wait 5000 |> ignore
+                                    blockingProbe.Wait 5000 |> ignore
+                                    Some Native.Posix.transientExitWaitErrnoForTests
+                                | Native.Posix.ExitWaitOperationForTests.BlockingWaitPid ->
+                                    blockingProbe.Set()
+
+                                    if Interlocked.Increment(&blockingCalls) <= 3 then
+                                        Some Native.Posix.transientExitWaitErrnoForTests
+                                    else
+                                        None
+                                | _ -> None)
+
+                    let! outcome = withDeadline 5000 (Native.Posix.waitPosix spawned.Handle)
+                    completed <- true
+
+                    Assert.That(outcome, Is.EqualTo(Outcome.Exited 29))
+
+                    Assert.That(
+                        kqueueCalls,
+                        Is.EqualTo 2,
+                        "the consumed one-shot event was not followed by exactly one failed reap probe"
+                    )
+
+                    Assert.That(
+                        armCalls,
+                        Is.EqualTo 1,
+                        "the consumed one-shot event was rearmed instead of transferred to the live worker"
+                    )
+
+                    Assert.That(failedStarts, Is.EqualTo 1, "the kqueue path retried replacement thread startup")
+
+                    Assert.That(
+                        blockingCalls,
+                        Is.EqualTo 4,
+                        "the retained kqueue worker did not survive three temporary blocking failures"
+                    )
+
+                    Assert.That(nonBlockingCalls, Is.LessThanOrEqualTo 1)
+                    Assert.That(parked.IsSet, Is.False, "the kqueue owner waited for a synthetic signal generation")
+                    Assert.That(Native.Posix.kqueueActive (), Is.True)
+                finally
+                    Native.Posix.blockingReapParkedForTests <- None
+                    Native.Posix.blockingReapThreadStartFailureForTests <- None
+                    Native.Posix.kqueueRegistrationFailureForTests <- None
+                    Native.Posix.exitWaitFaultForTests <- None
+                    spawned.Stdout |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stderr |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stdin |> Option.iter (fun stream -> stream.Dispose())
+
+                    if not completed then
+                        Native.Posix.killProcess pid
+                        Native.Posix.reapLeader pid |> ignore
+        }
+        :> Task
+
+    [<Test>]
+    member _.``a failed macOS kqueue registration transfers that child to one blocking wait``() : Task =
+        task {
+            if not isMacOs then
+                Assert.Ignore "macOS-only: exercises the EVFILT_PROC registration-failure fallback"
+
+            match Native.Posix.spawnPosix (shell "sleep 0.1; exit 19") with
+            | Error error -> Assert.Fail $"spawn failed: {error.Message}"
+            | Ok spawned ->
+                let pid = int spawned.Handle
+                let mutable blockingCalls = 0
+                let mutable completed = false
+
+                try
+                    Native.Posix.kqueueRegistrationFailureForTests <- Some((=) pid)
+
+                    Native.Posix.exitWaitFaultForTests <-
+                        Some(fun operation candidatePid ->
+                            if candidatePid <> pid then
+                                None
+                            else
+                                match operation with
+                                | Native.Posix.ExitWaitOperationForTests.BlockingWaitPid ->
+                                    Interlocked.Increment(&blockingCalls) |> ignore
+                                    None
+                                | Native.Posix.ExitWaitOperationForTests.NonBlockingWaitPid ->
+                                    Some Native.Posix.transientExitWaitErrnoForTests
+                                | _ -> None)
+
+                    let! outcome = withDeadline 5000 (Native.Posix.waitPosix spawned.Handle)
+                    completed <- true
+                    Assert.That(outcome, Is.EqualTo(Outcome.Exited 19))
+                    Assert.That(blockingCalls, Is.EqualTo 1, "the failed registration did not use one blocking wait")
+                    Assert.That(Native.Posix.kqueueActive (), Is.True)
+                finally
+                    Native.Posix.kqueueRegistrationFailureForTests <- None
+                    Native.Posix.exitWaitFaultForTests <- None
+                    spawned.Stdout |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stderr |> Option.iter (fun stream -> stream.Dispose())
+                    spawned.Stdin |> Option.iter (fun stream -> stream.Dispose())
+
+                    if not completed then
+                        Native.Posix.killProcess pid
+                        Native.Posix.reapLeader pid |> ignore
+        }
+        :> Task
 
     [<Test>]
     member _.``waitPosix is idempotent for a repeated pid and does not leak a descriptor``() : Task =

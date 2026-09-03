@@ -3,6 +3,7 @@ namespace ProcessKit.Tests
 open System
 open System.IO
 open System.Reflection
+open System.Runtime.CompilerServices
 open System.Text
 open NUnit.Framework
 
@@ -30,6 +31,28 @@ type ApiSurfaceTests() =
 
     // Culture-invariant (ordinal) ordering so the snapshot is byte-identical across every CI OS.
     static let ordinal (a: string) (b: string) : int = String.CompareOrdinal(a, b)
+
+    static let isDebugTaskBindHelperName (name: string) : bool =
+        let prefix = "<Bind>__debug@"
+
+        if not (name.StartsWith(prefix, StringComparison.Ordinal)) then
+            false
+        else
+            let mutable index = prefix.Length
+
+            let consumeAsciiDigits () =
+                let start = index
+
+                while index < name.Length && name[index] >= '0' && name[index] <= '9' do
+                    index <- index + 1
+
+                index > start
+
+            consumeAsciiDigits ()
+            && (index = name.Length
+                || (name[index] = '-'
+                    && (index <- index + 1
+                        consumeAsciiDigits () && index = name.Length)))
 
     /// Readable, deterministic rendering of a type reference: namespace-qualified, generics as
     /// `<...>`, arrays as `[]`, byrefs as `&`.
@@ -70,7 +93,13 @@ type ApiSurfaceTests() =
                 || n.StartsWith "add_"
                 || n.StartsWith "remove_")
 
-        if isAccessor then
+        // Unoptimized F# task expressions can emit metadata-public stepping helpers on their
+        // enclosing module. The attribute plus the exact compiler name excludes only that artifact.
+        let isDebugTaskBindHelper =
+            isDebugTaskBindHelperName n
+            && m.IsDefined(typeof<CompilerGeneratedAttribute>, false)
+
+        if isAccessor || isDebugTaskBindHelper then
             None
         else
             let prefix = if m.IsStatic then "static member " else "member "
@@ -244,6 +273,19 @@ type ApiSurfaceTests() =
     [<Test>]
     member _.``ProcessKit public API matches the approved baseline``() =
         verify typeof<ProcessKit.Command>.Assembly "PublicApi.ProcessKit.approved.txt"
+
+    [<TestCase("<Bind>__debug@0", true)>]
+    [<TestCase("<Bind>__debug@425", true)>]
+    [<TestCase("<Bind>__debug@688-1", true)>]
+    [<TestCase("<Bind>__debug@", false)>]
+    [<TestCase("<Bind>__debug@-1", false)>]
+    [<TestCase("<Bind>__debug@1-", false)>]
+    [<TestCase("<Bind>__debug@1-2-3", false)>]
+    [<TestCase("<Bind>__debug@1x", false)>]
+    [<TestCase("<Bind>__debug@١", false)>]
+    [<TestCase("x<Bind>__debug@1", false)>]
+    member _.``Debug task bind helper name predicate is exact``(name: string, expected: bool) =
+        Assert.That(isDebugTaskBindHelperName name, Is.EqualTo(expected))
 
     [<Test>]
     member _.``DI extensions public API matches the approved baseline``() =

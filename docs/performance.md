@@ -16,8 +16,11 @@ Process exit is event-driven on every supported platform:
 - macOS registers `EVFILT_PROC` / `NOTE_EXIT` with one shared kqueue reaper.
 - Windows uses registered waits over process handles; a pool wait thread multiplexes many handles.
 
-Piped output uses asynchronous stream reads. An idle child therefore does not need a dedicated
-managed thread parked in `Read` or `waitpid`. Work resumes when the OS reports exit or pipe data.
+Detached POSIX leaders join the same process-wide wait mechanism after handoff; they do not have a
+timer-driven reaper. If a per-child pidfd/kqueue registration fails, that child alone falls back to one
+blocking wait rather than repeated probes. Piped output uses asynchronous stream reads. An idle child
+on the normal path therefore does not need a dedicated managed thread parked in `Read` or `waitpid`.
+Work resumes when the OS reports exit or pipe data.
 This is a scaling property, not a promise that spawning a process is cheap: executable loading,
 container setup, antivirus, shell startup, and the child itself can dominate short commands.
 

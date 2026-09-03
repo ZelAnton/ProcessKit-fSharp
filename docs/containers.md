@@ -99,13 +99,12 @@ kernel, unlike for any other process).
 
 What this means for a ProcessKit-using app:
 
-- **Zombie reaping for ProcessKit's own tree is already covered, PID 1 or not.** Whatever spawned a
-  process — `Command`, a `ProcessGroup`, a `Supervisor` — is reaped by ProcessKit's own POSIX
-  backend: Linux uses the `pidfd`/epoll fast path, macOS uses a shared kqueue `NOTE_EXIT` reaper,
-  and the remaining POSIX fallback uses shared `SIGCHLD`-driven `waitpid`; each reaps every process
-  it tracks the moment it exits, regardless of where in the process tree it ends up. This is not a
-  `PID 1`-specific behavior — it is how the library always avoids leaving zombies behind for the
-  processes it spawned.
+- **Zombie reaping for ProcessKit's own children is already covered, PID 1 or not.** Whatever spawned
+  a process — `Command`, a `ProcessGroup`, a `Supervisor`, or `LaunchDetached` — hands its direct child
+  to ProcessKit's POSIX wait ledger: Linux uses the `pidfd`/epoll fast path, macOS uses a shared kqueue
+  `NOTE_EXIT` reaper, and the remaining POSIX fallback uses shared `SIGCHLD`-driven `waitpid`. Detached
+  leaders use those same event notifications rather than a timer-driven reaper. This is not a `PID 1`-
+  specific behavior — it is how the library avoids leaving zombies behind for the children it spawned.
 - **Reparenting does not let a process escape `Mechanism.JobObject` / `Mechanism.CgroupV2` /
   `Mechanism.ProcessReaper` containment**, because none of those three tracks membership by
   parent-child ancestry: the first two use a kernel container (the Job / the cgroup) and the third uses

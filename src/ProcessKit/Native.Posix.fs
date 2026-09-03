@@ -12,8 +12,8 @@ open System.Threading
 open System.Threading.Tasks
 open ProcessKit.Native.Common
 
-/// POSIX process-group containment: `posix_spawn` into a fresh process group, event-driven
-/// event-driven child reaping via pidfd/epoll, kqueue, or shared SIGCHLD, and `killpg`/`kill` signals.
+/// POSIX process-group containment: `posix_spawn` into a fresh process group, event-driven child
+/// reaping via pidfd/epoll, kqueue, or shared SIGCHLD, and `killpg`/`kill` signals.
 /// All libc `DllImport`s for this layer live here (including the single-pid `kill`, which the
 /// cgroup layer also uses); call sites are guarded by `RuntimeInformation.IsOSPlatform` so a libc
 /// entry point is only invoked on a POSIX host. Depends only on `Native.Common`.
@@ -77,18 +77,16 @@ module internal Posix =
     [<Literal>]
     let private ENOENT = 2
 
-    // `waitpid` returns ECHILD when another owner has already consumed the status. EAGAIN is retained
-    // with the other temporary wait failures by the detached reaper rather than dropping ownership.
+    // No (remaining) child of ours matches: another coordinated waiter may have consumed the status.
     [<Literal>]
-    let private detachedReaperEchild = 10
+    let private ECHILD = 10
 
+    // A transient native-resource verdict. waitpid(2) does not normally return EAGAIN on the
+    // platforms we target, but native wrappers/seccomp fault injection can surface it. Treating it as
+    // explicitly retryable keeps an already-transferred child under one blocking owner without turning
+    // every unexpected errno into a potentially hot retry loop.
     [<Literal>]
     let private EAGAIN = 11
-
-    // Detached reaping uses its own early non-blocking probe so it cannot accidentally depend on the
-    // event-driven wait registry used by contained processes (which intentionally has a different owner).
-    [<Literal>]
-    let private detachedReaperWnohang = 1
 
     // `killpg(pgid, 0)` reports this only when the target process group no longer exists. A failed
     // probe with EPERM instead proves that the group exists but the caller may not signal it.
@@ -529,13 +527,57 @@ module internal Posix =
     let mutable streamWrapFaultForTests: (string -> unit) option = None
 
     /// Test seam (internal, not public API): can force detached-reaper preparation or handoff to fail
-    /// after the test has arranged the child state. Returning `Ok ()` delegates to the real private reaper;
+    /// after the test has arranged the child state. Returning `Ok ()` delegates to the real shared reaper;
     /// returning `Error` exercises the typed pre-spawn or post-spawn unwind without bypassing ownership.
     let mutable detachedReaperPrepareForTests: (unit -> Result<unit, string>) option =
         None
 
     let mutable detachedReaperHandoffForTests: (int -> Result<unit, string>) option =
         None
+
+    /// Test seam (internal, not public API): forces a detached handoff through the portable SIGCHLD
+    /// fallback when `Some false`, even on a host whose normal path is pidfd or kqueue. Production leaves
+    /// it `None`, which selects the platform fast path.
+    let mutable detachedReaperUseFastPathForTests: bool option = None
+
+    /// The native exit-wait operation being fault-injected by `exitWaitFaultForTests`.
+    [<RequireQualifiedAccess>]
+    type ExitWaitOperationForTests =
+        | NonBlockingWaitPid
+        | BlockingWaitPid
+        | KqueueWaitPid
+        | PidfdWaitId
+
+    /// Test seam (internal, not public API): return an errno to make one exit-wait operation fail before
+    /// entering libc, or `None` to execute the real operation. Tests scope the hook to one child pid and
+    /// reset it in `finally`, so unrelated process-wide waits continue through the real native path.
+    let mutable exitWaitFaultForTests: (ExitWaitOperationForTests -> int -> int option) option =
+        None
+
+    /// The explicitly retryable synthetic errno used by exit-wait fault-injection tests.
+    let transientExitWaitErrnoForTests = EAGAIN
+
+    /// Test seam (internal, not public API): force the per-child EVFILT_PROC registration to fail for a
+    /// selected pid while leaving the shared kqueue itself intact. Production leaves it `None`.
+    let mutable kqueueRegistrationFailureForTests: (int -> bool) option = None
+
+    /// Test seam (internal, not public API): force the per-child pidfd registration to fail for a
+    /// selected pid while leaving the shared epoll instance intact. Production leaves it `None`.
+    let mutable pidfdRegistrationFailureForTests: (int -> bool) option = None
+
+    /// Test seam (internal, not public API): force the dedicated blocking-reap worker to fail before its
+    /// thread becomes a durable owner for the selected pid. Production leaves it `None`.
+    let mutable blockingReapThreadStartFailureForTests: (int -> bool) option = None
+
+    /// Test seam (internal, not public API): observes that an EAGAIN retry has reached the signal gate.
+    /// The callback runs immediately before `Monitor.Wait`, so tests can prove the native-probe count is
+    /// bounded without sleeping or polling. Production leaves it `None`.
+    let mutable blockingReapParkedForTests: (int -> unit) option = None
+
+    /// Test seam (internal, not public API): observes each native exit-status probe made by the shared
+    /// POSIX wait infrastructure. The pid lets a test isolate one detached child without a global counter
+    /// being polluted by other registrations. Production leaves it `None`.
+    let mutable exitWaitProbeForTests: (int -> unit) option = None
 
     /// Test seam (internal, not public API): overrides the by-number process-group liveness probe
     /// (`killpg(pgid, 0)`), so a pid/pgid-reuse scenario — a recycled number that still probes alive —
@@ -636,138 +678,6 @@ module internal Posix =
     /// `c_cc[VEOF]`. The production path leaves this unset; Linux integration tests use it to prove the
     /// discovery path, rather than merely passing a byte directly to `PtyStdinStream`.
     let mutable ptyConfigureTermiosForTests: (int -> Result<unit, string>) option = None
-
-    [<NoComparison; NoEquality>]
-    type private DetachedReaperState = { Queue: BlockingCollection<int> }
-
-    let private detachedReaperInitLock = obj ()
-
-    let mutable private detachedReaperState: Result<DetachedReaperState, string> option =
-        None
-
-    // Polling is deliberately bounded: a live child is revisited at this interval, and a transient waitpid
-    // error leaves the pid in `owned` for the same next pass. The owner is never dropped just because one
-    // probe was interrupted or temporarily unavailable.
-    [<Literal>]
-    let private detachedReaperPollMs = 10
-
-    let private detachedWaitCompleted (pid: int) : bool =
-        let mutable status = 0
-
-        try
-            let result = waitpid (pid, &status, detachedReaperWnohang)
-
-            if result = pid then
-                true
-            elif result < 0 then
-                let errno = Marshal.GetLastWin32Error()
-                // ECHILD means another path already consumed this child; retaining the numeric pid cannot
-                // restore its status, but there is no zombie left for this owner to clear.
-                if errno = detachedReaperEchild then
-                    true
-                elif errno = EAGAIN then
-                    // EAGAIN is a temporary wait failure; keep the owner for the next bounded poll.
-                    false
-                else
-                    // Unknown wait failures are also retained. Losing the owner here is the unsafe choice:
-                    // the child may still be a zombie that only this reaper can consume.
-                    false
-            else
-                // 0 means the child is still running. Any other non-negative result is unexpected, so keep
-                // the owner and let the next bounded poll try again rather than dropping the pid.
-                false
-        with _ ->
-            // A native wait failure is transient for this owner; retaining the pid is safer than allowing a
-            // detached child to become an unreaped zombie when the probe itself faults.
-            false
-
-    // One process-wide manager owns every detached POSIX leader after handoff. It stores only pids because
-    // `posix_spawn` exposes no managed Child handle, but the queue boundary is still the ownership boundary:
-    // before `TryAdd` the caller may synchronously kill/reap; after it succeeds only this thread calls waitpid.
-    let private detachedReaperLoop (state: DetachedReaperState) =
-        let owned = ResizeArray<int>()
-
-        try
-            while true do
-                if owned.Count = 0 then
-                    owned.Add(state.Queue.Take())
-                else
-                    let mutable pid = 0
-
-                    if state.Queue.TryTake(&pid, detachedReaperPollMs) then
-                        owned.Add pid
-
-                let mutable index = 0
-
-                while index < owned.Count do
-                    if detachedWaitCompleted owned[index] then
-                        owned.RemoveAt index
-                    else
-                        index <- index + 1
-        with _ ->
-            // The queue is process-global and never intentionally completes. If an infrastructure failure
-            // nevertheless ends this loop, closing it makes future handoffs fail synchronously instead of
-            // silently accepting pids into a manager that no longer exists.
-            try
-                state.Queue.CompleteAdding()
-            with _ ->
-                // Teardown of a failed manager must not mask the original startup/handoff error.
-                ()
-
-    let private prepareDetachedReaperCore () : Result<unit, string> =
-        lock detachedReaperInitLock (fun () ->
-            match detachedReaperState with
-            | Some(Ok _) -> Ok()
-            | Some(Error message) -> Error message
-            | None ->
-                try
-                    let state = { Queue = new BlockingCollection<int>() }
-                    let thread = Thread(ThreadStart(fun () -> detachedReaperLoop state))
-                    thread.IsBackground <- true
-                    thread.Name <- "ProcessKit-detached-reaper"
-                    thread.Start()
-                    detachedReaperState <- Some(Ok state)
-                    Ok()
-                with ex ->
-                    let message = $"could not start detached reaper: {ex.Message}"
-                    detachedReaperState <- Some(Error message)
-                    Error message)
-
-    let private prepareDetachedReaper () : Result<unit, string> =
-        match detachedReaperPrepareForTests with
-        | Some hook ->
-            try
-                match hook () with
-                | Error message -> Error message
-                | Ok() -> prepareDetachedReaperCore ()
-            with ex ->
-                Error $"detached reaper preparation hook failed: {ex.Message}"
-        | None -> prepareDetachedReaperCore ()
-
-    let private handoffDetachedReaperCore (pid: int) : Result<unit, string> =
-        lock detachedReaperInitLock (fun () ->
-            match detachedReaperState with
-            | Some(Ok state) ->
-                try
-                    if state.Queue.TryAdd pid then
-                        Ok()
-                    else
-                        Error "detached reaper stopped unexpectedly"
-                with ex ->
-                    Error $"detached reaper handoff failed: {ex.Message}"
-            | Some(Error message) -> Error message
-            | None -> Error "detached reaper was not prepared before spawn")
-
-    let private handoffDetachedReaper (pid: int) : Result<unit, string> =
-        match detachedReaperHandoffForTests with
-        | Some hook ->
-            try
-                match hook pid with
-                | Error message -> Error message
-                | Ok() -> handoffDetachedReaperCore pid
-            with ex ->
-                Error $"detached reaper handoff hook failed: {ex.Message}"
-        | None -> handoffDetachedReaperCore pid
 
     // Fire the group-delivery test observer (if installed) with the target pgid BEFORE the syscall, so a
     // test can record exactly which pgids a signal/kill path delivered to — and so it can never perturb
@@ -2533,7 +2443,17 @@ module internal Posix =
     [<NoComparison; NoEquality>]
     type private PendingWait =
         { Waiters: ResizeArray<TaskCompletionSource<Outcome>>
-          mutable Outcome: Outcome voption }
+          mutable Outcome: Outcome voption
+          MissedExitSignalGeneration: int64 voption
+          mutable BlockingFallbackStarting: bool
+          mutable BlockingFallbackStarted: bool }
+
+    [<RequireQualifiedAccess>]
+    type private ReapPendingResult =
+        | Resolved
+        | StillAlive
+        | ReplacementOwned
+        | ReplacementStartFailed
 
     // Every event-driven POSIX wait currently in flight — or just-reaped and briefly lingering with its
     // cached outcome — process-wide, keyed by pid. `waitPosix` adds a waiter to the pid's group (creating
@@ -2541,6 +2461,76 @@ module internal Posix =
     // (teardown) actually reaps a given child resolves the group and fans the ONE real status out to every
     // waiter — the OS status is consumed exactly once, since only one `waitpid`/`waitid` can get there.
     let private pendingWaits = ConcurrentDictionary<int, PendingWait>()
+
+    let private observeExitWaitProbe (pid: int) =
+        match exitWaitProbeForTests with
+        | None -> ()
+        | Some observe ->
+            try
+                observe pid
+            with _ ->
+                // Test-only observation must never interrupt a process-wide reaper or change ownership.
+                ()
+
+    let private injectedExitWaitErrno (operation: ExitWaitOperationForTests) (pid: int) =
+        match exitWaitFaultForTests with
+        | None -> None
+        | Some inject -> inject operation pid
+
+    // Capture errno next to the native call. Reading Marshal.GetLastWin32Error later, after another
+    // managed/native operation, can classify the wrong failure; the fault-injection seam returns the
+    // same `(result, errno)` shape without entering libc.
+    let private waitpidForExit
+        (operation: ExitWaitOperationForTests)
+        (pid: int)
+        (status: byref<int>)
+        (options: int)
+        : struct (int * int) =
+        match injectedExitWaitErrno operation pid with
+        | Some errno -> struct (-1, errno)
+        | None ->
+            let result = waitpid (pid, &status, options)
+            let errno = if result < 0 then Marshal.GetLastWin32Error() else 0
+            struct (result, errno)
+
+    // Blocking fallbacks normally sleep in waitpid itself. If libc ever reports an undocumented errno,
+    // keep that same owner alive but retry only after the process-wide SIGCHLD generation advances; this
+    // preserves ownership without a timer or hot loop. The registration callback is assigned after the
+    // top-to-bottom SIGCHLD definitions below; module initialization completes before any wait can run.
+    let private exitSignalGate = obj ()
+    let mutable private exitSignalGeneration = 0L
+
+    let private currentExitSignalGeneration () =
+        lock exitSignalGate (fun () -> exitSignalGeneration)
+
+    let private notifyExitSignal () =
+        lock exitSignalGate (fun () ->
+            exitSignalGeneration <- exitSignalGeneration + 1L
+            Monitor.PulseAll exitSignalGate)
+
+    let private waitForExitSignalAfter (pid: int) (observed: int64) =
+        lock exitSignalGate (fun () ->
+            while exitSignalGeneration = observed do
+                match blockingReapParkedForTests with
+                | Some observe ->
+                    try
+                        observe pid
+                    with _ ->
+                        // Test-only observation must never interrupt the fallback owner's wait.
+                        ()
+                | None -> ()
+
+                Monitor.Wait exitSignalGate |> ignore)
+
+    /// Test-only wake for a blocking-reap retry parked on the process-wide exit-signal gate. This is an
+    /// explicit event, not a timer; production wakes the same gate from the SIGCHLD callback.
+    let notifyExitSignalForTests () = notifyExitSignal ()
+
+    /// Test-only observation of the process-wide exit-signal generation. Detached-handoff tests use it
+    /// to prove that the real child's SIGCHLD was dispatched before the pid entered `pendingWaits`.
+    let exitSignalGenerationForTests () = currentExitSignalGeneration ()
+
+    let mutable private ensureSigchldForBlockingFallback: (unit -> unit) = fun () -> ()
 
     // How long a resolved group lingers in `pendingWaits` after its child was reaped, so a second
     // `waitPosix` for the same pid that registers just AFTER the reap still finds the cached outcome
@@ -2600,21 +2590,193 @@ module internal Posix =
         | true, group -> resolveGroup pid group outcome
         | false, _ -> ()
 
-    // Best-effort, non-blocking reap of one pending pid. Returns `true` once nothing further needs to
-    // be done SYNCHRONOUSLY for it (reaped by us; nothing was ever pending; already reaped and only
-    // lingering with its cached outcome; or an `ECHILD` race whose resolution has been handed off to an
-    // async grace-then-fallback on the thread pool — see below); `false` if it is still alive (left
-    // pending for the next trigger). Never blocks.
-    let private tryReapPending (pid: int) : bool =
+    let private graceThenResolvePending (pid: int) (pending: PendingWait) : Task =
+        task {
+            let mutable spins = 0
+
+            while not (groupResolved pending) && spins < 20 do
+                do! Task.Delay 1
+                spins <- spins + 1
+
+            resolveGroup
+                pid
+                pending
+                (Outcome.Unobserved "the process's exit status could not be observed (ECHILD race)")
+        }
+        :> Task
+
+    // Run a blocking fallback for a PendingWait generation already claimed by this thread. Normal
+    // waitpid calls sleep in the kernel. Before an exit event has been observed, undocumented EAGAIN or
+    // another temporary result gets one eager retry after SIGCHLD registration and then parks until the
+    // generation advances. Once an event for this child may already have been consumed, that generation
+    // becomes a durable credit: the same owner keeps issuing the naturally-blocking wait across any finite
+    // sequence of temporary wrapper failures. It must never park on that already-consumed generation,
+    // because an exited child owes no second SIGCHLD. Yielding between such failures prevents this rare
+    // defensive path from monopolizing its shared reaper thread without introducing timer polling.
+    let private runBlockingReapFallback (consumedExitEvent: bool) (pending: PendingWait) (pid: int) =
+        let mutable status = 0
+        let mutable terminal = false
+        let mutable signalFallbackArmed = false
+        let mutable signalGeneration = 0L
+        let mutable consumedEventCredit = consumedExitEvent
+
+        let awaitRetryEvent () =
+            if not signalFallbackArmed then
+                ensureSigchldForBlockingFallback ()
+                signalFallbackArmed <- true
+
+                match pending.MissedExitSignalGeneration with
+                | ValueSome preparedGeneration ->
+                    let currentGeneration = currentExitSignalGeneration ()
+                    signalGeneration <- currentGeneration
+
+                    if currentGeneration <> preparedGeneration then
+                        // Detached preparation captured this generation before spawn. Its advance proves
+                        // that an exit notification was consumed before handoff. Preserve that fact for
+                        // every later temporary failure: this child will not produce a replacement event.
+                        consumedEventCredit <- true
+                | ValueNone -> signalGeneration <- currentExitSignalGeneration ()
+
+                if consumedEventCredit then
+                    Thread.Yield() |> ignore
+            elif consumedEventCredit then
+                // The next call is still a blocking wait in production; this only yields after an
+                // exceptional immediate failure so a permanently failing wrapper cannot hot-spin the
+                // process-wide dispatcher. No timer or synthetic wake source is introduced.
+                Thread.Yield() |> ignore
+            else
+                let currentGeneration = currentExitSignalGeneration ()
+
+                if currentGeneration <> signalGeneration then
+                    // This call overlapped a real notification. The event has now been consumed, so all
+                    // later temporary failures remain owned here rather than waiting for this generation.
+                    signalGeneration <- currentGeneration
+                    consumedEventCredit <- true
+                else
+                    waitForExitSignalAfter pid signalGeneration
+                    signalGeneration <- currentExitSignalGeneration ()
+                    consumedEventCredit <- true
+
+        while not terminal do
+            observeExitWaitProbe pid
+
+            let struct (result, errno) =
+                waitpidForExit ExitWaitOperationForTests.BlockingWaitPid pid &status 0
+
+            if result = pid then
+                resolveGroup pid pending (decodeWaitStatus status)
+                terminal <- true
+            elif result < 0 && errno = ECHILD then
+                (graceThenResolvePending pid pending).GetAwaiter().GetResult()
+
+                terminal <- true
+            elif result < 0 && errno = EINTR then
+                // A signal interrupted the blocking syscall before it produced a result. Retry it
+                // immediately, matching waitpid's documented EINTR contract.
+                ()
+            else
+                // EAGAIN is not waitpid's normal contract, and a zero return with blocking options or
+                // another errno is likewise undocumented. Keep this same owner claimed and retry only
+                // within the bounded event-driven policy above.
+                awaitRetryEvent ()
+
+    // A per-child, non-polling fallback for a native registration failure or a temporary wait error.
+    // At most one dedicated background waiter is started for a PendingWait generation. Thread.Start
+    // returning successfully is the durable ownership-transfer point: callers retain their pidfd/kqueue
+    // source until this function returns true. The waiter still races safely with a later SIGCHLD scan or
+    // teardown's reapLeader: whichever waitpid consumes the status resolves the shared group, and an
+    // ECHILD loser gives that winner time to publish the real outcome.
+    let private beginBlockingReapFallback (pending: PendingWait) (pid: int) : bool =
+        let existingOwnership =
+            lock pending.Waiters (fun () ->
+                match pending.Outcome with
+                | ValueSome _ -> ValueSome true
+                | ValueNone when pending.BlockingFallbackStarted -> ValueSome true
+                | ValueNone when pending.BlockingFallbackStarting -> ValueSome false
+                | ValueNone ->
+                    pending.BlockingFallbackStarting <- true
+                    ValueNone)
+
+        match existingOwnership with
+        | ValueSome durable -> durable
+        | ValueNone ->
+            try
+                let thread =
+                    Thread(ThreadStart(fun () -> runBlockingReapFallback false pending pid))
+
+                thread.IsBackground <- true
+                thread.Name <- $"ProcessKit-blocking-reaper-{pid}"
+
+                lock pending.Waiters (fun () ->
+                    match blockingReapThreadStartFailureForTests with
+                    | Some shouldFail when shouldFail pid ->
+                        invalidOp $"injected blocking-reap thread-start failure for pid {pid}"
+                    | _ -> ()
+
+                    // Hold the group lock across Start and publication: a concurrent probe can observe
+                    // either a completed start or a restored unowned state, never the in-between claim.
+                    thread.Start()
+                    pending.BlockingFallbackStarting <- false
+                    pending.BlockingFallbackStarted <- true
+                    Monitor.PulseAll pending.Waiters)
+
+                true
+            with _ ->
+                // Thread startup failed before another waiter could own the pid. Restore the claim so the
+                // caller can retain ownership or a later exit notification can try again.
+                lock pending.Waiters (fun () ->
+                    pending.BlockingFallbackStarting <- false
+                    pending.BlockingFallbackStarted <- false
+                    Monitor.PulseAll pending.Waiters)
+
+                false
+
+    // A consumed exit notification has no kernel owner if starting its replacement thread fails. The
+    // current pidfd, kqueue, or SIGCHLD worker is already alive, so claim the exact PendingWait under its
+    // group lock and perform the blocking wait on this thread. This is the single durable recovery
+    // primitive for every consumed-event source: the native registration can be released after it returns
+    // (or after a racing owner is observed), so a level-ready pidfd or rearmed NOTE_EXIT cannot hot-loop.
+    let private reapConsumedExitOnCurrentThread (pending: PendingWait) (pid: int) =
+        let ownsFallback =
+            lock pending.Waiters (fun () ->
+                let mutable startupPending = true
+
+                while startupPending do
+                    match pending.Outcome with
+                    | ValueNone when pending.BlockingFallbackStarting -> Monitor.Wait pending.Waiters |> ignore
+                    | ValueSome _
+                    | ValueNone -> startupPending <- false
+
+                match pending.Outcome with
+                | ValueSome _ -> false
+                | ValueNone when pending.BlockingFallbackStarted -> false
+                | ValueNone ->
+                    pending.BlockingFallbackStarted <- true
+                    true)
+
+        if ownsFallback then
+            // This thread was invoked by the one exit notification that led to the failed probe. Its
+            // durable consumed-event credit survives every temporary result, so it cannot park on that
+            // event or require an unrelated child to exit before retrying.
+            runBlockingReapFallback true pending pid
+
+    // Best-effort, non-blocking reap of one pending pid. The result deliberately separates a live child
+    // still owned by the caller's durable event source from a native-error path whose replacement worker
+    // could not start. Initial handoff must fail closed for the latter: an already-exited child may have
+    // delivered its only SIGCHLD before registration, so an unresolved Task is not itself ownership.
+    let private tryReapPending (retainOnCurrentThread: bool) (pid: int) : ReapPendingResult =
         match pendingWaits.TryGetValue pid with
-        | false, _ -> true
+        | false, _ -> ReapPendingResult.Resolved
         | true, group when groupResolved group ->
             // Already reaped; the group is only lingering so late registrants can read the cached outcome.
             // Re-probing would just hit ECHILD, so leave the consumed child alone (reap-once, K-016).
-            true
+            ReapPendingResult.Resolved
         | true, group ->
             let mutable status = 0
-            let mutable result = waitpid (pid, &status, WNOHANG)
+            observeExitWaitProbe pid
+
+            let mutable waitResult =
+                waitpidForExit ExitWaitOperationForTests.NonBlockingWaitPid pid &status WNOHANG
 
             // `WNOHANG` returns near-instantly (it never blocks), so retrying `EINTR` immediately here
             // costs nothing — unlike the blocking `waitpid` this replaces, an "unbounded" retry loop
@@ -2623,16 +2785,19 @@ module internal Posix =
             // the one immediate probe right after `waitPosix` registers it, for a child that had
             // already exited before that — no *new* SIGCHLD is generated for an event that already
             // happened.
-            while result < 0 && Marshal.GetLastWin32Error() = EINTR do
-                result <- waitpid (pid, &status, WNOHANG)
+            while waitResult = struct (-1, EINTR) do
+                observeExitWaitProbe pid
+                waitResult <- waitpidForExit ExitWaitOperationForTests.NonBlockingWaitPid pid &status WNOHANG
+
+            let struct (result, errno) = waitResult
 
             if result = 0 then
-                false // still alive
+                ReapPendingResult.StillAlive
             elif result = pid then
                 // We won the reap race — this is the real, decoded status; fan it out to every waiter.
                 resolveGroup pid group (decodeWaitStatus status)
-                true
-            else
+                ReapPendingResult.Resolved
+            elif result < 0 && errno = ECHILD then
                 // `ECHILD`: some concurrent caller (most plausibly `reapLeader` tearing down an
                 // abandoned run, or another `tryReapPending` invocation that already won this exact
                 // race) has already reaped this pid and holds the REAL status; we have nothing to
@@ -2646,25 +2811,24 @@ module internal Posix =
                 // stall the runtime's whole signal-dispatch path and delay reaping every other pending
                 // child. Nothing inside the task can throw (`groupResolved`/`resolveGroup` don't), so
                 // it needs no fault observer.
-                task {
-                    let mutable spins = 0
+                graceThenResolvePending pid group |> ignore
 
-                    while not (groupResolved group) && spins < 20 do
-                        do! Task.Delay 1
-                        spins <- spins + 1
-
-                    // Still unresolved after the grace period: nobody ever reported this pid's real status
-                    // (the genuine winner errored out before resolving the group, or something outside
-                    // ProcessKit's own reap machinery reaped it). Resolve honestly instead of leaving the
-                    // waiters hanging forever or inventing a clean exit — a no-op if the winner just landed.
-                    resolveGroup
-                        pid
-                        group
-                        (Outcome.Unobserved "the process's exit status could not be observed (ECHILD race)")
-                }
-                |> ignore
-
-                true
+                ReapPendingResult.Resolved
+            else if
+                // A temporary or unexpected error is not proof that somebody else consumed the child.
+                // Preserve the one PendingWait generation and switch to a single blocking wait rather
+                // than dropping ownership or introducing a timed retry loop.
+                beginBlockingReapFallback group pid
+            then
+                ReapPendingResult.ReplacementOwned
+            elif retainOnCurrentThread then
+                // The SIGCHLD callback has consumed the notification that caused this probe. If a
+                // replacement thread cannot start, the callback itself is the only guaranteed live
+                // execution source, so it must retain the exact group before returning.
+                reapConsumedExitOnCurrentThread group pid
+                ReapPendingResult.ReplacementOwned
+            else
+                ReapPendingResult.ReplacementStartFailed
 
     // Re-scan every still-pending pid — triggered by SIGCHLD (some child changed state; POSIX signals
     // are not queued, so a burst of near-simultaneous exits can coalesce into one delivery, and we
@@ -2673,10 +2837,22 @@ module internal Posix =
     // exited before we started listening for it.
     let private reapAllPending () =
         for pid in pendingWaits.Keys |> Seq.toArray do
-            tryReapPending pid |> ignore
+            tryReapPending true pid |> ignore
 
+    let mutable private exitSignalRegistration: PosixSignalRegistration option = None
+    let private exitSignalInitLock = obj ()
     let mutable private sigchldRegistration: PosixSignalRegistration option = None
     let private sigchldInitLock = obj ()
+
+    // Detached preparation needs a durable pre-spawn event boundary even when the selected pidfd or
+    // kqueue per-child registration later fails. This notification-only registration advances that
+    // boundary without competing with a healthy fast-path owner for the child's wait status.
+    let private ensureExitSignalRegistration () =
+        if exitSignalRegistration.IsNone then
+            lock exitSignalInitLock (fun () ->
+                if exitSignalRegistration.IsNone then
+                    exitSignalRegistration <-
+                        Some(PosixSignalRegistration.Create(PosixSignal.SIGCHLD, (fun _ -> notifyExitSignal ()))))
 
     // Lazily install ONE process-wide SIGCHLD handler (not one thread, and not one per child) the
     // first time a POSIX wait is needed. `PosixSignalRegistration` dispatches through the runtime's
@@ -2684,11 +2860,15 @@ module internal Posix =
     // alongside any other SIGCHLD registration in the process (unlike installing a raw `sigaction`
     // handler, which would clobber one).
     let private ensureSigchldRegistration () =
+        ensureExitSignalRegistration ()
+
         if sigchldRegistration.IsNone then
             lock sigchldInitLock (fun () ->
                 if sigchldRegistration.IsNone then
                     sigchldRegistration <-
                         Some(PosixSignalRegistration.Create(PosixSignal.SIGCHLD, (fun _ -> reapAllPending ()))))
+
+    do ensureSigchldForBlockingFallback <- ensureSigchldRegistration
 
     // ----------------------------------------------------------------------------------
     // Linux >= 5.4: per-child pidfd + one shared epoll reaper (the pid-reuse-safe fast path)
@@ -2736,10 +2916,6 @@ module internal Posix =
     // waitid option: report a child that has TERMINATED (as opposed to stopped/continued).
     [<Literal>]
     let private WEXITED = 4
-
-    // errno: no (more) child of ours matches — someone else already reaped it.
-    [<Literal>]
-    let private ECHILD = 10
 
     // siginfo si_code values for a terminated child (asm-generic; shared across the Linux archs we run).
     [<Literal>]
@@ -2811,6 +2987,14 @@ module internal Posix =
 
     [<DllImport("libc", SetLastError = true)>]
     extern int private epoll_wait(int epfd, nativeint events, int maxevents, int timeout)
+
+    let private waitidForExit (pid: int) (pidfd: int) (siginfo: nativeint) : struct (int * int) =
+        match injectedExitWaitErrno ExitWaitOperationForTests.PidfdWaitId pid with
+        | Some errno -> struct (-1, errno)
+        | None ->
+            let result = waitid (P_PIDFD, uint pidfd, siginfo, WEXITED ||| WNOHANG)
+            let errno = if result < 0 then Marshal.GetLastWin32Error() else 0
+            struct (result, errno)
 
     // pidfd_open(pid, flags) via syscall(2). There is no fixed-signature libc wrapper before glibc 2.36,
     // so we go through `syscall`, whose glibc stub reads its arguments from REGISTERS (hand-written asm,
@@ -2907,6 +3091,52 @@ module internal Posix =
 
     let private pidfdRegs = ConcurrentDictionary<int, PidfdReg>()
 
+    // Create and start a shared native-queue worker under one initialization lock, then publish its
+    // descriptor. The outer read is deliberately volatile: a caller may skip the lock only after it can
+    // observe the descriptor that a successfully-started worker owns. A start failure closes an
+    // unpublished descriptor and leaves the slot negative so the next caller can recover.
+    let private ensureReaperDescriptor
+        (readDescriptor: unit -> int)
+        (publishDescriptor: int -> unit)
+        (initializationLock: obj)
+        (createDescriptor: unit -> int)
+        (closeDescriptor: int -> unit)
+        (startWorker: int -> unit)
+        : int =
+        if readDescriptor () < 0 then
+            lock initializationLock (fun () ->
+                if readDescriptor () < 0 then
+                    let descriptor = createDescriptor ()
+
+                    if descriptor >= 0 then
+                        try
+                            startWorker descriptor
+                            publishDescriptor descriptor
+                        with _ ->
+                            closeDescriptor descriptor
+                            reraise ())
+
+        readDescriptor ()
+
+    /// Test-only access to the exact shared-worker initialization primitive. Tests provide local fake
+    /// descriptors and start gates, so startup-failure publication races are deterministic and never
+    /// disturb the process-wide production epoll/kqueue instances.
+    let ensureReaperDescriptorForTests
+        (readDescriptor: unit -> int)
+        (publishDescriptor: int -> unit)
+        (initializationLock: obj)
+        (createDescriptor: unit -> int)
+        (closeDescriptor: int -> unit)
+        (startWorker: int -> unit)
+        : int =
+        ensureReaperDescriptor
+            readDescriptor
+            publishDescriptor
+            initializationLock
+            createDescriptor
+            closeDescriptor
+            startWorker
+
     let mutable private epollFd = -1
     let private epollInitLock = obj ()
 
@@ -2918,66 +3148,73 @@ module internal Posix =
     let private completePidfdReg (reg: PidfdReg) (outcome: Outcome) =
         resolveGroup reg.Pid reg.Pending outcome
 
-    // `waitid` came back ECHILD (or a spurious wake): the genuine winner — `reapLeader` racing this
-    // child's teardown — holds the real status and is about to deliver it via `completePending`. Give it
+    // `waitid` came back ECHILD: the genuine winner — `reapLeader` racing this child's teardown — holds
+    // the real status and is about to deliver it via `completePending`. Give it
     // the same brief grace the SIGCHLD path's ECHILD branch gives, then resolve OUR group honestly. Keyed
     // by registration identity throughout (`groupResolved`/`resolveGroup` act on the group by reference),
     // so a reused pid is never crossed. Runs on the thread pool so it never blocks the shared reaper thread.
     let private graceThenResolve (reg: PidfdReg) : Task =
-        task {
-            let mutable spins = 0
-
-            while not (groupResolved reg.Pending) && spins < 20 do
-                do! Task.Delay 1
-                spins <- spins + 1
-
-            completePidfdReg reg (Outcome.Unobserved "the process's exit status could not be observed (ECHILD race)")
-        }
-        :> Task
+        graceThenResolvePending reg.Pid reg.Pending
 
     // Handle one pidfd the reaper thread found readable: the child it refers to has terminated. Reap it
     // pid-reuse-safely with `waitid(P_PIDFD)`, resolve the owning wait, then unregister and close the
     // pidfd (a dead process's pidfd stays readable, so it MUST be removed or epoll would report it
     // forever). Runs only on the single reaper thread.
-    let private reapReadyPidfd (pidfd: int) (siginfo: nativeint) =
+    let private reapReadyPidfd (epollDescriptor: int) (pidfd: int) (siginfo: nativeint) =
         match pidfdRegs.TryGetValue pidfd with
         | false, _ ->
             // Already processed and removed (no event should arrive after the DEL below): nothing to do.
             ()
         | true, reg ->
             Marshal.WriteInt32(siginfo, siPidOffset, 0)
-            let mutable rc = waitid (P_PIDFD, uint pidfd, siginfo, WEXITED ||| WNOHANG)
+            observeExitWaitProbe reg.Pid
+            let mutable waitResult = waitidForExit reg.Pid pidfd siginfo
 
-            while rc < 0 && Marshal.GetLastWin32Error() = EINTR do
+            while waitResult = struct (-1, EINTR) do
                 Marshal.WriteInt32(siginfo, siPidOffset, 0)
-                rc <- waitid (P_PIDFD, uint pidfd, siginfo, WEXITED ||| WNOHANG)
+                observeExitWaitProbe reg.Pid
+                waitResult <- waitidForExit reg.Pid pidfd siginfo
 
+            let struct (rc, errno) = waitResult
             let siPid = Marshal.ReadInt32(siginfo, siPidOffset)
 
-            if rc = 0 && siPid <> 0 then
-                // We won the reap — this is the real, pid-reuse-safe status.
-                completePidfdReg reg (decodeSiginfo siginfo)
-            else
-                // ECHILD (or a spurious wake): `reapLeader` (teardown) reaped this child first and holds
-                // the real status. Give it a brief grace to land it, then resolve honestly.
-                graceThenResolve reg |> ignore
+            let releaseRegistration =
+                if rc = 0 && siPid <> 0 then
+                    // We won the reap — this is the real, pid-reuse-safe status.
+                    completePidfdReg reg (decodeSiginfo siginfo)
+                    true
+                elif rc < 0 && errno = ECHILD then
+                    // `reapLeader` (teardown) reaped this child first and holds the real status. Give it a
+                    // brief grace to land it, then resolve honestly.
+                    graceThenResolve reg |> ignore
+                    true
+                else
+                    // A temporary native failure can hand ownership to a dedicated blocking waiter. If
+                    // that thread cannot start, this already-live epoll worker claims the exact group and
+                    // waits here before the level-ready pidfd is removed; returning to epoll with it still
+                    // registered would continuously redispatch the same consumed exit.
+                    if not (beginBlockingReapFallback reg.Pending reg.Pid) then
+                        reapConsumedExitOnCurrentThread reg.Pending reg.Pid
 
-            // Unregister from `pidfdRegs` BEFORE closing, so a concurrent `pidfdOpen` that reuses this fd
-            // number (only possible after the close) never lands on the stale registration; then DEL
-            // (needs the fd still open) and close.
-            pidfdRegs.TryRemove pidfd |> ignore
-            epoll_ctl (epollFd, EPOLL_CTL_DEL, pidfd, IntPtr.Zero) |> ignore
-            close pidfd |> ignore
+                    true
+
+            if releaseRegistration then
+                // Unregister from `pidfdRegs` BEFORE closing, so a concurrent `pidfdOpen` that reuses this
+                // fd number (only possible after the close) never lands on the stale registration; then
+                // DEL (needs the fd still open) and close.
+                pidfdRegs.TryRemove pidfd |> ignore
+                epoll_ctl (epollDescriptor, EPOLL_CTL_DEL, pidfd, IntPtr.Zero) |> ignore
+                close pidfd |> ignore
 
     // The single shared reaper: one thread for the whole process, blocking in `epoll_wait` and
     // dispatching each ready pidfd. Never returns; a background thread so it does not hold process exit
     // open. Its scratch buffers live for the thread's lifetime (intentionally never freed).
-    let private epollReaperLoop () =
+    let private epollReaperLoop (epollDescriptor: int) =
         let eventsBuf = Marshal.AllocHGlobal(maxEpollEvents * epollEventSize)
         let siginfo = Marshal.AllocHGlobal 128
 
         while true do
-            let n = epoll_wait (epollFd, eventsBuf, maxEpollEvents, -1)
+            let n = epoll_wait (epollDescriptor, eventsBuf, maxEpollEvents, -1)
 
             if n < 0 then
                 // EINTR is routine (a signal interrupted the wait); anything else is unexpected — a brief
@@ -2988,27 +3225,26 @@ module internal Posix =
                 for i in 0 .. n - 1 do
                     let pidfd = int (Marshal.ReadInt64(eventsBuf, i * epollEventSize + epollDataOffset))
 
-                    reapReadyPidfd pidfd siginfo
+                    reapReadyPidfd epollDescriptor pidfd siginfo
 
     // Lazily create the one epoll instance + reaper thread, the first time the pidfd path is used.
     let private ensureEpoll () =
-        if epollFd < 0 then
-            lock epollInitLock (fun () ->
-                if epollFd < 0 then
-                    let fd = epoll_create1 EPOLL_CLOEXEC
-
-                    if fd >= 0 then
-                        // Publish the fd BEFORE starting the thread so the loop reads a valid epollFd.
-                        epollFd <- fd
-                        let thread = Thread(ThreadStart(epollReaperLoop))
-                        thread.IsBackground <- true
-                        thread.Name <- "ProcessKit-pidfd-reaper"
-                        thread.Start())
+        ensureReaperDescriptor
+            (fun () -> Volatile.Read &epollFd)
+            (fun descriptor -> Volatile.Write(&epollFd, descriptor))
+            epollInitLock
+            (fun () -> epoll_create1 EPOLL_CLOEXEC)
+            (fun descriptor -> close descriptor |> ignore)
+            (fun descriptor ->
+                let thread = Thread(ThreadStart(fun () -> epollReaperLoop descriptor))
+                thread.IsBackground <- true
+                thread.Name <- "ProcessKit-pidfd-reaper"
+                thread.Start())
 
     // Register a pidfd with the shared epoll for readability (level-triggered, so an already-dead child
     // is reported at once). Returns false if `epoll_ctl` rejects it (pathological on a pidfd-capable
     // kernel), so the caller can fall back for this child.
-    let private armEpoll (pidfd: int) : bool =
+    let private armEpoll (epollDescriptor: int) (pidfd: int) : bool =
         let ev = Marshal.AllocHGlobal epollEventSize
 
         try
@@ -3019,59 +3255,51 @@ module internal Posix =
                 Marshal.WriteInt32(ev, 4, 0)
 
             Marshal.WriteInt64(ev, epollDataOffset, int64 pidfd)
-            epoll_ctl (epollFd, EPOLL_CTL_ADD, pidfd, ev) = 0
+            epoll_ctl (epollDescriptor, EPOLL_CTL_ADD, pidfd, ev) = 0
         finally
             Marshal.FreeHGlobal ev
 
-    // Last-resort per-child fallback when `pidfd_open`/`epoll_ctl` can't be used for THIS child (the
-    // child was already reaped — ESRCH — or the fd table is momentarily exhausted). Confined to this rare
-    // corner so the global pidfd path stays park-free: a single blocking `waitpid(pid, 0)` on a pool
-    // thread, resolving the owning registration so it coordinates with `reapLeader` exactly like the
-    // epoll path. This is the only place the pidfd path parks a thread, and only under fd exhaustion or an
-    // already-gone child.
-    let private blockingReapFallback (pending: PendingWait) (pid: int) =
-        let reg = { Pid = pid; Pending = pending }
-
-        let work () : Task =
-            task {
-                let mutable status = 0
-                let mutable result = waitpid (pid, &status, 0)
-
-                while result < 0 && Marshal.GetLastWin32Error() = EINTR do
-                    result <- waitpid (pid, &status, 0)
-
-                if result = pid then
-                    completePidfdReg reg (decodeWaitStatus status)
-                else
-                    // ECHILD (already reaped, most likely by `reapLeader`): grace-then-resolve.
-                    do! graceThenResolve reg
-            }
-            :> Task
-
-        Task.Run(work) |> ignore
-
     // Begin a pidfd-based wait for one freshly-registered child: open its pidfd and arm epoll; on any
-    // per-child failure, degrade just this child via `blockingReapFallback`. The reap itself happens
+    // per-child failure, degrade just this child via `beginBlockingReapFallback`. The reap itself happens
     // later on the reaper thread when the pidfd signals readiness.
     let private beginPidfdWait (pid: int) (pending: PendingWait) =
-        ensureEpoll ()
+        let startBlockingFallback () =
+            if not (beginBlockingReapFallback pending pid) then
+                invalidOp $"could not schedule the blocking exit wait fallback for pid {pid}"
 
-        if epollFd < 0 then
+        let epollDescriptor = ensureEpoll ()
+
+        if epollDescriptor < 0 then
             // The epoll instance could not be created (pathological): degrade this child.
-            blockingReapFallback pending pid
+            startBlockingFallback ()
         else
             let pidfd = pidfdOpen pid
 
             if pidfd < 0 then
-                blockingReapFallback pending pid
+                startBlockingFallback ()
             else
-                pidfdRegs[pidfd] <- { Pid = pid; Pending = pending }
+                let mutable registered = false
 
-                if not (armEpoll pidfd) then
+                let armed =
+                    try
+                        pidfdRegs[pidfd] <- { Pid = pid; Pending = pending }
+                        registered <- true
+
+                        match pidfdRegistrationFailureForTests with
+                        | Some shouldFail when shouldFail pid -> false
+                        | _ -> armEpoll epollDescriptor pidfd
+                    with _ ->
+                        // A managed allocation/registration failure is equivalent to epoll_ctl refusing
+                        // the fd: release the partial registration and use the non-polling fallback.
+                        false
+
+                if not armed then
                     // Could not arm epoll for it: undo and degrade this child.
-                    pidfdRegs.TryRemove pidfd |> ignore
+                    if registered then
+                        pidfdRegs.TryRemove pidfd |> ignore
+
                     close pidfd |> ignore
-                    blockingReapFallback pending pid
+                    startBlockingFallback ()
 
     // ----------------------------------------------------------------------------------
     // macOS: EVFILT_PROC / NOTE_EXIT on one shared kqueue reaper
@@ -3116,27 +3344,57 @@ module internal Posix =
     let mutable private kqueueToken = 0L
     let private kqueueInitLock = obj ()
 
+    let private armKqueueRegistration (kqueueDescriptor: int) (pid: int) (token: int64) =
+        let change = Marshal.AllocHGlobal keventSize
+
+        try
+            for offset in 0..7 do
+                Marshal.WriteInt32(change, offset * 4, 0)
+
+            Marshal.WriteInt64(change, 0, int64 pid)
+            Marshal.WriteInt16(change, 8, EVFILT_PROC)
+            Marshal.WriteInt16(change, 10, int16 (EV_ADD ||| EV_ONESHOT))
+            Marshal.WriteInt32(change, 12, int NOTE_EXIT)
+            Marshal.WriteInt64(change, 24, token)
+
+            match kqueueRegistrationFailureForTests with
+            | Some shouldFail when shouldFail pid -> false
+            | _ -> kevent (kqueueDescriptor, change, 1, IntPtr.Zero, 0, IntPtr.Zero) = 0
+        finally
+            Marshal.FreeHGlobal change
+
     let private reapKqueueReg (reg: PidfdReg) =
         let mutable status = 0
-        let mutable result = waitpid (reg.Pid, &status, WNOHANG)
+        observeExitWaitProbe reg.Pid
 
-        while result < 0 && Marshal.GetLastWin32Error() = EINTR do
-            result <- waitpid (reg.Pid, &status, WNOHANG)
+        let mutable waitResult =
+            waitpidForExit ExitWaitOperationForTests.KqueueWaitPid reg.Pid &status WNOHANG
+
+        while waitResult = struct (-1, EINTR) do
+            observeExitWaitProbe reg.Pid
+            waitResult <- waitpidForExit ExitWaitOperationForTests.KqueueWaitPid reg.Pid &status WNOHANG
+
+        let struct (result, errno) = waitResult
 
         if result = reg.Pid then
             resolveGroup reg.Pid reg.Pending (decodeWaitStatus status)
-            true
+            ReapPendingResult.Resolved
         elif result = 0 then
-            false
-        else
+            ReapPendingResult.StillAlive
+        elif errno = ECHILD then
             graceThenResolve reg |> ignore
-            true
+            ReapPendingResult.Resolved
+        else if beginBlockingReapFallback reg.Pending reg.Pid then
+            ReapPendingResult.ReplacementOwned
+        else
+            ReapPendingResult.ReplacementStartFailed
 
-    let private kqueueReaperLoop () =
+    let private kqueueReaperLoop (kqueueDescriptor: int) =
         let events = Marshal.AllocHGlobal(maxKqueueEvents * keventSize)
 
         while true do
-            let count = kevent (kqueueFd, IntPtr.Zero, 0, events, maxKqueueEvents, IntPtr.Zero)
+            let count =
+                kevent (kqueueDescriptor, IntPtr.Zero, 0, events, maxKqueueEvents, IntPtr.Zero)
 
             if count < 0 then
                 if Marshal.GetLastWin32Error() <> EINTR then
@@ -3146,30 +3404,44 @@ module internal Posix =
                     let event = IntPtr.Add(events, index * keventSize)
                     let token = Marshal.ReadInt64(event, 24)
 
-                    match kqueueRegs.TryRemove token with
+                    match kqueueRegs.TryGetValue token with
                     | true, reg ->
-                        if not (reapKqueueReg reg) then
-                            // A defensive spurious notification must not strand the group after the
-                            // one-shot filter is consumed. Hand it to the portable shared fallback and
-                            // probe once immediately; the normal NOTE_EXIT path is already waitable here.
-                            ensureSigchldRegistration ()
-                            tryReapPending reg.Pid |> ignore
+                        match reapKqueueReg reg with
+                        | ReapPendingResult.Resolved
+                        | ReapPendingResult.ReplacementOwned -> kqueueRegs.TryRemove token |> ignore
+                        | ReapPendingResult.StillAlive ->
+                            // Dequeuing an EV_ONESHOT event consumes its kernel ownership. Restore the
+                            // same exact pid/generation registration before returning to kevent when a
+                            // defensive spurious event reports a live child.
+                            if not (armKqueueRegistration kqueueDescriptor reg.Pid token) then
+                                // If the kernel refuses to restore the filter, the current kqueue worker
+                                // remains the durable owner. Claim and perform the blocking reap here
+                                // before dropping the managed token; relying on a newly-installed SIGCHLD
+                                // source would lose an exit whose one signal preceded this recovery path.
+                                reapConsumedExitOnCurrentThread reg.Pending reg.Pid
+                                kqueueRegs.TryRemove token |> ignore
+                        | ReapPendingResult.ReplacementStartFailed ->
+                            // The NOTE_EXIT event has already been consumed. Transfer its exact group once
+                            // to this already-live worker instead of rearming an exited pid and immediately
+                            // redispatching it when replacement thread creation keeps failing.
+                            reapConsumedExitOnCurrentThread reg.Pending reg.Pid
+                            kqueueRegs.TryRemove token |> ignore
                     | false, _ -> ()
 
     let private ensureKqueue () =
-        if kqueueFd < 0 then
-            lock kqueueInitLock (fun () ->
-                if kqueueFd < 0 then
-                    let fd = kqueue ()
+        ensureReaperDescriptor
+            (fun () -> Volatile.Read &kqueueFd)
+            (fun descriptor -> Volatile.Write(&kqueueFd, descriptor))
+            kqueueInitLock
+            kqueue
+            (fun descriptor -> close descriptor |> ignore)
+            (fun descriptor ->
+                let thread = Thread(ThreadStart(fun () -> kqueueReaperLoop descriptor))
+                thread.IsBackground <- true
+                thread.Name <- "ProcessKit-kqueue-reaper"
+                thread.Start())
 
-                    if fd >= 0 then
-                        kqueueFd <- fd
-                        let thread = Thread(ThreadStart(kqueueReaperLoop))
-                        thread.IsBackground <- true
-                        thread.Name <- "ProcessKit-kqueue-reaper"
-                        thread.Start())
-
-    let private deleteKqueueRegistration (pid: int) =
+    let private deleteKqueueRegistration (kqueueDescriptor: int) (pid: int) =
         let change = Marshal.AllocHGlobal keventSize
 
         try
@@ -3179,52 +3451,51 @@ module internal Posix =
             Marshal.WriteInt64(change, 0, int64 pid)
             Marshal.WriteInt16(change, 8, EVFILT_PROC)
             Marshal.WriteInt16(change, 10, int16 EV_DELETE)
-            kevent (kqueueFd, change, 1, IntPtr.Zero, 0, IntPtr.Zero) |> ignore
+            kevent (kqueueDescriptor, change, 1, IntPtr.Zero, 0, IntPtr.Zero) |> ignore
         finally
             Marshal.FreeHGlobal change
 
     let private beginKqueueWait (pid: int) (pending: PendingWait) : bool =
-        ensureKqueue ()
+        let startBlockingFallback () =
+            if beginBlockingReapFallback pending pid then
+                true
+            else
+                invalidOp $"could not start the blocking exit wait fallback for pid {pid}"
 
-        if kqueueFd < 0 then
-            false
+        let kqueueDescriptor = ensureKqueue ()
+
+        if kqueueDescriptor < 0 then
+            startBlockingFallback ()
         else
             let token = Interlocked.Increment(&kqueueToken)
             let reg = { Pid = pid; Pending = pending }
-            let change = Marshal.AllocHGlobal keventSize
+            kqueueRegs[token] <- reg
 
-            try
-                for offset in 0..7 do
-                    Marshal.WriteInt32(change, offset * 4, 0)
-
-                Marshal.WriteInt64(change, 0, int64 pid)
-                Marshal.WriteInt16(change, 8, EVFILT_PROC)
-                Marshal.WriteInt16(change, 10, int16 (EV_ADD ||| EV_ONESHOT))
-                Marshal.WriteInt32(change, 12, int NOTE_EXIT)
-                Marshal.WriteInt64(change, 24, token)
-                kqueueRegs[token] <- reg
-
-                if kevent (kqueueFd, change, 1, IntPtr.Zero, 0, IntPtr.Zero) <> 0 then
+            if not (armKqueueRegistration kqueueDescriptor pid token) then
+                kqueueRegs.TryRemove token |> ignore
+                startBlockingFallback ()
+            else
+                // Register first, then probe: an exit racing registration is either delivered by
+                // kqueue or reaped here. Both paths carry the exact PendingWait generation and the
+                // first resolution wins, so no status is lost or applied to a reused pid. A failed
+                // replacement-worker start leaves the still-armed kqueue filter as durable ownership.
+                match reapKqueueReg reg with
+                | ReapPendingResult.Resolved
+                | ReapPendingResult.ReplacementOwned ->
                     kqueueRegs.TryRemove token |> ignore
-                    false
-                else
-                    // Register first, then probe: an exit racing registration is either delivered by
-                    // kqueue or reaped here. Both paths carry the exact PendingWait generation and the
-                    // first resolution wins, so no status is lost or applied to a reused pid.
-                    if reapKqueueReg reg then
-                        kqueueRegs.TryRemove token |> ignore
-                        // The immediate probe may have won before the NOTE_EXIT event was dequeued, or
-                        // registration may have landed on a pid number already reused after an ECHILD
-                        // race. Remove the kernel filter as well as the managed token so no stale one-shot
-                        // registration lingers until that unrelated process exits.
-                        deleteKqueueRegistration pid
+                    // The immediate probe may have won before the NOTE_EXIT event was dequeued, or
+                    // registration may have landed on a pid number already reused after an ECHILD
+                    // race. Remove the kernel filter as well as the managed token so no stale one-shot
+                    // registration lingers until that unrelated process exits.
+                    deleteKqueueRegistration kqueueDescriptor pid
+                | ReapPendingResult.StillAlive
+                | ReapPendingResult.ReplacementStartFailed -> ()
 
-                    true
-            finally
-                Marshal.FreeHGlobal change
+                true
 
     /// Internal diagnostic for tests: true once macOS initialized the shared kqueue exit reaper.
-    let kqueueActive () = isMacOs && kqueueFd >= 0
+    let kqueueActive () =
+        isMacOs && Volatile.Read(&kqueueFd) >= 0
 
     /// Reap a POSIX child and report how it concluded, without parking a thread per child. On Linux
     /// >= 5.4 each child is awaited through its own `pidfd` on one shared epoll reaper (O(1) dispatch,
@@ -3239,7 +3510,11 @@ module internal Posix =
     /// or triggers a second reap. A wait that registers just AFTER the child was reaped (the double-
     /// registration race the flaky idempotency test exercises) still gets the real status from the group's
     /// briefly-cached outcome, instead of losing an ECHILD race and inventing an `Unobserved`.
-    let rec private waitPosixCore (useFastPath: bool) (pid: nativeint) : Task<Outcome> =
+    let rec private waitPosixCore
+        (useFastPath: bool)
+        (missedExitSignalGeneration: int64 voption)
+        (pid: nativeint)
+        : Task<Outcome> =
         let intPid = int pid
 
         let tcs =
@@ -3263,7 +3538,10 @@ module internal Posix =
 
             let pending =
                 { Waiters = waiters
-                  Outcome = ValueNone }
+                  Outcome = ValueNone
+                  MissedExitSignalGeneration = missedExitSignalGeneration
+                  BlockingFallbackStarting = false
+                  BlockingFallbackStarted = false }
 
             if pendingWaits.TryAdd(intPid, pending) then
                 if useFastPath && pidfdSupported then
@@ -3274,23 +3552,106 @@ module internal Posix =
                     ensureSigchldRegistration ()
                     // The child may already have exited — even before this call started — so probe once
                     // immediately rather than waiting on a SIGCHLD that may already have been delivered.
-                    tryReapPending intPid |> ignore
+                    match tryReapPending false intPid with
+                    | ReapPendingResult.ReplacementStartFailed ->
+                        invalidOp $"could not schedule the blocking exit wait fallback for pid {intPid}"
+                    | ReapPendingResult.Resolved
+                    | ReapPendingResult.StillAlive
+                    | ReapPendingResult.ReplacementOwned -> ()
 
                 tcs.Task
             else
                 // Lost the race to register first — a concurrent call for the same pid won in between our
                 // `TryGetValue` miss and this `TryAdd`. Retry so we join the winner's group instead.
-                waitPosixCore useFastPath pid
+                waitPosixCore useFastPath missedExitSignalGeneration pid
 
     /// Reap a POSIX child on the platform fast path (Linux pidfd or macOS kqueue), with the shared
     /// SIGCHLD reaper as the remaining POSIX fallback. See `waitPosixCore`.
-    let waitPosix (pid: nativeint) : Task<Outcome> = waitPosixCore true pid
+    let waitPosix (pid: nativeint) : Task<Outcome> = waitPosixCore true ValueNone pid
 
     /// Test seam (internal, not public API): force the shared-SIGCHLD fallback path regardless of pidfd
     /// support, so the fallback stays covered by an explicit test even on a pidfd-capable Linux host. In
     /// production this is never called — `waitPosix` is the only entry — so the pidfd path never has the
     /// SIGCHLD registration installed alongside it.
-    let waitPosixViaSigchldForTests (pid: nativeint) : Task<Outcome> = waitPosixCore false pid
+    let waitPosixViaSigchldForTests (pid: nativeint) : Task<Outcome> = waitPosixCore false ValueNone pid
+
+    let private detachedReaperUsesFastPath () =
+        detachedReaperUseFastPathForTests |> Option.defaultValue true
+
+    // Prepare the same process-wide exit-notification infrastructure used by ordinary contained children
+    // before a detached spawn can create a new child. Per-child pidfd/EVFILT_PROC registration necessarily
+    // happens after posix_spawn returns its pid; this step creates the shared epoll/kqueue engine or installs
+    // the portable SIGCHLD callback first. A platform-fast-path setup that is unavailable degrades to the
+    // existing blocking or SIGCHLD fallback without timed polling.
+    let private prepareDetachedReaperCore () : Result<int64 voption, string> =
+        try
+            let useFastPath = detachedReaperUsesFastPath ()
+
+            // Install a notification-only SIGCHLD observer before spawn for every selected mechanism.
+            // If a later per-child pidfd/kqueue registration fails after the child has already exited,
+            // the fallback can recognize this generation advance without letting the observer reap a
+            // child which still has a healthy kernel fast-path owner.
+            ensureExitSignalRegistration ()
+
+            if useFastPath && pidfdSupported then
+                // A failed epoll_create leaves `epollFd = -1`; handoff then selects the blocking waitpid
+                // fallback for that child. Thread-start failures throw and fail preparation before spawn.
+                ensureEpoll () |> ignore
+            elif useFastPath && isMacOs then
+                ensureKqueue () |> ignore
+
+                if Volatile.Read(&kqueueFd) < 0 then
+                    ensureSigchldRegistration ()
+            else
+                ensureSigchldRegistration ()
+
+            // Capture after the selected shared engine is ready but before spawn. If SIGCHLD advances
+            // this value before handoff, any later blocking fallback knows the exit event was consumed.
+            Ok(ValueSome(currentExitSignalGeneration ()))
+        with ex ->
+            Error $"could not prepare shared POSIX exit wait: {ex.Message}"
+
+    let private prepareDetachedReaper () : Result<int64 voption, string> =
+        match detachedReaperPrepareForTests with
+        | Some hook ->
+            try
+                match hook () with
+                | Error message -> Error message
+                | Ok() -> prepareDetachedReaperCore ()
+            with ex ->
+                Error $"detached reaper preparation hook failed: {ex.Message}"
+        | None -> prepareDetachedReaperCore ()
+
+    // Ownership transfers only after `waitPosixCore` has synchronously installed the pid's one shared
+    // PendingWait generation and armed its platform mechanism (or scheduled the non-polling blocking
+    // fallback). The returned task needs no consumer: the registry and native registration own the
+    // completion path, and resolving the group releases its per-child resources exactly as for an
+    // ordinary contained process.
+    let private handoffDetachedReaperCore
+        (missedExitSignalGeneration: int64 voption)
+        (pid: int)
+        : Result<unit, string> =
+        try
+            waitPosixCore (detachedReaperUsesFastPath ()) missedExitSignalGeneration (nativeint pid)
+            |> ignore
+
+            Ok()
+        with ex ->
+            // The caller still treats a failed handoff as owner-side: it kills and calls reapLeader. If
+            // registration made it as far as pendingWaits before this exception, reapLeader resolves that
+            // exact group, so the partial registration cannot introduce a second wait or strand a zombie.
+            Error $"detached reaper handoff failed: {ex.Message}"
+
+    let private handoffDetachedReaper (missedExitSignalGeneration: int64 voption) (pid: int) : Result<unit, string> =
+        match detachedReaperHandoffForTests with
+        | Some hook ->
+            try
+                match hook pid with
+                | Error message -> Error message
+                | Ok() -> handoffDetachedReaperCore missedExitSignalGeneration pid
+            with ex ->
+                Error $"detached reaper handoff hook failed: {ex.Message}"
+        | None -> handoffDetachedReaperCore missedExitSignalGeneration pid
 
     /// Best-effort synchronous reap of a POSIX child we own (a group leader, whose pid == its pgid)
     /// during teardown — it was just SIGKILLed, so it becomes a zombie within a moment. Uses a
@@ -5379,7 +5740,7 @@ module internal Posix =
     //
     // Every other spawn here puts the child in a process group (or cgroup) the owning `ProcessGroup`
     // tears down with `killpg`, and registers its pid with the event-driven reap machinery. The detached
-    // launch deliberately skips containment, but it still hands its direct leader to the private reaper:
+    // launch deliberately skips containment, but it still hands its direct leader to the shared reaper:
     //
     //  * `POSIX_SPAWN_SETSID` unconditionally — the child becomes a session leader (sid == pgid == pid)
     //    with NO controlling terminal, so it is immune to the terminal hangup that would otherwise reach
@@ -5387,21 +5748,21 @@ module internal Posix =
     //    exactly what `Command.Setsid` asks for, so setting that knob alongside is redundant, never a
     //    conflict; `POSIX_SPAWN_SETPGROUP` is not set (it and `SETSID` are mutually exclusive — see
     //    `spawnPosixViaSpawn`'s note).
-    //  * The pid is handed to one process-wide private reaper after the start-time snapshot. That owner
-    //    performs the only normal `waitpid` for the detached leader, retries bounded non-blocking probes,
-    //    and retains the pid after temporary wait errors. The normal detached lifetime still has no public
+    //  * The pid joins the process-wide PendingWait registry after the start-time snapshot. The selected
+    //    pidfd/epoll, kqueue, or SIGCHLD path performs the only normal reap; a registration failure gets
+    //    one blocking wait rather than a timer loop. The normal detached lifetime still has no public
     //    teardown path: no `killProcessGroup`, no kill-on-dispose, nothing for a `Dispose` or finalizer to
     //    reach. The exceptions are pre-handoff setup failures, whose fresh session is killed and reaped
     //    synchronously before the typed spawn error is returned.
     //
     // Honest divergence (documented, not silently broadened): `posix_spawn` cannot reparent, so the
     // detached child is still this process's DIRECT child while it runs and genuinely survives the
-    // parent's exit. Its exit status is nevertheless consumed by the private reaper while this parent is
+    // parent's exit. Its exit status is nevertheless consumed by the shared reaper while this parent is
     // alive, so a long-lived host does not accumulate detached zombies; the public descriptor remains a
     // pid + start-time snapshot with no lifetime/control API.
 
     /// Launch `command` detached from all containment (see the section comment above): its own session,
-    /// then a private reaper handoff after the start-time snapshot; no public teardown. Returns the child's
+    /// then a shared reaper handoff after the start-time snapshot; no public teardown. Returns the child's
     /// pid and OS-reported start time — read while the pid is still pinned by the unreaped child, so the
     /// identity pair can never describe a recycled pid. Structurally a much smaller `spawnPosixViaSpawn`:
     /// no socketpairs, no parent-kept ends, and therefore no stream wrapping. If preparation, post-spawn
@@ -5639,7 +6000,12 @@ module internal Posix =
                                         $"could not prepare detached POSIX reaper: {message}"
                                     )
                                 )
-                            | Ok() -> None
+                            | Ok _ -> None
+
+                        let missedExitSignalGeneration =
+                            match reaperPreparation with
+                            | Ok generation -> generation
+                            | Error _ -> ValueNone
 
                         // `umask(2)` is a whole-process attribute with no posix_spawn attribute, so it is
                         // set on the parent around the spawn under the SAME lock every other spawn takes —
@@ -5706,7 +6072,7 @@ module internal Posix =
                                     // unreaped direct-child status, so the pair cannot describe a recycled pid.
                                     let startTime = readProcessStartTime pid
 
-                                    match handoffDetachedReaper pid with
+                                    match handoffDetachedReaper missedExitSignalGeneration pid with
                                     | Ok() -> Ok { Pid = pid; StartTime = startTime }
                                     | Error message ->
                                         // The queue did not accept ownership, so this caller is still the sole

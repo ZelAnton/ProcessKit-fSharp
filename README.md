@@ -55,6 +55,9 @@ a kernel operation over the whole tree, not a best-effort signal to one pid:
 - **Detached failures are cleaned up.** The explicit `Command.LaunchDetached()` opt-out still
   tears down the whole fresh POSIX session and reaps its leader if post-spawn priority setup fails,
   before returning the typed `ProcessError.Spawn`.
+- **Detached POSIX reaping does not poll.** Completed detached leaders use the shared pidfd/epoll,
+  kqueue, or SIGCHLD exit-wait ledger; a native registration failure transfers ownership to a dedicated
+  blocking kernel wait, without periodic timer wakeups while the child remains live.
 - **Async-first.** Run-and-capture, line/Content-Length streaming, interactive stdin, readiness
   probes, shell-free pipelines, supervision — all return `Task<…>` and stream as
   `IAsyncEnumerable<…>`.

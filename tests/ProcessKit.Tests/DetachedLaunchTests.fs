@@ -282,6 +282,94 @@ type DetachedLaunchTests() =
         }
 
     [<Test>]
+    member _.``a live detached POSIX child is not polled and is reaped after its exit event``() : Task =
+        task {
+            if not isLinux then
+                Assert.Ignore "Linux-only: /proc makes the detached child lifecycle directly observable"
+
+            let counts = System.Collections.Generic.Dictionary<int, int>()
+            let countsLock = obj ()
+
+            let countFor pid =
+                lock countsLock (fun () ->
+                    match counts.TryGetValue pid with
+                    | true, count -> count
+                    | false, _ -> 0)
+
+            let observe pid =
+                lock countsLock (fun () ->
+                    let current =
+                        match counts.TryGetValue pid with
+                        | true, count -> count
+                        | false, _ -> 0
+
+                    counts[pid] <- current + 1)
+
+            let runCase (useFastPath: bool) =
+                task {
+                    let mutable pid = 0
+
+                    try
+                        Native.Posix.detachedReaperUseFastPathForTests <- Some useFastPath
+                        Native.Posix.exitWaitProbeForTests <- Some observe
+
+                        match (sleeper 60).LaunchDetached() with
+                        | Error error -> Assert.Fail $"detached launch failed: {error}"
+                        | Ok detached -> pid <- detached.Pid
+
+                        // Two settled samples, each far beyond the removed 10-ms interval. The portable
+                        // SIGCHLD branch makes one eager registration probe; pidfd makes none. Neither may
+                        // make another native reap attempt until an actual child-exit notification arrives.
+                        do! Task.Delay 120
+                        let firstIdleCount = countFor pid
+                        do! Task.Delay 120
+                        let secondIdleCount = countFor pid
+
+                        Assert.That(
+                            secondIdleCount,
+                            Is.EqualTo firstIdleCount,
+                            $"the live detached child was probed again without an exit event (fastPath={useFastPath})"
+                        )
+
+                        if useFastPath && Native.Posix.pidfdActive then
+                            Assert.That(
+                                firstIdleCount,
+                                Is.EqualTo 0,
+                                "the pidfd fast path probed waitid before the pidfd reported exit"
+                            )
+                        elif not useFastPath then
+                            Assert.That(
+                                firstIdleCount,
+                                Is.EqualTo 1,
+                                "the forced SIGCHLD fallback did not perform exactly its one eager registration probe"
+                            )
+
+                        killQuietly pid
+
+                        let reaped =
+                            waitUntil (TimeSpan.FromSeconds 5.0) (fun () -> procState pid |> Option.isNone)
+
+                        Assert.That(reaped, Is.True, "the detached child was not reaped after its exit event")
+                        Assert.That(countFor pid, Is.GreaterThan secondIdleCount, "exit did not trigger a final reap")
+                    finally
+                        if pid <> 0 && (procState pid |> Option.isSome) then
+                            killQuietly pid
+
+                            waitUntil (TimeSpan.FromSeconds 5.0) (fun () -> procState pid |> Option.isNone)
+                            |> ignore
+
+                        Native.Posix.exitWaitProbeForTests <- None
+                        Native.Posix.detachedReaperUseFastPathForTests <- None
+                }
+
+            // Exercise the host-selected Linux path and then the same handoff through the portable
+            // SIGCHLD fallback, without changing the public detached-launch surface.
+            do! runCase true
+            do! runCase false
+        }
+        :> Task
+
+    [<Test>]
     member _.``a detached child runs and writes its redirected output with no parent involvement``() =
         let path = tempFile ()
 

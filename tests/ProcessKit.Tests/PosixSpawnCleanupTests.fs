@@ -419,6 +419,87 @@ exec "$sp" --pdeathsig=SIGKILL /bin/sh -c "$g" sh "$e" "$@"
         }
 
     [<Test>]
+    member _.``detached SIGCHLD handoff fails closed when no replacement waiter starts``() =
+        if not isLinux then
+            Assert.Ignore "Linux-only: /proc confirms the child exited before the forced SIGCHLD handoff"
+
+        let mutable pid = 0
+        let mutable sawZombieBeforeHandoff = false
+        let childBefore = ourChildCount ()
+
+        let cleanupLeakedChild () =
+            if pid <> 0 then
+                try
+                    Native.Posix.killProcess pid
+                    Native.Posix.reapLeader pid |> ignore
+                with _ ->
+                    // Best-effort cleanup for a deliberately failing handoff. A correct implementation
+                    // has already completed this owner-side reap before returning its Spawn error.
+                    ()
+
+        try
+            Native.Posix.detachedReaperUseFastPathForTests <- Some false
+            Native.Posix.blockingReapThreadStartFailureForTests <- Some(fun candidatePid -> candidatePid = pid)
+
+            Native.Posix.exitWaitFaultForTests <-
+                Some(fun operation candidatePid ->
+                    if
+                        candidatePid = pid
+                        && operation = Native.Posix.ExitWaitOperationForTests.NonBlockingWaitPid
+                    then
+                        Some Native.Posix.transientExitWaitErrnoForTests
+                    else
+                        None)
+
+            Native.Posix.detachedReaperHandoffForTests <-
+                Some(fun candidatePid ->
+                    pid <- candidatePid
+                    Native.Posix.killProcess candidatePid
+
+                    sawZombieBeforeHandoff <-
+                        waitUntil
+                            (fun () ->
+                                try
+                                    let fields = statFieldsAfterComm (string candidatePid)
+                                    fields.Length > 0 && fields[0] = "Z"
+                                with _ ->
+                                    false)
+                            (TimeSpan.FromSeconds 5.0)
+
+                    Ok())
+
+            match Native.Posix.spawnDetachedPosix (shell "sleep 60") with
+            | Error(ProcessError.Spawn(_, detail)) ->
+                Assert.That(
+                    detail.Contains("could not schedule the blocking exit wait fallback", StringComparison.Ordinal),
+                    Is.True,
+                    detail
+                )
+            | Error other -> Assert.Fail $"expected ProcessError.Spawn, got {other}"
+            | Ok spawned ->
+                pid <- spawned.Pid
+                cleanupLeakedChild ()
+                Assert.Fail "detached handoff succeeded without a durable exit owner"
+
+            Assert.That(sawZombieBeforeHandoff, Is.True, "the child was not already exited at initial handoff")
+
+            Assert.That(
+                ourChildCount (),
+                Is.LessThanOrEqualTo(childBefore),
+                "failed initial handoff returned with a live or zombie direct child"
+            )
+
+            // The owner-side reap is confirmed; do not retain a bare pid number into finally, where a
+            // later process could theoretically have recycled it before best-effort cleanup runs.
+            pid <- 0
+        finally
+            Native.Posix.detachedReaperHandoffForTests <- None
+            Native.Posix.detachedReaperUseFastPathForTests <- None
+            Native.Posix.blockingReapThreadStartFailureForTests <- None
+            Native.Posix.exitWaitFaultForTests <- None
+            cleanupLeakedChild ()
+
+    [<Test>]
     member _.``repeated POSIX spawns (success and failure) do not leak file descriptors``() : Task =
         task {
             if not isLinux then

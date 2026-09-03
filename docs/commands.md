@@ -1623,9 +1623,11 @@ pinned, so it can never describe an already-recycled process.
   reaches it. `ProcessGroup`-level knobs (`ResourceLimits`, `ProcessGroupOptions`) are not
   merely ignored: they live on the container this verb refuses to create.
 - **No public exit.** `DetachedProcess` has no wait operation or `Outcome`, exit code, duration,
-  or `ProcessResult`. On POSIX, a private reaper consumes the direct leader's wait status while this
-  process lives solely to prevent zombies; that internal ownership is not exposed as lifecycle control.
-  Windows does not observe the detached child's exit.
+  or `ProcessResult`. On POSIX, the shared exit-wait ledger consumes the direct leader's status through
+  pidfd/epoll on supported Linux, kqueue on macOS, or the shared SIGCHLD fallback elsewhere. A failed
+  per-child registration transfers that ledger entry to a blocking kernel wait; none of these branches
+  uses timer polling. This internal zombie prevention is not exposed as lifecycle control. Windows does
+  not observe the detached child's exit.
 - **No output.** There is no parent left to drain a pipe, so `StdioMode.Piped` — the
   builder default — is wired to the **null device** here. Keep output with
   `StdoutToFile`/`StderrToFile` (the child writes the file itself, with no pump), or share
@@ -1664,10 +1666,12 @@ that ignore them today. Everything the OS can honour on its own **is** honoured:
 - **POSIX.** The child gets a new session with no controlling terminal (`Setsid()` asks for
   exactly this, so setting it alongside is redundant, never a conflict), so a terminal
   hangup cannot reach it. Because `posix_spawn` cannot reparent, it remains this process's
-  direct child while the parent lives: if it exits *first*, a private reaper consumes the
-  direct leader's wait status, so a long-lived host does not accumulate zombies. If the
-  parent exits first, the OS reparents the child and its new supervisor owns reaping; the
-  public descriptor remains only a pid + start-time snapshot with no lifecycle-control API.
+  direct child while the parent lives: if it exits *first*, the same shared event-driven
+  pidfd/epoll, kqueue, or SIGCHLD wait ledger used for contained children consumes the direct
+  leader's status, so a long-lived host does not accumulate zombies. Native registration failures
+  use a blocking kernel wait rather than a polling timer. If the parent exits first, the OS reparents
+  the child and its new supervisor owns reaping; the public descriptor remains only a pid + start-time
+  snapshot with no lifecycle-control API.
   If the post-spawn `Priority` setup is refused, ProcessKit instead
   kills the entire new session/process group and reaps the direct leader before returning
   the typed `ProcessError.Spawn`; a descendant cannot survive that failed launch.

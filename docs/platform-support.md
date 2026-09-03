@@ -337,14 +337,15 @@ refusals; the platform divergences are:
 |---|:---:|:---:|
 | Detachment mechanism | ✅ created running, assigned to **no** Job Object, no handle retained | ✅ `POSIX_SPAWN_SETSID` — its own session, no controlling terminal |
 | Survives a terminal/console close | 🟡 only with `CreateNoWindow()` (or `WindowsCtrlSignals()`) — it otherwise shares the caller's console | ✅ a new session cannot be reached by the terminal's hangup |
-| Leaves no entry behind when it exits first | ✅ nothing references the process | ✅ a private reaper consumes the direct leader's wait status while this process lives |
+| Leaves no entry behind when it exits first | ✅ nothing references the process | ✅ the shared POSIX exit reaper consumes the direct leader's wait status while this process lives |
 
 Both platforms return the same `DetachedProcess` (pid + start-time identity) and neither exposes the
-child's exit through that descriptor — that is what "detached" means here. On POSIX, the private reaper
-consumes the direct leader's wait status while this process lives; if the parent exits first, the OS
-reparents the child and its new supervisor owns reaping. Returning the *real* target pid therefore does
-not require double-forking through a helper, and ProcessKit never claims arbitrary processes outside its
-own child ownership.
+child's exit through that descriptor — that is what "detached" means here. On POSIX, the direct leader
+uses the same process-wide pidfd/epoll, kqueue, or shared-SIGCHLD wait mechanism as an ordinary child,
+with one blocking `waitpid` as the no-poll fallback when a per-child native registration fails. If the
+parent exits first, the OS reparents the child and its new supervisor owns reaping. Returning the *real*
+target pid therefore does not require double-forking through a helper, and ProcessKit never claims
+arbitrary processes outside its own child ownership.
 
 The opt-out covers the containment **ProcessKit** creates, not one your own process was placed in by
 someone else: a child of a job-bound Windows process joins that job by kernel rule (breakaway is not
