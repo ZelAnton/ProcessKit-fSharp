@@ -1121,7 +1121,11 @@ container has an `ILoggerFactory`). The runners registered by `AddProcessKit()` 
 underlying runner. A keyed `AddProcessKitClient(..., configure)` callback must likewise return a
 non-null `CliClient` for the registered program; resolution rejects a null result with
 `ArgumentNullException` and a client for another program with `ArgumentException`, both naming
-`configure`.
+`configure`. Both `AddProcessKitClient` overloads reject a null, empty, or whitespace-only `program`
+during registration, before a keyed client is created or resolved, and name that parameter in the
+exception. `ProcessKitOptions.DefaultWorkingDirectory` accepts `null` or a non-blank path without an
+embedded NUL; an invalid assignment throws `ArgumentException` naming `DefaultWorkingDirectory`
+during options setup, before a runner applies the default to a command.
 The DI registration overloads also name each null argument after their public signatures
 (`services`, `configure`, `configuration`, `name`, or `program`); the Hosting registration and
 configuration overloads do the same for `services`, `name`, `command`, `configureSupervisor`, and

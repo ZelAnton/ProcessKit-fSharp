@@ -294,6 +294,11 @@ type DependencyInjectionTests() =
                       clientConfigure
                   )
                   |> ignore)
+              "AddProcessKitClient simple overload program",
+              "program",
+              (fun () ->
+                  ServiceCollectionExtensions.AddProcessKitClient(services, "tool", Unchecked.defaultof<string>)
+                  |> ignore)
               "AddProcessKitClient configure",
               "configure",
               (fun () ->
@@ -320,6 +325,42 @@ type DependencyInjectionTests() =
 
         for caseName, expected, call in calls do
             assertNullParameter caseName expected call
+
+    [<TestCase("")>]
+    [<TestCase("   ")>]
+    member _.``AddProcessKitClient overloads reject an empty or whitespace-only program during registration``
+        (invalidProgram: string)
+        =
+        for withConfigure in [ false; true ] do
+            let services = ServiceCollection()
+            let mutable configureCalled = false
+
+            let register =
+                if withConfigure then
+                    fun () ->
+                        ServiceCollectionExtensions.AddProcessKitClient(
+                            services,
+                            "tool",
+                            invalidProgram,
+                            Func<CliClient, CliClient>(fun client ->
+                                configureCalled <- true
+                                client)
+                        )
+                        |> ignore
+                else
+                    fun () ->
+                        ServiceCollectionExtensions.AddProcessKitClient(services, "tool", invalidProgram)
+                        |> ignore
+
+            let thrown =
+                match Assert.Throws<ArgumentException>(Action register) with
+                | null ->
+                    failwith "Expected an empty or whitespace-only client program to be rejected during registration."
+                | exceptionThrown -> exceptionThrown
+
+            Assert.That(thrown.ParamName, Is.EqualTo "program")
+            Assert.That(configureCalled, Is.False)
+            Assert.That(services.Count, Is.Zero)
 
     [<Test>]
     member _.``the resolved runner is logger-aware when a logger factory is registered``() : Task =
@@ -389,7 +430,7 @@ type DependencyInjectionTests() =
     member _.``ProcessKitOptions.DefaultWorkingDirectory validates and applies a default``() : Task =
         let options = ProcessKitOptions()
 
-        for invalidDirectory in [ ""; "   " ] do
+        for invalidDirectory in [ ""; "   "; "before\000after" ] do
             let thrown =
                 match
                     Assert.Throws<ArgumentException>(

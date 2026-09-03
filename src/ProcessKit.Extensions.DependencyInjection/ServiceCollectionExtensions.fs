@@ -144,9 +144,10 @@ type ServiceCollectionExtensions =
     /// `IProcessRunner` when present (so it is logger-aware and honours a shared group / test runner),
     /// otherwise a default `JobRunner`. `configure` applies shared defaults via the `CliClient` builder
     /// (`WithDefaults` — timeout, working directory, environment, encoding, ok-codes, …). It runs when
-    /// the keyed client is resolved and must return a non-null `CliClient` for the registered `program`;
-    /// a null result throws `ArgumentNullException`, and changing the program throws `ArgumentException`,
-    /// both naming `configure`.
+    /// the keyed client is resolved and must return a non-null `CliClient` for the registered `program`.
+    /// `program` must be non-empty and contain at least one non-whitespace character; invalid values are
+    /// rejected during registration with an exception naming `program`. A null configured result throws
+    /// `ArgumentNullException`, and changing the program throws `ArgumentException`, both naming `configure`.
     ///
     /// The `name` must be unique across `AddProcessKitClient` calls on this `IServiceCollection`.
     /// Registering a second client under a name already in use throws `InvalidOperationException`
@@ -164,6 +165,10 @@ type ServiceCollectionExtensions =
         ArgumentNullException.ThrowIfNull(services, nameof services)
         ArgumentNullException.ThrowIfNull(name, nameof name)
         ArgumentNullException.ThrowIfNull(program, nameof program)
+
+        if String.IsNullOrWhiteSpace program then
+            raise (ArgumentException("program must not be empty or whitespace-only", nameof program))
+
         ArgumentNullException.ThrowIfNull(configure, nameof configure)
 
         if DiInternals.hasClient services name then
@@ -207,7 +212,8 @@ type ServiceCollectionExtensions =
         services
 
     /// Register a keyed `CliClient` for `program` under `name`, with no extra defaults (see the
-    /// `configure` overload).
+    /// `configure` overload). `program` must be non-empty and contain at least one non-whitespace
+    /// character; invalid values are rejected during registration with an exception naming `program`.
     [<Extension>]
     static member AddProcessKitClient
         (services: IServiceCollection, name: string, program: string)

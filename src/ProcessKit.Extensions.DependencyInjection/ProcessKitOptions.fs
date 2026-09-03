@@ -1,6 +1,7 @@
 namespace ProcessKit.Extensions.DependencyInjection
 
 open System
+open ProcessKit
 
 /// Default settings applied to every command run through the DI-resolved `IProcessRunner`, configured
 /// with `AddProcessKit(Action&lt;ProcessKitOptions&gt;)` or bound from an `IConfiguration` section.
@@ -29,8 +30,9 @@ type ProcessKitOptions() =
             defaultTimeout <- value
 
     /// A default working directory applied when a command sets none. `null` (the default) means the
-    /// process inherits the current directory. Empty or whitespace-only values are rejected at assignment
-    /// (`ArgumentException`), so configuration mistakes surface during setup.
+    /// process inherits the current directory. Empty, whitespace-only, or embedded-NUL values are rejected
+    /// at assignment (`ArgumentException` naming `DefaultWorkingDirectory`), so configuration mistakes
+    /// surface during setup.
     member _.DefaultWorkingDirectory
         with get () = defaultWorkingDirectory
         and set (value: string | null) =
@@ -45,4 +47,5 @@ type ProcessKitOptions() =
                         )
                     )
 
+                CommandConfig.rejectEmbeddedNul "DefaultWorkingDirectory" nonNull
                 defaultWorkingDirectory <- nonNull
