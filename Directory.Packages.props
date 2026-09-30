@@ -48,7 +48,7 @@
 		     shipped package's dependency graph and the ordinary CI jobs never restore it. -->
 		<PackageVersion Include="Mono.Cecil" Version="0.11.6" />
 		<PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.400" />
-		<PackageVersion Include="NUnit" Version="4.6.1" />
+		<PackageVersion Include="NUnit" Version="5.0.0" />
 		<PackageVersion Include="NUnit3TestAdapter" Version="6.3.0" />
 		<PackageVersion Include="SharpFuzz" Version="2.3.0" />
 		<PackageVersion Include="System.IO.Pipelines" Version="9.0.19" />
