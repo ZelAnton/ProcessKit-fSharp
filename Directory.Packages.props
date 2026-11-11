@@ -29,7 +29,7 @@
 		<PackageVersion Include="FSharp.Core" Version="10.1.300" />
 		<PackageVersion Include="Ionide.Analyzers" Version="0.16.0" />
 		<PackageVersion Include="FsCheck" Version="3.4.0" />
-		<PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.11" />
+		<PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="11.0.0" />
 		<PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.11" />
 		<PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.11" />
 		<!-- Only the documentation-snippet harness (docs/snippets) needs the full health-checks
